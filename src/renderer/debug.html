@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="google" content="notranslate" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>Muse Desktop — Debug</title>
+    <!-- Diagnostic page (BUG-071): direct URL only, nothing user-facing links
+         here. Styles are inline so the page is one self-contained file; the
+         script stays external because the CSP is script-src 'self'. -->
+    <style>
+      :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      body { margin: 0; background: #0b0f14; color: #e6edf3; }
+      header {
+        position: sticky; top: 0; display: flex; flex-wrap: wrap; gap: 0.6rem;
+        align-items: center; padding: 0.7rem 1rem;
+        border-bottom: 1px solid #30363d; background: #0f141b;
+      }
+      h1 { font-size: 1rem; margin: 0; font-weight: 700; }
+      .pill {
+        font-size: 0.75rem; padding: 0.15rem 0.45rem; border-radius: 999px;
+        border: 1px solid #30363d; background: #161b22; color: #8b949e;
+      }
+      .pill.on { color: #3fb950; border-color: #3fb95066; }
+      .pill.off { color: #f85149; border-color: #f8514966; }
+      .toolbar { display: flex; gap: 0.4rem; margin-left: auto; }
+      button {
+        background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+        border-radius: 0.4rem; padding: 0.3rem 0.55rem; cursor: pointer; font-size: 0.8rem;
+      }
+      button:hover { border-color: #58a6ff; color: #58a6ff; }
+      main { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+      @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+      section { border-right: 1px solid #30363d; min-height: 50vh; }
+      section:last-child { border-right: none; }
+      h2 {
+        margin: 0; padding: 0.55rem 0.8rem; font-size: 0.85rem;
+        border-bottom: 1px solid #30363d; color: #8b949e; font-weight: 600;
+      }
+      table { border-collapse: collapse; width: 100%; font-size: 0.8rem; }
+      td { padding: 0.25rem 0.8rem; border-bottom: 1px solid #161b22; }
+      td.k { color: #8b949e; white-space: nowrap; width: 40%; }
+      td.v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+      ul#smoke { list-style: none; margin: 0; padding: 0.5rem 0.8rem; font-size: 0.8rem; }
+      ul#smoke li {
+        display: flex; gap: 0.5rem; padding: 0.2rem 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      li.ok { color: #3fb950; }
+      li.fail { color: #ff7b72; }
+      li.pending { color: #8b949e; }
+      .ms { margin-left: auto; color: #8b949e; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Muse Desktop · Debug</h1>
+      <span class="pill" id="pill-host">host ?</span>
+      <span class="pill" id="pill-version">v?</span>
+      <span class="pill" id="pill-sse">sse ?</span>
+      <span class="pill" id="pill-stream">stream …</span>
+      <div class="toolbar">
+        <button type="button" id="btn-refresh">รีเฟรช</button>
+        <button type="button" id="btn-smoke">รัน API smoke</button>
+      </div>
+    </header>
+    <main>
+      <section>
+        <h2>counters (live จาก /api/debug/stream)</h2>
+        <table id="counters"></table>
+      </section>
+      <section>
+        <h2>API smoke</h2>
+        <ul id="smoke"><li class="pending">กด “รัน API smoke” เพื่อทดสอบ endpoints</li></ul>
+      </section>
+    </main>
+    <script src="/debug.js"></script>
+  </body>
+</html>

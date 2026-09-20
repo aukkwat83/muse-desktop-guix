@@ -1,0 +1,579 @@
+#!/usr/bin/env node
+// Renderer turn-view invariants (src/renderer/turn-view.js — pure, no DOM).
+//
+// The rule these tests protect: a window that missed `turn_started` must open
+// the turn from the first scoped SSE event it sees, and a late frame from a
+// superseded turn must never touch the view that replaced it.
+
+import assert from 'node:assert/strict';
+
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, messageChildOrder, shouldAutoExpandTool, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from '../src/renderer/turn-view.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test('createTurnView starts empty and unbound', () => {
+  const tv = createTurnView();
+  assert.equal(tv.turnId, null);
+  assert.equal(tv.text, '');
+  assert.equal(tv.tools.size, 0);
+  assert.equal(tv.plan, null);
+  assert.equal(tv.interactions.size, 0);
+  assert.equal(tv.cancelling, false);
+});
+
+test('fresh views start at structural rev 0', () => {
+  assert.equal(createTurnView().rev, 0);
+});
+
+test('seedTurnView bumps the structural rev on merge', () => {
+  const tv = createTurnView();
+  tv.turnId = 't1';
+  seedTurnView(tv, { turnId: 't1', partial: 'hi', tools: [], plan: null, pendingInteractions: [] });
+  assert.equal(tv.rev, 1);
+  seedTurnView(tv, { turnId: 't1', partial: 'hi!', tools: [], plan: null, pendingInteractions: [] });
+  assert.equal(tv.rev, 2);
+});
+
+test('first scoped event binds the turnId and reports open', () => {
+  const tv = createTurnView();
+  const bind = bindTurnId(tv, { turnId: 't1' });
+  assert.equal(bind, 'open');
+  assert.equal(tv.turnId, 't1');
+  assert.ok(tv.startedAt > 0, 'startedAt must be set on bind');
+});
+
+test('an unscoped event (no turnId) is accepted without binding', () => {
+  const tv = createTurnView();
+  assert.equal(bindTurnId(tv, {}), 'ok');
+  assert.equal(tv.turnId, null);
+});
+
+test('the pending placeholder upgrades to the real turnId', () => {
+  const tv = createTurnView();
+  tv.turnId = 'pending'; // set by permission-card rehydrate after a reload
+  const bind = bindTurnId(tv, { turnId: 't9' });
+  assert.equal(bind, 'open');
+  assert.equal(tv.turnId, 't9');
+});
+
+test('events for the bound turn are accepted; a superseded turn is dropped', () => {
+  const tv = createTurnView();
+  bindTurnId(tv, { turnId: 't1' });
+  assert.equal(bindTurnId(tv, { turnId: 't1' }), 'ok');
+  assert.equal(bindTurnId(tv, { turnId: 't2-late' }), 'drop');
+  assert.equal(tv.turnId, 't1', 'a drop must not rebind');
+});
+
+test('bind keeps the original startedAt (elapsed time stays truthful)', () => {
+  const tv = createTurnView();
+  tv.startedAt = 1234; // e.g. seeded from the server's turn snapshot
+  bindTurnId(tv, { turnId: 't1' });
+  assert.equal(tv.startedAt, 1234);
+});
+
+test('interruptedMarkerText labels a user stop and a watchdog stop differently', () => {
+  assert.equal(interruptedMarkerText('cancelled'), '⏹ หยุดโดยผู้ใช้');
+  assert.equal(interruptedMarkerText('watchdog'), '⚠︎ ระบบหยุดให้ (เงียบเกินเพดาน watchdog)');
+  // Anything else that reads as a manual interruption gets the user label.
+  assert.equal(interruptedMarkerText(undefined), '⏹ หยุดโดยผู้ใช้');
+});
+
+test('liveChildOrder pins the answer below tools/plan and above permission cards', () => {
+  const tv = createTurnView();
+  // A tool call that starts AFTER some answer text must still sort above it.
+  tv.text = 'partial answer';
+  tv.tools.set('tc-1', { id: 'tc-1' });
+  tv.plan = [{ content: 'step', status: 'in_progress' }];
+  tv.interactions.set('ix-1', { id: 'ix-1' });
+  assert.deepEqual(liveChildOrder(tv), ['tool:tc-1', 'plan', 'text', 'ix:ix-1']);
+});
+
+test('liveChildOrder omits absent content and keeps tool arrival order', () => {
+  const tv = createTurnView();
+  assert.deepEqual(liveChildOrder(tv), []);
+  tv.tools.set('b', { id: 'b' });
+  tv.tools.set('a', { id: 'a' });
+  tv.text = 'x';
+  assert.deepEqual(liveChildOrder(tv), ['tool:b', 'tool:a', 'text']);
+});
+
+test('live paint scheduler coalesces a burst of schedules into one paint', async () => {
+  let painted = 0;
+  const sched = createLivePaintScheduler(() => painted++, { minMs: 25 });
+  for (let i = 0; i < 20; i++) sched.schedule();
+  await sleep(80);
+  assert.equal(painted, 1, `burst painted ${painted} times, want 1`);
+  assert.equal(sched.paints, 1);
+});
+
+test('live paint scheduler flush paints synchronously and cancels the pending timer', async () => {
+  let painted = 0;
+  const sched = createLivePaintScheduler(() => painted++, { minMs: 25 });
+  sched.schedule();
+  sched.flush();
+  assert.equal(painted, 1, 'flush must paint immediately');
+  await sleep(60);
+  assert.equal(painted, 1, 'the cancelled timer must not paint again');
+  sched.schedule();
+  await sleep(60);
+  assert.equal(painted, 2, 'a later schedule still paints normally');
+});
+
+test('seedTurnView fills an empty view from the server snapshot', () => {
+  const tv = createTurnView();
+  seedTurnView(tv, {
+    turnId: 't1',
+    startedAt: 555,
+    partial: 'partial answer',
+    tools: [{ id: 'tc-1', status: 'in_progress' }],
+    plan: [{ content: 'step', status: 'pending' }],
+    pendingInteractions: [{ id: 'ix-1' }],
+  });
+  assert.equal(tv.turnId, 't1');
+  assert.equal(tv.startedAt, 555);
+  assert.equal(tv.text, 'partial answer');
+  assert.ok(tv.tools.has('tc-1'));
+  assert.equal(tv.plan.length, 1);
+  assert.ok(tv.interactions.has('ix-1'));
+});
+
+test('seedTurnView never regresses newer local state for the same turn', () => {
+  const tv = createTurnView();
+  bindTurnId(tv, { turnId: 't1' });
+  tv.text = 'locally streamed further';
+  tv.tools.set('tc-2', { id: 'tc-2', status: 'completed' });
+  const startedAt = tv.startedAt;
+  // The snapshot was taken before the latest SSE deltas landed.
+  seedTurnView(tv, {
+    turnId: 't1',
+    startedAt: 111,
+    partial: 'shorter',
+    tools: [{ id: 'tc-1', status: 'in_progress' }, { id: 'tc-2', status: 'in_progress' }],
+  });
+  assert.equal(tv.text, 'locally streamed further', 'older partial must not clobber SSE text');
+  assert.equal(tv.startedAt, startedAt);
+  assert.equal(tv.tools.get('tc-2').status, 'completed', 'fresher tool record must win');
+  assert.ok(tv.tools.has('tc-1'), 'missing tool filled from snapshot');
+});
+
+test('seedTurnView upgrades the pending placeholder and adopts a new turn wholesale', () => {
+  const tv = createTurnView();
+  tv.turnId = 'pending';
+  seedTurnView(tv, { turnId: 't1', partial: 'x' });
+  assert.equal(tv.turnId, 't1');
+
+  // A different live turnId: the local view was stale — the server wins.
+  tv.text = 'old turn text that never settled locally';
+  seedTurnView(tv, { turnId: 't2', partial: 'fresh', startedAt: 42 });
+  assert.equal(tv.turnId, 't2');
+  assert.equal(tv.text, 'fresh');
+  assert.equal(tv.startedAt, 42);
+});
+
+test('seedTurnView ignores empty snapshots', () => {
+  const tv = createTurnView();
+  seedTurnView(tv, null);
+  seedTurnView(tv, {});
+  assert.equal(tv.turnId, null);
+  assert.equal(tv.text, '');
+});
+
+test('ixSubmitTransition: fail hands the card back with an error line (BUG-025)', () => {
+  let s = { submitting: false, error: null };
+  s = ixSubmitTransition(s, 'start');
+  assert.deepEqual(s, { submitting: true, error: null }, 'submit disables the buttons');
+  // The whole point of the fix: a failed resolve must not stay submitting —
+  // the buttons come back and the error line goes up.
+  s = ixSubmitTransition(s, 'fail');
+  assert.deepEqual(s, { submitting: false, error: IX_SUBMIT_ERROR_TEXT });
+  s = ixSubmitTransition(s, 'start');
+  assert.equal(s.error, null, 'a retry clears the error line');
+  s = ixSubmitTransition(s, 'ok');
+  assert.deepEqual(s, { submitting: false, error: null });
+});
+
+test('ixSubmitTransition passes unknown phases through untouched', () => {
+  const s = { submitting: true, error: null };
+  assert.equal(ixSubmitTransition(s, 'bogus'), s);
+});
+
+test('toolStatusLabel maps wire statuses to Thai, unknown passes through (BUG-027)', () => {
+  assert.equal(toolStatusLabel('pending'), 'รอดำเนินการ');
+  assert.equal(toolStatusLabel('in_progress'), 'กำลังทำงาน');
+  assert.equal(toolStatusLabel('running'), 'กำลังทำงาน');
+  assert.equal(toolStatusLabel('completed'), 'เสร็จแล้ว');
+  assert.equal(toolStatusLabel('failed'), 'ล้มเหลว');
+  assert.equal(toolStatusLabel('cancelled'), 'ถูกยกเลิก');
+  // Case-insensitive like the status flips in settleTurn (BUG-004).
+  assert.equal(toolStatusLabel('IN_PROGRESS'), 'กำลังทำงาน');
+  // A status the mapping does not know must surface, never render blank.
+  assert.equal(toolStatusLabel('waiting_for_input'), 'waiting_for_input');
+  assert.equal(toolStatusLabel(undefined), '');
+});
+
+test('ixPrimaryOptionId: exactly one primary per card, allow_always preferred (BUG-028)', () => {
+  // Canonical permission options: the session-approve wins over one-shot.
+  assert.equal(
+    ixPrimaryOptionId([
+      { optionId: 'approve_once', kind: 'allow_once' },
+      { optionId: 'approve_always', kind: 'allow_always' },
+      { optionId: 'reject', kind: 'reject_once' },
+    ]),
+    'approve_always',
+  );
+  // AskUserQuestion: every answer is allow_once — only the first is primary,
+  // and the Skip (reject_once) never is.
+  assert.equal(
+    ixPrimaryOptionId([
+      { optionId: 'q0_opt_0', kind: 'allow_once' },
+      { optionId: 'q0_opt_1', kind: 'allow_once' },
+      { optionId: 'q0_skip', kind: 'reject_once' },
+    ]),
+    'q0_opt_0',
+  );
+  // ExitPlanMode fallback set.
+  assert.equal(
+    ixPrimaryOptionId([
+      { optionId: 'plan_approve', kind: 'allow_once' },
+      { optionId: 'plan_revise', kind: 'reject_once' },
+      { optionId: 'plan_reject_and_exit', kind: 'reject_once' },
+    ]),
+    'plan_approve',
+  );
+  // No kind fields (the renderer's built-in fallback list): ids still work.
+  assert.equal(
+    ixPrimaryOptionId([
+      { optionId: 'allow-once' },
+      { optionId: 'allow-always' },
+      { optionId: 'reject-once' },
+    ]),
+    'allow-always',
+  );
+  // All-reject or empty: nothing is primary.
+  assert.equal(ixPrimaryOptionId([{ optionId: 'reject', kind: 'reject_once' }]), null);
+  assert.equal(ixPrimaryOptionId([]), null);
+  assert.equal(ixPrimaryOptionId(undefined), null);
+});
+
+test('ixAnchorKey points at the tool row that asked, else null (BUG-029)', () => {
+  const tv = createTurnView();
+  tv.tools.set('tc-1', { id: 'tc-1' });
+  assert.equal(ixAnchorKey(tv, { id: 'ix-1', toolCallId: 'tc-1' }), 'tool:tc-1');
+  // The row is not in this turn's view (rehydrated card, or the tool only
+  // exists in the settled transcript) — the caller keeps the end position.
+  assert.equal(ixAnchorKey(tv, { id: 'ix-2', toolCallId: 'tc-unknown' }), null);
+  assert.equal(ixAnchorKey(tv, { id: 'ix-3' }), null);
+  assert.equal(ixAnchorKey(tv, { id: 'ix-4', toolCallId: '' }), null);
+  assert.equal(ixAnchorKey(createTurnView(), { toolCallId: 'tc-1' }), null);
+});
+
+test('ixKeyToOptionId: digits pick by position, Esc picks the reject-kind option (BUG-030)', () => {
+  const canonical = [
+    { optionId: 'approve_once', kind: 'allow_once' },
+    { optionId: 'approve_always', kind: 'allow_always' },
+    { optionId: 'reject', kind: 'reject_once' },
+  ];
+  assert.equal(ixKeyToOptionId(canonical, '1'), 'approve_once');
+  assert.equal(ixKeyToOptionId(canonical, '3'), 'reject');
+  assert.equal(ixKeyToOptionId(canonical, 'Escape'), 'reject');
+  // AskUserQuestion: Esc lands on Skip (reject_once), digits on the answers.
+  const ask = [
+    { optionId: 'q0_opt_0', kind: 'allow_once' },
+    { optionId: 'q0_opt_1', kind: 'allow_once' },
+    { optionId: 'q0_skip', kind: 'reject_once' },
+  ];
+  assert.equal(ixKeyToOptionId(ask, '2'), 'q0_opt_1');
+  assert.equal(ixKeyToOptionId(ask, 'Escape'), 'q0_skip');
+  // Id-spelling fallback for kind-less option lists.
+  assert.equal(
+    ixKeyToOptionId([{ optionId: 'allow-once' }, { optionId: 'reject-once' }], 'Escape'),
+    'reject-once',
+  );
+  // Unmapped keys and out-of-range digits are not swallowed.
+  assert.equal(ixKeyToOptionId(canonical, '9'), null);
+  assert.equal(ixKeyToOptionId(canonical, '0'), null);
+  assert.equal(ixKeyToOptionId(canonical, 'a'), null);
+  // A card with no reject option must not swallow Esc (the global stop
+  // binding still applies).
+  assert.equal(ixKeyToOptionId([{ optionId: 'q0_opt_0', kind: 'allow_once' }], 'Escape'), null);
+  assert.equal(ixKeyToOptionId([], 'Escape'), null);
+  assert.equal(ixKeyToOptionId(undefined, '1'), null);
+});
+
+test('messageChildOrder mirrors liveChildOrder for the settled transcript (BUG-031)', () => {
+  const msg = {
+    role: 'assistant',
+    text: 'คำตอบ',
+    meta: {
+      plan: [{ content: 'step', status: 'completed' }],
+      toolCalls: [{ id: 'tc-1' }],
+      reason: 'cancelled',
+    },
+  };
+  // tools → plan → text → marker: the live paint's tools → plan → answer.
+  assert.deepEqual(messageChildOrder(msg), ['tools', 'plan', 'text', 'marker']);
+  const tv = createTurnView();
+  tv.tools.set('tc-1', { id: 'tc-1' });
+  tv.plan = msg.meta.plan;
+  tv.text = msg.text;
+  // Same relative order in both paths: tools before plan before answer.
+  const live = liveChildOrder(tv);
+  const rank = (k) => (k.startsWith('tool:') ? 'tools' : k);
+  assert.deepEqual(live.map(rank), ['tools', 'plan', 'text']);
+  // Absent content drops out; user/notice are single-node messages.
+  assert.deepEqual(messageChildOrder({ role: 'assistant', text: 'x' }), ['text']);
+  assert.deepEqual(messageChildOrder({ role: 'user', text: 'x' }), ['user']);
+  assert.deepEqual(messageChildOrder({ role: 'notice', text: 'x' }), ['notice']);
+});
+
+test('shouldAutoExpandTool opens running/execute rows unless the user toggled them (BUG-033)', () => {
+  const tv = createTurnView();
+  assert.equal(shouldAutoExpandTool(tv, { id: 't1', status: 'in_progress' }), true);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't2', status: 'running' }), true);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't3', status: 'pending', kind: 'execute' }), true);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't4', status: 'pending', kind: 'bash' }), true);
+  // A quiet read still queued stays collapsed.
+  assert.equal(shouldAutoExpandTool(tv, { id: 't5', status: 'pending', kind: 'read' }), false);
+  // Terminal states do not re-open finished rows on their own.
+  assert.equal(shouldAutoExpandTool(tv, { id: 't6', status: 'completed', kind: 'read' }), false);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't7', status: 'failed' }), false);
+  // The guard: a manual collapse wins over every rule above for this turn.
+  tv.userToggledTools.add('t1');
+  assert.equal(shouldAutoExpandTool(tv, { id: 't1', status: 'in_progress' }), false);
+  // …but never leaks to other rows or next turn's fresh view.
+  assert.equal(shouldAutoExpandTool(tv, { id: 't2', status: 'running' }), true);
+  assert.equal(shouldAutoExpandTool(createTurnView(), { id: 't1', status: 'in_progress' }), true);
+  assert.equal(shouldAutoExpandTool(tv, null), false);
+});
+
+test('resolveStatusVerb says preparing-tools while a fresh agent is silent', () => {
+  const tv = createTurnView();
+  tv.warming = true;
+  assert.equal(resolveStatusVerb(tv), 'กำลังเตรียมเครื่องมือ…');
+  tv.thoughtSeen = true;
+  assert.equal(resolveStatusVerb(tv), 'กำลังคิด…');
+  tv.thoughtSeen = false;
+  tv.text = 'hi';
+  assert.equal(resolveStatusVerb(tv), 'กำลังทำงาน…');
+});
+
+test('resolveStatusVerb falls back to working for an empty view', () => {
+  assert.equal(resolveStatusVerb(null), '');
+  assert.equal(resolveStatusVerb(createTurnView()), 'กำลังทำงาน…');
+});
+
+test('resolveStatusVerb picks the interaction verb by subtype', () => {
+  const tv = createTurnView();
+  tv.tools.set('tc-1', { id: 'tc-1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  tv.plan = [{ content: 'ลงมือทำ', status: 'in_progress' }];
+  tv.interactions.set('ix-1', { id: 'ix-1' });
+  assert.equal(resolveStatusVerb(tv), 'รอการอนุญาต…', 'plain approval card');
+  tv.interactions.get('ix-1').subtype = 'ask';
+  assert.equal(resolveStatusVerb(tv), 'รอคำตอบจากคุณ…', 'AskUserQuestion card');
+  tv.interactions.get('ix-1').subtype = 'plan';
+  assert.equal(resolveStatusVerb(tv), 'แผนพร้อมแล้ว — รอตรวจสอบ…', 'ExitPlanMode card');
+  tv.interactions.get('ix-1').resolved = true;
+  assert.equal(resolveStatusVerb(tv), 'ลงมือทำ…', 'a resolved card stops blocking the verb');
+});
+
+test('resolveStatusVerb prefers the in-progress plan step over tools', () => {
+  const tv = createTurnView();
+  tv.tools.set('tc-1', { id: 'tc-1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  tv.plan = [
+    { content: 'อ่านโจทย์', status: 'completed' },
+    { content: 'ลงมือทำ', status: 'in_progress' },
+    { content: 'ตรวจงาน', status: 'pending' },
+  ];
+  assert.equal(resolveStatusVerb(tv), 'ลงมือทำ…');
+});
+
+test('resolveStatusVerb truncates a long plan step to 56 chars + ellipsis', () => {
+  const tv = createTurnView();
+  tv.plan = [{ content: 'x'.repeat(80), status: 'in_progress' }];
+  const verb = resolveStatusVerb(tv);
+  assert.equal(verb.length, 57);
+  assert.ok(verb.endsWith('…'));
+});
+
+test('resolveStatusVerb maps the running tool kind to a Thai verb', () => {
+  const tv = createTurnView();
+  tv.tools.set('tc-0', { id: 'tc-0', title: 'src/app.js', kind: 'read', status: 'completed' });
+  assert.equal(resolveStatusVerb(tv), 'กำลังทำงาน…', 'completed tools are done — not news');
+  const cases = [
+    // [kind, title, expected with title, expected without title]
+    ['read', 'src/app.js', 'กำลังอ่าน src/app.js…', 'กำลังอ่าน…'],
+    ['edit', 'src/app.js', 'กำลังแก้ไข src/app.js…', 'กำลังแก้ไข…'],
+    ['execute', 'npm test', 'กำลังรัน npm test…', 'กำลังรันคำสั่ง…'],
+    ['fetch', 'muse docs', 'กำลังค้นหา muse docs…', 'กำลังค้นหา…'],
+    ['think', 'step by step', 'กำลังคิด…', 'กำลังคิด…'],
+    ['other', 'WebFetch', 'กำลังใช้ WebFetch…', 'กำลังใช้เครื่องมือ…'],
+  ];
+  for (const [kind, title, withTitle, withoutTitle] of cases) {
+    const a = createTurnView();
+    a.tools.set('t', { id: 't', title, kind, status: 'in_progress' });
+    assert.equal(resolveStatusVerb(a), withTitle, `kind ${kind} with title`);
+    const b = createTurnView();
+    b.tools.set('t', { id: 't', kind, status: 'in_progress' });
+    assert.equal(resolveStatusVerb(b), withoutTitle, `kind ${kind} without title`);
+  }
+});
+
+test('resolveStatusVerb keeps a verb-phrase title as-is', () => {
+  const tv = createTurnView();
+  tv.tools.set('t1', { id: 't1', title: 'กำลังวิเคราะห์โค้ด', kind: 'read', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(tv), 'กำลังวิเคราะห์โค้ด…', 'Thai verb phrase is not double-prefixed');
+  const en = createTurnView();
+  en.tools.set('t1', { id: 't1', title: 'Reading src/app.js', kind: 'read', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(en), 'Reading src/app.js…', 'English -ing phrase stays as-is');
+});
+
+test('resolveStatusVerb counts running subagent tools after plain tools', () => {
+  const tv = createTurnView();
+  tv.tools.set('a1', { id: 'a1', title: 'explore the repo', kind: 'other', status: 'in_progress', rawInput: { subagent_type: 'explore' } });
+  assert.equal(resolveStatusVerb(tv), 'กำลังรัน 1 agent…');
+  tv.tools.set('a2', { id: 'a2', title: 'swarm task', kind: 'other', status: 'pending', rawInput: { prompt_template: 'x' } });
+  assert.equal(resolveStatusVerb(tv), 'กำลังรัน 2 agents…');
+  tv.tools.get('a1').status = 'completed';
+  assert.equal(resolveStatusVerb(tv), 'กำลังรัน 1 agent…', 'settled agents drop out of the count');
+  // Agents outrank the thought stream…
+  tv.thoughtSeen = true;
+  assert.equal(resolveStatusVerb(tv), 'กำลังรัน 1 agent…');
+  // …but a plain running tool wins slot 3 over any agent.
+  tv.tools.set('t1', { id: 't1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(tv), 'กำลังรัน npm test…');
+});
+
+test('resolveStatusVerb degrades gracefully when rawInput is null', () => {
+  const tv = createTurnView();
+  tv.tools.set('a1', { id: 'a1', title: 'lazy task', kind: 'other', status: 'in_progress', rawInput: null });
+  assert.equal(resolveStatusVerb(tv), 'กำลังใช้ lazy task…', 'not identifiable as an agent → plain other-tool verb');
+});
+
+test('resolveStatusVerb shows thinking only after a thought chunk arrived', () => {
+  const tv = createTurnView();
+  assert.equal(resolveStatusVerb(tv), 'กำลังทำงาน…', 'no signal yet — the fallback stays honest');
+  tv.thoughtSeen = true;
+  assert.equal(resolveStatusVerb(tv), 'กำลังคิด…');
+  // …but a running tool still outranks the thought stream.
+  tv.tools.set('tc-1', { id: 'tc-1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(tv), 'กำลังรัน npm test…');
+});
+
+test('configSelectsFromOptions normalizes the advertised selects (BUG-075)', () => {
+  const selects = configSelectsFromOptions([
+    { id: 'model', currentValue: 'muse-spark', options: [{ value: 'muse-spark' }, { value: 'muse-spark-fast' }] },
+    { id: 'thinking', currentValue: 'max', options: [{ value: 'off' }, { value: 'low' }, { value: 'high' }, { value: 'max' }] },
+    { id: 'mode', currentValue: 'code', options: [{ value: 'code' }] },
+  ]);
+  assert.equal(selects.model.id, 'model');
+  assert.equal(selects.model.currentValue, 'muse-spark');
+  assert.deepEqual(selects.model.values, ['muse-spark', 'muse-spark-fast']);
+  assert.deepEqual(selects.thinking.values, ['off', 'low', 'high', 'max']);
+  // A non-thinking model omits the select entirely (0.36.1).
+  assert.equal(configSelectsFromOptions([{ id: 'model', options: [] }]).thinking, null);
+  // String-shaped and `values`-shaped rows work too; garbage in → nulls out.
+  assert.deepEqual(configSelectsFromOptions([{ id: 'thinking', values: ['low', 'high'] }]).thinking.values, ['low', 'high']);
+  assert.deepEqual(configSelectsFromOptions(null), { model: null, thinking: null });
+});
+
+test('modelShortName takes the last alias segment (BUG-075)', () => {
+  assert.equal(modelShortName('meta/muse-spark'), 'muse-spark');
+  assert.equal(modelShortName('muse-spark-fast'), 'muse-spark-fast');
+  assert.equal(modelShortName('plain-id'), 'plain-id');
+  assert.equal(modelShortName(null), '—');
+  assert.equal(modelShortName(''), '—');
+});
+
+test('configMenuItems flags the current value (BUG-075)', () => {
+  const select = { id: 'thinking', currentValue: 'max', values: ['off', 'low', 'high', 'max'] };
+  const items = configMenuItems(select, 'high');
+  assert.deepEqual(items.map((i) => i.value), ['off', 'low', 'high', 'max']);
+  assert.equal(items.find((i) => i.current)?.value, 'high', 'an explicit current wins');
+  assert.equal(configMenuItems(select).find((i) => i.current)?.value, 'max', 'else the select currentValue');
+  assert.deepEqual(configMenuItems(null), []);
+});
+
+test('agentToolMeta reads Agent and AgentSwarm rawInput shapes (BUG-076)', () => {
+  assert.equal(agentToolMeta({ title: 'x', kind: 'other' }), null, 'plain tool');
+  assert.equal(agentToolMeta({ rawInput: null }), null, 'lazy-created call without rawInput');
+  assert.equal(agentToolMeta({ rawInput: { prompt: 'hi' } }), null, 'rawInput without agent keys');
+  assert.deepEqual(
+    agentToolMeta({ rawInput: { subagent_type: 'explore', prompt: 'p', run_in_background: true } }),
+    { swarm: false, type: 'explore', count: 1, background: true },
+  );
+  assert.deepEqual(
+    agentToolMeta({ rawInput: { prompt_template: 't', items: [1, 2, 3, 4, 5, 6, 7], resume_agent_ids: { a: 1, b: 2, c: 3, d: 4, e: 5 } } }),
+    { swarm: true, type: 'swarm', count: 12, background: false },
+    'swarm fan-out = fresh items + resumed agents',
+  );
+  assert.equal(agentToolMeta({ rawInput: { prompt_template: 't' } }).count, 0, 'no items known yet');
+});
+
+test('agentSubtitle names the type or the swarm fan-out (BUG-076)', () => {
+  assert.equal(agentSubtitle({ rawInput: { subagent_type: 'coder' } }), 'coder');
+  assert.equal(agentSubtitle({ rawInput: { prompt_template: 't', items: [1, 2, 3] } }), 'swarm · 3 ตัว');
+  assert.equal(agentSubtitle({ rawInput: { prompt_template: 't' } }), 'swarm');
+  assert.equal(agentSubtitle({ title: 'plain' }), '');
+});
+
+test('toolDisplayState: completed background agent reads background, not done (BUG-076)', () => {
+  const bg = { status: 'completed', rawInput: { subagent_type: 'explore', run_in_background: true } };
+  assert.equal(toolDisplayState(bg), 'background');
+  assert.equal(toolDisplayState({ status: 'completed', rawInput: { subagent_type: 'explore' } }), 'done', 'foreground agent completes normally');
+  assert.equal(toolDisplayState({ status: 'completed' }), 'done');
+  assert.equal(toolDisplayState({ status: 'failed' }), 'failed');
+  assert.equal(toolDisplayState({ status: 'cancelled' }), 'failed');
+  assert.equal(toolDisplayState({ status: 'pending' }), 'pending');
+  assert.equal(toolDisplayState({ status: 'in_progress' }), 'running');
+  assert.equal(toolDisplayState({ status: 'running' }), 'running');
+});
+
+test('liveChildOrder pins agent rows above plain tools, arrival order within groups (BUG-076)', () => {
+  const tv = createTurnView();
+  tv.tools.set('t1', { id: 't1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  tv.tools.set('a1', { id: 'a1', title: 'Launching explore agent: scan', kind: 'other', status: 'in_progress', rawInput: { subagent_type: 'explore' } });
+  tv.tools.set('t2', { id: 't2', title: 'src/app.js', kind: 'read', status: 'completed' });
+  tv.tools.set('a2', { id: 'a2', title: 'Launching agent swarm: batch', kind: 'other', status: 'in_progress', rawInput: { prompt_template: 't', items: [1] } });
+  tv.plan = [{ content: 'step', status: 'in_progress' }];
+  tv.text = 'answer';
+  tv.interactions.set('ix-1', { id: 'ix-1' });
+  assert.deepEqual(liveChildOrder(tv), ['tool:a1', 'tool:a2', 'tool:t1', 'tool:t2', 'plan', 'text', 'ix:ix-1']);
+  // A plain-tools-only turn keeps pure arrival order (the pre-BUG-076 shape).
+  const tv2 = createTurnView();
+  tv2.tools.set('x', { id: 'x', title: 'a', status: 'completed' });
+  tv2.tools.set('y', { id: 'y', title: 'b', status: 'in_progress' });
+  assert.deepEqual(liveChildOrder(tv2), ['tool:x', 'tool:y']);
+});
+
+test('agentCounts: swarm is one row, background-done leaves the running count (BUG-077)', () => {
+  const tv = createTurnView();
+  assert.deepEqual(agentCounts(tv), { running: 0, total: 0 }, 'empty view');
+  assert.deepEqual(agentCounts(null), { running: 0, total: 0 });
+  tv.tools.set('t1', { id: 't1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  assert.deepEqual(agentCounts(tv), { running: 0, total: 0 }, 'plain tools are not agents');
+  tv.tools.set('a1', { id: 'a1', status: 'in_progress', rawInput: { subagent_type: 'explore' } });
+  tv.tools.set('a2', { id: 'a2', status: 'pending', rawInput: { prompt_template: 't', items: [1, 2, 3, 4, 5] } });
+  assert.deepEqual(agentCounts(tv), { running: 2, total: 2 }, 'a 5-item swarm still counts as one row');
+  tv.tools.get('a1').status = 'completed';
+  assert.deepEqual(agentCounts(tv), { running: 1, total: 2 }, 'settled agents stay in total only');
+  tv.tools.get('a1').rawInput.run_in_background = true;
+  assert.deepEqual(agentCounts(tv), { running: 1, total: 2 }, 'background-done is excluded from running');
+  tv.tools.get('a2').status = 'failed';
+  assert.deepEqual(agentCounts(tv), { running: 0, total: 2 }, 'failed agents are not running');
+});
+
+let failed = 0;
+for (const [name, fn] of tests) {
+  try {
+    await fn();
+    console.log(`  ok   ${name}`);
+  } catch (err) {
+    failed++;
+    console.log(`  FAIL ${name}\n       ${err.message}`);
+  }
+}
+console.log(`turn-view: ${tests.length - failed}/${tests.length} passed`);
+process.exit(failed ? 1 : 0);

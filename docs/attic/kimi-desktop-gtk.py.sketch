@@ -1,0 +1,46 @@
+# Kimi Desktop - GTK4 Native Linux (libadwaita)
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Gtk, Adw, Gio, GLib
+import subprocess
+import json
+
+class KimiDesktop(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='com.aukkwat83.kimidesktop')
+        self.connect('activate', self.on_activate)
+        self.acp_process = None
+
+    def on_activate(self, app):
+        self.win = Adw.ApplicationWindow(application=app)
+        self.win.set_title('Kimi Desktop')
+        self.win.set_default_size(1200, 800)
+
+        header = Adw.HeaderBar()
+        header.pack_start(Gtk.Button(label="🚀 Agent Swarm"))
+        header.pack_start(Gtk.Button(label="🎯 Goal Mode"))
+        header.pack_end(Gtk.Button(label="Login Kimi"))
+
+        # Main content with chat + sidebar
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        # ... add chat view, swarm panel, etc.
+
+        self.win.set_titlebar(header)
+        self.win.set_child(box)
+        self.win.present()
+
+        # Spawn kimi acp
+        self.start_acp()
+
+    def start_acp(self):
+        self.acp_process = subprocess.Popen(['kimi', 'acp'],
+                                          stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE,
+                                          text=True)
+        print('✅ Kimi ACP spawned - Native GTK4 mode')
+
+app = KimiDesktop()
+app.run()

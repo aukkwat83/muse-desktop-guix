@@ -1,0 +1,1654 @@
+// Session pool + turn core for Muse Desktop.
+//
+// The single most important rule in this file: **one funnel settles a turn**.
+// `settleTurn()` is the only place that may emit a terminal event, and it is
+// idempotent. The kimi/grok lineage learned this the hard way — three racing
+// paths to "turn is over" (a stream event, the blocking HTTP response, and a
+// cancel handler) left the UI showing a spinner for a finished turn, or
+// painting a finished turn twice.
+//
+// Corollaries that follow from that rule and are enforced here:
+//   - every turn has a `turnId`; late events from a superseded turn are dropped
+//   - `POST /prompt` returns 202 immediately; all painting happens over SSE
+//   - turn state is per-chat, never a module-level "current turn"
+//   - the agent's final `turn/start` result is authoritative over the
+//     accumulated stream chunks
+
+import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { MspClient, formatRpcError, isAuthRequiredError, isClientAlive, isHistoryIncompatibleError, sanitizeSubscriptionUsage, terminalAuthCommand } from './msp-client.js';
+import { ConfigCatalog } from './config-catalog.js';
+import { formatDiffPreview } from './hosts.js';
+import { normalizeSessionMode } from './session-mode.js';
+import { SearchIndex, turnForMessageIndex } from './search-index.js';
+import { stateDir } from './session-store.js';
+import { normalizeAttachmentInput, resolveAttachments } from './attachments.js';
+
+const DEFAULT_MAX_HOT = Number(process.env.MUSE_DESKTOP_MAX_HOT_AGENTS || 6);
+const DEFAULT_IDLE_DEMOTE_MS = Number(process.env.MUSE_DESKTOP_IDLE_DEMOTE_MS || 30 * 60 * 1000);
+/** No first activity within this window ⇒ the agent is wedged, not thinking. */
+const NO_ACTIVITY_MS = Number(process.env.MUSE_DESKTOP_NO_ACTIVITY_MS || 180_000);
+/** Streaming stalled this long ⇒ settle rather than spin forever. */
+const STALL_MS = Number(process.env.MUSE_DESKTOP_STALL_MS || 900_000);
+/**
+ * Backstop while a *live* agent still holds the turn open: silence is
+ * tolerated up to this long, then the turn is settled anyway. Above the
+ * CLI's own inference idle backstop, like grok-desktop's 65 min hard cap.
+ */
+const WATCHDOG_HARD_MS = Number(process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS || 65 * 60 * 1000);
+/** Watchdog tick interval — env-overridable so tests can use short clocks. */
+const WATCHDOG_TICK_MS = Number(process.env.MUSE_DESKTOP_WATCHDOG_TICK_MS || 15_000);
+/**
+ * Delta batching (grok-desktop: 16ms / 768 chars; we run 8ms). The agent
+ * streams one RPC frame per token; forwarding each as its own SSE frame
+ * burns CPU and can exhaust the 2000-frame replay ring on a long answer.
+ * Accumulate per chat and flush on a short timer or a size threshold.
+ * Env-tunable (and 0 = flush every chunk) so tests never wait on real time.
+ */
+const DELTA_FLUSH_MS = Number(process.env.MUSE_DESKTOP_DELTA_FLUSH_MS ?? 8);
+const DELTA_FLUSH_CHARS = Number(process.env.MUSE_DESKTOP_DELTA_FLUSH_CHARS ?? 768);
+/** Cap per recap section in the post-rotation recovery preamble. */
+const RECOVERY_MAX_CHARS = 4_000;
+/** Transcript notice for every history-incompatible rotation (prompt path
+ * and config-change path share the one wording). */
+const HISTORY_INCOMPATIBLE_NOTICE =
+  'ประวัติเดิมของ agent ใช้ต่อไม่ได้ — เปิดเซสชันใหม่แล้วลองส่งต่ออีกครั้ง';
+
+export function extractText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map(extractText).join('');
+  if (typeof content !== 'object') return String(content);
+  if (typeof content.text === 'string') return content.text;
+  if (content.content) return extractText(content.content);
+  return '';
+}
+
+/**
+ * Body text for a tool row. Prefers the terminal `rawOutput` the CLI
+ * attaches to the completed `tool_call_update` (grok-desktop's
+ * `extractToolOutput` does the same); otherwise reads the content blocks.
+ * An Edit/Write call carries its change as a leading `{type:'diff'}` block
+ * — plain `extractText` returns '' for those, which is why such rows used
+ * to show nothing but the raw args JSON.
+ */
+export function extractToolOutput(update) {
+  if (!update || typeof update !== 'object') return '';
+  const direct = extractText(update.rawOutput ?? update.raw_output);
+  if (direct.trim()) return direct;
+  const content = update.content;
+  const blocks = Array.isArray(content) ? content : content != null ? [content] : [];
+  const diffs = blocks.filter((b) => b && typeof b === 'object' && b.type === 'diff');
+  if (diffs.length) {
+    // The text block next to a diff is the stringified args — the same
+    // information, raw. The diff is its readable rendering; show it alone.
+    return diffs.map(formatDiffPreview).filter(Boolean).join('\n');
+  }
+  return extractText(content);
+}
+
+/** One-line preview for the sidebar row: the latest thing that was said. */
+export function previewOf(chat, max = 90) {
+  const last = [...(chat.messages || [])].reverse().find((m) => m.text && m.text.trim());
+  if (!last) return '';
+  const flat = last.text
+    .replace(/```[\s\S]*?```/g, ' ⌗ ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+}
+
+/** `mcp__<server>.<tool>` → `<server>`; null for built-in tools. */
+export function mcpServerOfToolKind(kind) {
+  const m = /^mcp__([^.]+)\./.exec(String(kind || ''));
+  return m ? m[1] : null;
+}
+
+/** Cap per item text in a subagent drill-down — the child session log stays on disk. */
+const DRILL_TEXT_MAX = 2_000;
+/** Cap live-streamed child text kept per subagent record. */
+const SUBAGENT_LIVE_MAX = 4_000;
+
+/**
+ * Small projection of one child-session item for the drill-down view. Keeps
+ * identity + state + the readable text, capped; nested children keep their
+ * drill keys so the panel can recurse one level deeper.
+ */
+export function sanitizeDrillItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const out = {
+    itemId: item.itemId != null ? String(item.itemId) : null,
+    kind: String(item.kind || ''),
+    status: String(item.status || ''),
+  };
+  const str = (v) => (v == null ? null : String(v));
+  for (const k of ['subagentId', 'agentPath', 'role', 'objective', 'controlStatus', 'childSessionId',
+    'tool', 'title', 'fallbackText', 'entryId', 'scriptId', 'message']) {
+    if (item[k] != null) out[k] = str(item[k]);
+  }
+  if (typeof item.text === 'string' && item.text) {
+    out.text = item.text.length > DRILL_TEXT_MAX
+      ? `${item.text.slice(0, DRILL_TEXT_MAX)}…`
+      : item.text;
+    if (item.text.length > DRILL_TEXT_MAX) out.truncated = true;
+  }
+  if (item.result && typeof item.result === 'object') {
+    out.result = {
+      summary: str(item.result.summary),
+      ...(typeof item.result.errorKind === 'string' ? { errorKind: item.result.errorKind } : {}),
+    };
+    if (typeof item.result.text === 'string' && item.result.text) {
+      out.result.text = item.result.text.length > DRILL_TEXT_MAX
+        ? `${item.result.text.slice(0, DRILL_TEXT_MAX)}…`
+        : item.result.text;
+    }
+  }
+  if (Array.isArray(item.children)) {
+    out.children = item.children
+      .filter((c) => c && typeof c === 'object')
+      .map((c) => ({
+        childId: str(c.childId),
+        label: str(c.label),
+        phase: str(c.phase),
+        status: str(c.status),
+      }));
+  }
+  return out;
+}
+
+/** The client wraps the discriminator in `params.update.sessionUpdate`; be tolerant. */
+export function readUpdate(params) {
+  const update = params?.update && typeof params.update === 'object' ? params.update : params || {};
+  const kind = String(update.sessionUpdate || update.kind || update.type || '').trim();
+  return { kind, update };
+}
+
+export class SessionManager extends EventEmitter {
+  constructor({ store, wire, defaults = {}, catalog = null }) {
+    super();
+    this.store = store;
+    this.wire = wire;
+    /** Agent-wide model/thinking catalog — lets cold chats offer pickers
+     * before their first spawn (BUG-079). */
+    this.catalog = catalog || new ConfigCatalog();
+    this.defaults = {
+      mode: defaults.mode || 'always',
+      cwd: defaults.cwd || process.cwd(),
+      model: defaults.model || null,
+      effort: defaults.effort || 'ultra',
+      // Create-warm (grok-desktop's recipe): a fresh chat spawns its agent
+      // in the background while the UI stays idle, so the ~20s of async MCP
+      // connects after session/start usually finish while the user is still
+      // typing the first prompt. MUSE_DESKTOP_CREATE_WARM=0 disables.
+      createWarm: defaults.createWarm ?? process.env.MUSE_DESKTOP_CREATE_WARM !== '0',
+      maxHot: defaults.maxHot || DEFAULT_MAX_HOT,
+      idleDemoteMs: defaults.idleDemoteMs || DEFAULT_IDLE_DEMOTE_MS,
+    };
+    /** chatId → { client, turn, lastUsed, starting } */
+    this.slots = new Map();
+    /** interactionId → { chatId, resolve } — any client may answer. */
+    this.pendingInteractions = new Map();
+    /**
+     * chatId → { message?: {turnId,delta,text,timer}, thought?: {...} } —
+     * batched stream deltas, flushed by timer/size and always by settleTurn
+     * before its terminal frame so ordering is preserved.
+     */
+    this._deltaBufs = new Map();
+    /**
+     * chatId → { reason, message } — the agent session was rotated away
+     * (load_miss / history-incompatible). The next prompt prepends a lean
+     * recovery recap to its wire text (once), then clears the flag.
+     */
+    this._rotated = new Map();
+    /** mcp server name → last-seen-epoch-ms, learned from `mcp__<srv>.` tool kinds. */
+    this.mcpUsage = new Map();
+    this._mcpUsageFile = null;
+    this._mcpUsageTimer = null;
+    this._loadMcpUsage();
+    this.lastAuth = null;
+
+    // Cross-chat full-text search (SQLite FTS5 trigram, grok-desktop parity).
+    // Loud by design: the constructor throws when the binding is missing and
+    // self-heals a corrupt db — FTS is never silently disabled.
+    this.searchIndex = new SearchIndex();
+    this.store.onWrite = (type, payload) => this._onStoreWrite(type, payload);
+    // Rebuild from restored chats + groups (next tick — boot stays snappy).
+    setImmediate(() => {
+      try {
+        const r = this.searchIndex.rebuildAll(this.store.list(), this.store.listGroups());
+        if (r?.ok) {
+          console.log(
+            `[sessions] search index ready chunks=${r.chunks} sessions=${r.sessions} groups=${r.groups} ${r.ms || 0}ms`,
+          );
+        } else {
+          console.warn(`[sessions] search index rebuild: ${r?.error || 'disabled'}`);
+        }
+      } catch (err) {
+        console.error('[sessions] search rebuild failed:', err?.message || err);
+      }
+    });
+
+    this._demoteTimer = setInterval(() => this._demoteIdle(), 60_000);
+    this._demoteTimer.unref?.();
+  }
+
+  // ---------------------------------------------------------------- chats
+
+  listChats() {
+    return this.store.list().map((c) => this.chatSummary(c));
+  }
+
+  chatSummary(chat) {
+    const slot = this.slots.get(chat.id);
+    return {
+      id: chat.id,
+      title: chat.title,
+      cwd: chat.cwd,
+      mode: chat.mode,
+      model: chat.model,
+      effort: chat.effort,
+      groupId: chat.groupId,
+      preview: previewOf(chat),
+      updatedAt: chat.updatedAt,
+      createdAt: chat.createdAt,
+      messageCount: chat.messages.length,
+      live: !!slot?.client,
+      status: slot?.client?.status || 'cold',
+      running: !!slot?.turn && !slot.turn.settled,
+      turnId: slot?.turn && !slot.turn.settled ? slot.turn.turnId : null,
+      pendingInteractions: [...this.pendingInteractions.values()]
+        .filter((p) => p.chatId === chat.id)
+        .map((p) => p.payload),
+    };
+  }
+
+  getChat(id) {
+    const chat = this.store.get(id);
+    if (!chat) return null;
+    return { ...this.chatSummary(chat), config: this.chatConfig(id), messages: chat.messages };
+  }
+
+  /**
+   * Model/effort snapshot for the chat plus the selects its pickers show
+   * (BUG-074/079): the live client's advertised selects when there is one,
+   * else the agent-wide catalog cache (with the CHAT's stored values as
+   * current — currentValue is per-chat, the catalog is not), else null when
+   * nothing was ever learned.
+   */
+  chatConfig(chatId) {
+    const chat = this.store.get(chatId);
+    const client = this.slots.get(chatId)?.client;
+    let options = client && isClientAlive(client) ? client.configSelects() : null;
+    if (!options) {
+      const cached = this.catalog.selects();
+      if (cached) {
+        options = {
+          model: cached.model
+            ? { ...cached.model, currentValue: chat?.model ?? cached.model.currentValue }
+            : null,
+          thinking: cached.thinking
+            ? { ...cached.thinking, currentValue: chat?.effort ?? cached.thinking.currentValue }
+            : null,
+        };
+      }
+    }
+    return {
+      model: chat?.model ?? null,
+      effort: chat?.effort ?? null,
+      options,
+    };
+  }
+
+  /** Feed the agent-wide catalog from a live client's advertised selects (BUG-079). */
+  _learnConfig(client) {
+    if (!client) return;
+    try {
+      this.catalog.update(client.configSelects());
+    } catch {
+      /* a learning hiccup must never break the session path */
+    }
+  }
+
+  /**
+   * Prewarm the chat's agent session so its advertised selects can serve the
+   * pickers (BUG-079): ensureClient() spawns + session/new WITHOUT a prompt,
+   * the catalog refreshes from the live client, and the reply is the same
+   * config shape GET returns. Spawn/auth errors propagate to the route.
+   */
+  async refreshChatConfig(chatId) {
+    const chat = this.store.get(chatId);
+    if (!chat) return null;
+    await this.ensureClient(chatId);
+    this._learnConfig(this.slots.get(chatId)?.client);
+    return { config: this.chatConfig(chatId) };
+  }
+
+  /**
+   * Live open-turn snapshot for `GET /api/chats/:id/turn` — a reloaded UI
+   * needs the in-flight text/tools/plan to repaint its live area
+   * (grok-desktop sessions.js:843-872). `null` for an unknown chat;
+   * `{ turn: null }` when no turn is live.
+   */
+  getTurn(chatId) {
+    if (!this.store.get(chatId)) return null;
+    const turn = this.slots.get(chatId)?.turn;
+    if (!turn || turn.settled) return { turn: null };
+    return {
+      turn: {
+        turnId: turn.turnId,
+        startedAt: turn.startedAt,
+        partial: turn.text,
+        tools: [...turn.toolCalls.values()],
+        plan: turn.plan,
+        pendingInteractions: [...this.pendingInteractions.values()]
+          .filter((p) => p.chatId === chatId)
+          .map((p) => p.payload),
+      },
+    };
+  }
+
+  /** The newest chat that was never used — nothing typed, no agent session. */
+  findReusableEmptyChat(groupId = null) {
+    const pool = groupId ? this.store.listInGroup(groupId) : this.store.list();
+    return pool.find((c) => c.messages.length === 0 && !c.mspSessionId) || null;
+  }
+
+  createChat(opts = {}) {
+    // Boot passes `reuseEmpty` so that N clients starting against an empty
+    // store (app window + a browser tab, or just a fast reload) do not each
+    // add a "New chat" row — and so the list does not accumulate blank chats
+    // every time the app is opened without one being used.
+    if (opts.reuseEmpty) {
+      const existing = this.findReusableEmptyChat(opts.groupId || this.store.activeGroupId);
+      if (existing) {
+        this._warmChat(existing.id);
+        return existing;
+      }
+    }
+    const chat = this.store.create({
+      groupId: opts.groupId || null,
+      title: opts.title || 'New chat',
+      cwd: opts.cwd || this.defaults.cwd,
+      mode: normalizeSessionMode(opts.mode || this.defaults.mode),
+      model: opts.model ?? this.defaults.model,
+      effort: opts.effort ?? this.defaults.effort,
+    });
+    this.wire.emit(chat.id, 'chat_created', { chat: this.chatSummary(chat) });
+    this._warmChat(chat.id);
+    return chat;
+  }
+
+  /**
+   * Background agent spawn for a chat the user is about to use. Returns
+   * immediately; the boot single-flights with a racing first prompt inside
+   * ensureClient, and a failure only logs — the prompt path retries aloud.
+   */
+  _warmChat(chatId) {
+    if (!this.defaults.createWarm) return;
+    void this.ensureClient(chatId).catch((err) => {
+      console.warn(`[sessions] create-warm failed for ${chatId}: ${err?.message || err}`);
+    });
+  }
+
+  async removeChat(id) {
+    await this.releaseClient(id, 'chat removed');
+    const ok = this.store.remove(id);
+    if (ok) this.wire.emit(id, 'chat_removed', {});
+    return ok;
+  }
+
+  // --------------------------------------------------------------- groups
+
+  listGroups() {
+    return this.store.listGroups().map((g) => {
+      const chats = this.store.listInGroup(g.id);
+      return {
+        ...g,
+        chatCount: chats.length,
+        runningCount: chats.filter((c) => {
+          const slot = this.slots.get(c.id);
+          return !!slot?.turn && !slot.turn.settled;
+        }).length,
+      };
+    });
+  }
+
+  groupsState() {
+    return { groups: this.listGroups(), activeGroupId: this.store.activeGroupId };
+  }
+
+  // ------------------------------------------------------------- search
+
+  _groupNameForSearch(groupId) {
+    return (groupId && this.store.getGroup(groupId)?.name) || null;
+  }
+
+  /**
+   * SessionStore write observer → FTS indexer. One choke point: every string
+   * the store persists (messages, titles, tool calls, plans, group names)
+   * lands in the index through here, so search can find any of them in any
+   * chat. The store already guards this call; index work itself is queued
+   * off the MSP hot path.
+   */
+  _onStoreWrite(type, p = {}) {
+    const idx = this.searchIndex;
+    if (!idx?.enabled) return;
+    try {
+      switch (type) {
+        case 'message': {
+          const chat = this.store.get(p.chatId);
+          if (!chat || !p.msg) return;
+          const turn = turnForMessageIndex(chat.messages, p.index);
+          const gopts = { groupId: chat.groupId };
+          idx.indexMessage(p.chatId, p.index, p.msg.role, p.msg.text, p.msg.ts, turn, gopts);
+          idx.indexMessageExtras(p.chatId, p.index, p.msg, p.msg.ts, { ...gopts, turn });
+          // Title may have auto-derived from this message — re-shell cheaply.
+          idx.indexSessionShell(chat, { groupName: this._groupNameForSearch(chat.groupId) });
+          break;
+        }
+        case 'trim': {
+          const chat = this.store.get(p.chatId);
+          if (chat) idx.reindexSession(chat, { groupName: this._groupNameForSearch(chat.groupId) });
+          break;
+        }
+        case 'chat':
+        case 'chat-update': {
+          const chat = this.store.get(p.chat?.id || p.id);
+          if (chat) {
+            idx.indexSessionShell(chat, {
+              groupName: this._groupNameForSearch(chat.groupId),
+              urgent: true,
+            });
+          }
+          break;
+        }
+        case 'chat-remove':
+          idx.removeSession(p.id);
+          break;
+        case 'group':
+          if (p.group) idx.indexGroup(p.group, { urgent: true });
+          break;
+        case 'group-remove':
+          idx.removeGroup(p.id);
+          for (const cid of p.removedChatIds || []) idx.removeSession(cid);
+          break;
+        default:
+          break;
+      }
+    } catch (err) {
+      console.error(`[sessions] search index (${type}) failed:`, err?.message || err);
+    }
+  }
+
+  /**
+   * Cross-chat search with live chrome (grok-desktop sessions.js:search).
+   * @param {string} query
+   */
+  search(query, { limit = 40, groupId, kind, surface } = {}) {
+    const meta = new Map();
+    for (const c of this.store.list()) {
+      const slot = this.slots.get(c.id);
+      // Epoch → ISO: the index's recency bonus Date.parse()s this, and
+      // Date.parse(1726…) is NaN, which would poison the hit score.
+      const ts = c.updatedAt || c.createdAt || '';
+      meta.set(c.id, {
+        shortId: String(c.id).slice(0, 8),
+        title: c.title || 'แชท',
+        groupId: c.groupId || null,
+        groupName: this._groupNameForSearch(c.groupId),
+        status: slot?.turn && !slot.turn.settled ? 'running' : slot?.client ? 'starting' : 'idle',
+        updatedAt: typeof ts === 'number' ? new Date(ts).toISOString() : ts,
+      });
+    }
+
+    const out = this.searchIndex.search(query, {
+      limit,
+      sessionMeta: meta,
+      groupId,
+      kind,
+      surface,
+    });
+    // Also match bare chat ids that FTS may miss (uuid punctuation).
+    const q = String(query || '').trim().toLowerCase();
+    if (q.length >= 4 && out?.hits) {
+      for (const c of this.store.list()) {
+        if (
+          c.id.toLowerCase().includes(q) ||
+          (c.mspSessionId && c.mspSessionId.toLowerCase().includes(q))
+        ) {
+          if (!out.hits.some((h) => h.sessionId === c.id)) {
+            const m = meta.get(c.id) || {};
+            out.hits.unshift({
+              sessionId: c.id,
+              groupId: m.groupId || null,
+              groupName: m.groupName || null,
+              shortId: m.shortId || String(c.id).slice(0, 8),
+              title: m.title || c.title || 'แชท',
+              status: m.status || 'idle',
+              score: 5,
+              matches: [{ field: 'id', kind: 'shell', surface: 'meta', snippet: c.id }],
+              updatedAt: m.updatedAt || '',
+              hitType: 'session',
+            });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  createGroup(opts = {}) {
+    const group = this.store.createGroup(opts);
+    this.wire.emit(null, 'group_created', { group, ...this.groupsState() });
+    return group;
+  }
+
+  renameGroup(id, name) {
+    const group = this.store.renameGroup(id, name);
+    if (group) this.wire.emit(null, 'group_updated', { group, ...this.groupsState() });
+    return group;
+  }
+
+  /**
+   * Deleting a group takes its chats with it — so every agent in it has to be
+   * shut down first, or we leak `muse serve` processes with no chat to belong to.
+   */
+  async removeGroup(id) {
+    const chatIds = this.store.listInGroup(id).map((c) => c.id);
+    const result = this.store.removeGroup(id);
+    if (!result) return null; // unknown group, or it was the last one
+    await Promise.all(chatIds.map((cid) => this.releaseClient(cid, 'group removed')));
+    this.wire.emit(null, 'group_removed', {
+      groupId: id,
+      removedChatIds: result.removedChatIds,
+      ...this.groupsState(),
+    });
+    return result;
+  }
+
+  reorderGroups(order) {
+    const groups = this.store.reorderGroups(order);
+    this.wire.emit(null, 'groups_reordered', { ...this.groupsState() });
+    return groups;
+  }
+
+  selectGroup(id) {
+    const active = this.store.setActiveGroup(id);
+    if (!active) return null;
+    this.wire.emit(null, 'group_selected', { ...this.groupsState() });
+    return active;
+  }
+
+  moveChat(chatId, groupId) {
+    const chat = this.store.moveChat(chatId, groupId);
+    if (!chat) return null;
+    this.wire.emit(chatId, 'chat_moved', {
+      chat: this.chatSummary(chat),
+      groupId,
+      ...this.groupsState(),
+    });
+    return chat;
+  }
+
+  // --------------------------------------------------------------- agent
+
+  hasLiveClient(id) {
+    return !!this.slots.get(id)?.client;
+  }
+
+  async ensureClient(chatId) {
+    const chat = this.store.get(chatId);
+    if (!chat) throw new Error(`unknown chat ${chatId}`);
+
+    let slot = this.slots.get(chatId);
+    if (slot?.client && slot.client.sessionId && slot.client.proc?.exitCode == null) {
+      slot.lastUsed = Date.now();
+      return slot.client;
+    }
+    // Single-flight: two prompts arriving together must not spawn two agents.
+    if (slot?.starting) return slot.starting;
+
+    if (!slot) {
+      slot = { client: null, turn: null, lastUsed: Date.now(), starting: null, subagents: new Map() };
+      this.slots.set(chatId, slot);
+    }
+    if (!slot.subagents) slot.subagents = new Map();
+
+    const boot = (async () => {
+      await this._evictIfOverCap(chatId);
+      const client = new MspClient({
+        cwd: chat.cwd,
+        model: chat.model,
+        // Per-chat effort wins over the global env default (BUG-074) —
+        // applySessionConfig() pushes the constructor value at session open.
+        effort: chat.effort,
+        sessionMode: chat.mode,
+        env: process.env,
+      });
+      this._bindClient(chatId, client);
+      slot.client = client;
+      try {
+        await client.start({ resumeSessionId: chat.mspSessionId });
+      } catch (err) {
+        slot.client = null;
+        try {
+          await client.shutdown();
+        } catch { /* best effort */ }
+        throw err;
+      }
+      // Persist immediately: a debounced write here loses the race with a
+      // process exit and strands a dead agent-session id on disk forever.
+      if (client.sessionId && client.sessionId !== chat.mspSessionId) {
+        this.store.update(chatId, { mspSessionId: client.sessionId });
+      }
+      this._learnConfig(client); // fresh configOptions feed the catalog (BUG-079)
+      slot.lastUsed = Date.now();
+      slot.bootedAt = Date.now();
+      slot.turnsStarted = 0;
+      this.wire.emit(chatId, 'agent_ready', {
+        sessionId: client.sessionId,
+        mode: client.sessionMode,
+        modeId: client.currentModeId,
+        agent: client.agentInfo,
+      });
+      return client;
+    })();
+
+    slot.starting = boot;
+    try {
+      return await boot;
+    } finally {
+      slot.starting = null;
+    }
+  }
+
+  _bindClient(chatId, client) {
+    const wire = this.wire;
+
+    client.on('status', (s) => wire.emit(chatId, 'agent_status', s));
+    client.on('stderr', (text) => wire.emit(chatId, 'agent_stderr', { text: String(text).slice(0, 4000) }));
+
+    client.on('handshake', (h) => wire.emit(chatId, 'agent_handshake', h));
+
+    client.on('auth_required', (info) => {
+      const cmd = terminalAuthCommand(info?.authMethods || client.authMethods);
+      this.lastAuth = { ...info, command: cmd };
+      wire.emit(chatId, 'auth_required', { ...info, command: cmd });
+    });
+
+    client.on('load_miss', (info) => {
+      // The agent threw the old session away (version change, expired
+      // encryption, pruned history). Clear our copy of its id in the same tick
+      // so we do not retry the dead id on every restart — and flag the chat so
+      // the next prompt carries a recovery recap instead of landing on a
+      // fresh agent with zero context.
+      this.store.update(chatId, { mspSessionId: null });
+      this._rotated.set(chatId, {
+        reason: 'load-miss',
+        message: info?.message || 'unknown',
+      });
+      this.store.addMessage(chatId, {
+        role: 'notice',
+        text: `เซสชันเดิมของ agent ใช้ต่อไม่ได้ (${info?.message || 'unknown'}) — เปิดเซสชันใหม่ให้แล้ว`,
+      });
+      wire.emit(chatId, 'load_miss', info);
+    });
+
+    client.on('update', (params) => this._onUpdate(chatId, params));
+
+    client.on('permission', (req) => this._onPermission(chatId, req));
+
+    client.on('exit', ({ code, signal }) => {
+      const slot = this.slots.get(chatId);
+      if (slot) slot.client = null;
+      // An exit mid-turn is a terminal condition — settle so the UI is not
+      // left spinning on a process that no longer exists.
+      if (slot?.turn && !slot.turn.settled) {
+        this.settleTurn(chatId, slot.turn.turnId, {
+          reason: 'agent_exit',
+          error: `agent exited (code=${code ?? 'null'}${signal ? ` signal=${signal}` : ''})`,
+        });
+      }
+      wire.emit(chatId, 'agent_exit', { code, signal });
+    });
+
+    client.on('error', (err) => {
+      wire.emit(chatId, 'agent_error', { message: err?.message || String(err) });
+    });
+  }
+
+  async releaseClient(chatId, reason = 'released') {
+    const slot = this.slots.get(chatId);
+    if (!slot) return false;
+    if (slot.turn && !slot.turn.settled) {
+      this.settleTurn(chatId, slot.turn.turnId, { reason: 'released', error: reason });
+    }
+    for (const [id, p] of [...this.pendingInteractions]) {
+      if (p.chatId === chatId) {
+        // Same dead-shape fix as settleTurn: reject through the real waiter on
+        // the client before it is shut down below.
+        try { slot.client?.resolvePermission(id, 'reject'); } catch { /* ignore */ }
+        this.pendingInteractions.delete(id);
+      }
+    }
+    const client = slot.client;
+    slot.client = null;
+    this.slots.delete(chatId);
+    if (client) {
+      try {
+        await client.shutdown();
+      } catch { /* best effort */ }
+    }
+    this.wire.emit(chatId, 'agent_released', { reason });
+    return true;
+  }
+
+  async _evictIfOverCap(exceptChatId) {
+    const live = [...this.slots.entries()].filter(([id, s]) => s.client && id !== exceptChatId);
+    if (live.length < this.defaults.maxHot) return;
+    live.sort((a, b) => (a[1].lastUsed || 0) - (b[1].lastUsed || 0));
+    const victims = live.slice(0, live.length - this.defaults.maxHot + 1);
+    for (const [id, slot] of victims) {
+      if (slot.turn && !slot.turn.settled) continue; // never evict a running turn
+      await this.releaseClient(id, 'pool cap');
+    }
+  }
+
+  _demoteIdle() {
+    const now = Date.now();
+    for (const [id, slot] of [...this.slots]) {
+      if (!slot.client) continue;
+      if (slot.turn && !slot.turn.settled) continue;
+      if (now - (slot.lastUsed || 0) > this.defaults.idleDemoteMs) {
+        void this.releaseClient(id, 'idle');
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------- turns
+
+  /**
+   * Wire text for the first prompt after an agent-session rotation
+   * (load_miss / history-incompatible): a lean `[SESSION RECOVERY]` recap of
+   * the latest exchange, prepended to the user's text **on the wire only** —
+   * the stored user message stays the plain text. Fires once, then the flag
+   * is cleared. grok-desktop does the same in turn-recovery.js:221-304.
+   */
+  _buildRecoveryWireText(chatId, body, excludeMessageId = null) {
+    const rotated = this._rotated.get(chatId);
+    if (!rotated) return body;
+    this._rotated.delete(chatId);
+
+    const msgs = (this.store.get(chatId)?.messages || []).filter((m) => m.id !== excludeMessageId);
+    const lastUser = [...msgs].reverse().find((m) => m.role === 'user' && m.text?.trim())?.text || '';
+    const lastAsst =
+      [...msgs].reverse().find((m) => m.role === 'assistant' && m.text?.trim())?.text || '';
+    const clip = (s) => (s.length > RECOVERY_MAX_CHARS ? `${s.slice(0, RECOVERY_MAX_CHARS)}…` : s);
+
+    const lines = [
+      '[SESSION RECOVERY — Muse Desktop]',
+      'You are a FRESH agent session. The previous session could not be resumed',
+      `(${rotated.reason}${rotated.message ? `: ${String(rotated.message).slice(0, 300)}` : ''}).`,
+      'The desktop transcript is the source of truth — continue from the recap',
+      'below; do not restart the task from scratch.',
+      '',
+      '## Latest user message',
+      clip(lastUser) || '(none)',
+      '',
+      '## Latest assistant output',
+      clip(lastAsst) || '(none yet)',
+      '',
+      '## The user message to answer now follows',
+      '',
+    ];
+    return `${lines.join('\n')}${body}`;
+  }
+
+  async prompt(chatId, text, opts = {}) {
+    const chat = this.store.get(chatId);
+    if (!chat) throw new Error(`unknown chat ${chatId}`);
+    const body = String(text ?? '').trim();
+    // Attachments arrive separately and stay separate: images become image
+    // parts, files become @mentions — the text part is the user's verbatim
+    // text (grok merges a preamble into it; we deliberately do not).
+    const rawAtts = Array.isArray(opts.attachments) ? opts.attachments : [];
+    if (!body && !rawAtts.length) throw new Error('empty prompt');
+    const normalized = rawAtts.map(normalizeAttachmentInput);
+    const resolved = resolveAttachments(normalized, {
+      attachDir: path.join(stateDir(), 'attach'),
+      chatId,
+    });
+
+    const slot = this.slots.get(chatId);
+    if (slot?.turn && !slot.turn.settled) {
+      const err = new Error('a turn is already running for this chat');
+      err.code = 'TURN_IN_FLIGHT';
+      err.status = 409;
+      throw err;
+    }
+
+    const client = await this.ensureClient(chatId);
+    const turnId = randomUUID();
+    const live = this.slots.get(chatId);
+    // A history-rotation retry re-sends the same text — the user message is
+    // already in the transcript from the first attempt; storing it again
+    // would paint the prompt twice.
+    const userMsg = opts.skipUserMessage
+      ? null
+      : this.store.addMessage(chatId, {
+        role: 'user',
+        text: body,
+        ...(resolved.meta.length ? { meta: { attachments: resolved.meta } } : {}),
+      });
+    if (!body && resolved.meta.length && (!chat.title || chat.title === 'New chat')) {
+      this.store.update(chatId, { title: `ไฟล์แนบ ${resolved.meta.length} รายการ` });
+    }
+    const wireText = this._buildRecoveryWireText(chatId, body, userMsg?.id);
+
+    live.turn = {
+      turnId,
+      text: '',
+      thought: '',
+      toolCalls: new Map(),
+      plan: null,
+      startedAt: Date.now(),
+      lastActivity: Date.now(),
+      sawActivity: false,
+      settled: false,
+      // The agent echoes the prompt back as `user_message_chunk`; without this
+      // the transcript grows a duplicate copy of every message the user sends.
+      promptText: body,
+    };
+    live.lastUsed = Date.now();
+    // First turn on a just-booted agent: the ~20s of async MCP connects are
+    // usually still running, so the UI says "preparing tools" instead of a
+    // dead spinner until the first real activity lands.
+    const warming = live.turnsStarted === 0 && Date.now() - (live.bootedAt || 0) < 45_000;
+    live.turnsStarted = (live.turnsStarted || 0) + 1;
+
+    this.wire.emit(chatId, 'turn_started', {
+      turnId,
+      message: userMsg,
+      title: this.store.get(chatId)?.title,
+      ...(warming ? { warming: true } : {}),
+    });
+
+    live.watchdog = setInterval(() => this._checkWatchdog(chatId, turnId), WATCHDOG_TICK_MS);
+    live.watchdog.unref?.();
+
+    // Fire-and-forget: the HTTP caller gets 202 + turnId, everything else
+    // arrives over SSE. Painting from the HTTP response is what made grok's
+    // UI single-threaded across a whole turn.
+    client
+      .prompt(wireText, { images: resolved.images, mentionText: resolved.mentionText })
+      .then((result) => {
+        const stopReason = result?.stopReason || result?.stop_reason || null;
+        const finalText = extractText(result?.content ?? result?.message ?? null);
+        this.settleTurn(chatId, turnId, {
+          reason: stopReason || 'end_turn',
+          content: finalText || null,
+        });
+      })
+      .catch(async (err) => {
+        if (err?.cancelled) {
+          this.settleTurn(chatId, turnId, { reason: 'cancelled' });
+          return;
+        }
+        // The agent rejected our stored history (model change, expired
+        // encryption, pruned session). Settling with an error here would
+        // brick the chat: the dead mspSessionId stays on disk and every later
+        // prompt fails the same way. Settle the partial stream, clear the id
+        // (update() flushNow()s that field), rotate to a fresh agent and
+        // retry exactly once — grok-desktop sessions.js:3536-3586.
+        if (isHistoryIncompatibleError(err) && !opts._historyRetried) {
+          this.settleTurn(chatId, turnId, { reason: 'rotated' });
+          this.store.update(chatId, { mspSessionId: null });
+          this._rotated.set(chatId, {
+            reason: 'history-incompatible',
+            message: formatRpcError(err),
+          });
+          this.store.addMessage(chatId, {
+            role: 'notice',
+            text: HISTORY_INCOMPATIBLE_NOTICE,
+          });
+          await this.releaseClient(chatId, 'history-incompatible');
+          try {
+            // Attachments live in the stored user message — re-send them so
+            // the retry sees the same turn (normalized {path} shape re-validates).
+            await this.prompt(chatId, body, {
+              _historyRetried: true,
+              skipUserMessage: true,
+              attachments: userMsg?.meta?.attachments || rawAtts,
+            });
+          } catch (retryErr) {
+            // The retry surfaces its own turn events; only an early throw
+            // (e.g. the fresh agent refused to start) needs a signal here.
+            this.wire.emit(chatId, 'agent_error', { message: formatRpcError(retryErr) });
+          }
+          return;
+        }
+        if (isAuthRequiredError(err)) {
+          const cmd = terminalAuthCommand(client.authMethods);
+          this.lastAuth = { authMethods: client.authMethods, command: cmd };
+          this.wire.emit(chatId, 'auth_required', { authMethods: client.authMethods, command: cmd });
+        }
+        this.settleTurn(chatId, turnId, {
+          reason: 'error',
+          error: formatRpcError(err),
+        });
+      });
+
+    return { turnId, message: userMsg };
+  }
+
+  /**
+   * The one and only way a turn ends. Idempotent by `settled`; ignores a
+   * turnId that is not the live one (a late reply from a superseded turn must
+   * never terminate the turn that replaced it).
+   */
+  settleTurn(chatId, turnId, { reason = 'end_turn', content = null, error = null } = {}) {
+    const slot = this.slots.get(chatId);
+    const turn = slot?.turn;
+    if (!turn || turn.turnId !== turnId || turn.settled) return false;
+
+    turn.settled = true;
+    if (slot.watchdog) {
+      clearInterval(slot.watchdog);
+      slot.watchdog = null;
+    }
+    // Flush any batched deltas BEFORE the terminal frame so the client sees
+    // the full running text ahead of turn_done/turn_error, never after it.
+    this._flushDelta(chatId, 'message');
+    this._flushDelta(chatId, 'thought');
+    this._deltaBufs.delete(chatId);
+
+    // Close every still-open tool row before anything persists or emits —
+    // pending/in_progress must not survive into the transcript, where they
+    // would render as spinners forever. grok-desktop flips by stop reason
+    // (turn-view.js:230-241): interrupted work on cancel/watchdog, failed
+    // on error, completed otherwise (a done turn's tools should already be
+    // completed; anything left open simply joins them).
+    const openToolStatus =
+      reason === 'cancelled' || reason === 'watchdog' ? 'cancelled' : error ? 'failed' : 'completed';
+    for (const tool of turn.toolCalls.values()) {
+      if (/^(pending|in_progress|running)$/i.test(String(tool.status || ''))) {
+        tool.status = openToolStatus;
+      }
+    }
+
+    // The agent's final content wins over accumulated chunks when present —
+    // chunks can be partial or re-ordered; the result is authoritative.
+    const finalText = content != null && String(content).length ? String(content) : turn.text;
+
+    if (finalText && finalText.trim()) {
+      this.store.setAssistantMessage(chatId, turnId, finalText, {
+        reason,
+        toolCalls: [...turn.toolCalls.values()],
+        // The plan is part of what the agent produced for this turn; without
+        // persisting it, it vanishes the instant the turn settles and the
+        // transcript reloads.
+        ...(turn.plan ? { plan: turn.plan } : {}),
+      });
+    } else {
+      // Never blank a turn after tools ran (grok-desktop's rule): a cancel
+      // right after tool activity leaves no assistant text, but the tool
+      // rows must still survive a transcript reload. The empty assistant
+      // message renders as just its tool rows (`.msg-assistant` has no
+      // chrome of its own).
+      if (turn.toolCalls.size) {
+        this.store.setAssistantMessage(chatId, turnId, '', {
+          reason,
+          toolCalls: [...turn.toolCalls.values()],
+          ...(turn.plan ? { plan: turn.plan } : {}),
+        });
+      }
+      if (error) {
+        this.store.addMessage(chatId, {
+          role: 'notice',
+          text: `เทิร์นจบแบบไม่สำเร็จ: ${error}`,
+          meta: { turnId, reason },
+        });
+      }
+    }
+    this.store.trimMessages(chatId);
+
+    for (const [id, p] of [...this.pendingInteractions]) {
+      if (p.chatId === chatId) {
+        // The waiter that actually unblocks the agent lives on the MspClient
+        // (_permWaiters) — pendingInteractions is metadata only. Resolving it
+        // here is what lets a watchdog/released settle un-park an agent that
+        // is still sitting on session/request_permission.
+        try { slot.client?.resolvePermission(id, 'reject'); } catch { /* ignore */ }
+        this.pendingInteractions.delete(id);
+        this.wire.emit(chatId, 'interaction_resolved', { id, optionId: 'reject', reason: 'turn settled' });
+      }
+    }
+
+    this.wire.emit(chatId, error ? 'turn_error' : 'turn_done', {
+      turnId,
+      reason,
+      content: finalText,
+      error,
+      toolCalls: [...turn.toolCalls.values()],
+      durationMs: Date.now() - turn.startedAt,
+      chat: this.chatSummary(this.store.get(chatId) || { id: chatId, messages: [] }),
+    });
+    slot.turn = null;
+    return true;
+  }
+
+  /**
+   * True while the agent process is alive AND a turn is still in flight —
+   * silence then means a long quiet tool run, not a dead turn. MSP's
+   * turn/start admits fast (completion arrives as a notification), so the
+   * in-flight signal is status === 'running' for the whole prompt() window;
+   * the _pending scan stays as a second witness for the admission moment.
+   */
+  _clientLively(slot) {
+    const client = slot?.client;
+    if (!client) return false;
+    if (client.status === 'exited') return false;
+    if (!isClientAlive(client)) return false;
+    if (client._pending instanceof Map) {
+      for (const p of client._pending.values()) {
+        if (p?.method === 'turn/start' || p?.method === 'session/prompt') return true;
+      }
+    }
+    // status==='running' covers the whole prompt() window.
+    return client.status === 'running';
+  }
+
+  _hasPendingInteraction(chatId) {
+    for (const p of this.pendingInteractions.values()) {
+      if (p.chatId === chatId) return true;
+    }
+    return false;
+  }
+
+  _checkWatchdog(chatId, turnId) {
+    const slot = this.slots.get(chatId);
+    const turn = slot?.turn;
+    if (!turn || turn.turnId !== turnId || turn.settled) return;
+    const now = Date.now();
+
+    // A mounted permission card is an intentional human wait — freeze the
+    // stall clock so the card outlives the watchdog, and restart the
+    // countdown only after it resolves (grok-desktop R52).
+    if (this._hasPendingInteraction(chatId)) {
+      if (turn.sawActivity) turn.lastActivity = now;
+      else turn.startedAt = now;
+      return;
+    }
+
+    // Liveness guard: while the agent is alive and the turn is still
+    // in flight, never settle for silence — a >15 min quiet build is work,
+    // not a wedge. Settling here would strand the real reply (settleTurn
+    // would reject it) and let a second prompt run concurrently on the same
+    // MSP session. The hard cap is the backstop for a genuinely wedged turn.
+    if (this._clientLively(slot)) {
+      const silentFor = now - (turn.sawActivity ? turn.lastActivity : turn.startedAt);
+      if (silentFor <= WATCHDOG_HARD_MS) return;
+      this.settleTurn(chatId, turnId, {
+        reason: 'watchdog',
+        error: `agent ค้างเกิน ${Math.round(WATCHDOG_HARD_MS / 60000)} นาทีทั้งที่ยังเชื่อมต่ออยู่ — ตัดเทิร์นตาม hard cap`,
+      });
+      return;
+    }
+
+    if (!turn.sawActivity && now - turn.startedAt > NO_ACTIVITY_MS) {
+      this.settleTurn(chatId, turnId, {
+        reason: 'watchdog',
+        error: `agent ไม่ตอบสนองภายใน ${Math.round(NO_ACTIVITY_MS / 1000)}s`,
+      });
+      return;
+    }
+    if (turn.sawActivity && now - turn.lastActivity > STALL_MS) {
+      this.settleTurn(chatId, turnId, {
+        reason: 'watchdog',
+        error: `สตรีมค้างเกิน ${Math.round(STALL_MS / 1000)}s`,
+      });
+    }
+  }
+
+  async cancel(chatId) {
+    const slot = this.slots.get(chatId);
+    if (!slot?.client) return { cancelled: false };
+    const turnId = slot.turn?.turnId;
+    await slot.client.cancel();
+    if (turnId) this.settleTurn(chatId, turnId, { reason: 'cancelled' });
+    return { cancelled: true, turnId: turnId || null };
+  }
+
+  async setMode(chatId, mode) {
+    const next = normalizeSessionMode(mode);
+    this.store.update(chatId, { mode: next });
+    const slot = this.slots.get(chatId);
+    let applied = null;
+    if (slot?.client) applied = await slot.client.setSessionMode(next);
+    this.wire.emit(chatId, 'mode_changed', {
+      mode: next,
+      modeId: slot?.client?.currentModeId || null,
+      applied,
+    });
+    return { mode: next, applied };
+  }
+
+  /**
+   * Change the chat's model or thinking effort (POST /api/chats/:id/config).
+   * The value is persisted to the store either way; with a live client it is
+   * validated against the advertised configOptions and applied via
+   * `session/set_config_option`, and the fresh selects ride both the reply
+   * and the `config_changed` broadcast. A cold chat validates against the
+   * agent-wide catalog cache when one exists (BUG-079); with NO catalog at
+   * all the value is accepted-and-persisted — applySessionConfig() skips
+   * unadvertised values at spawn, so a stale pick degrades instead of
+   * bricking. Errors carry `.status = 400` for unknown ids/values.
+   */
+  async setChatConfig(chatId, body = {}) {
+    const chat = this.store.get(chatId);
+    if (!chat) return null;
+    const kind = String(body.configId || '');
+    if (kind !== 'model' && kind !== 'thinking') {
+      const err = new Error(`unknown configId ${kind || '(missing)'} — expected model|thinking`);
+      err.status = 400;
+      throw err;
+    }
+    const value = String(body.value ?? '');
+    if (!value) {
+      const err = new Error(`empty value for ${kind}`);
+      err.status = 400;
+      throw err;
+    }
+
+    const slot = this.slots.get(chatId);
+    const client = slot?.client && isClientAlive(slot.client) ? slot.client : null;
+    if (client) {
+      try {
+        await client.setConfigOption(kind, value);
+        this._learnConfig(client);
+      } catch (err) {
+        // A model the stored history is incompatible with kills the resumed
+        // session — rotate exactly like the prompt path: clear the dead id
+        // (update() flushNow()s it), notice in the transcript, release the
+        // client; the stored value applies at the next spawn.
+        if (!isHistoryIncompatibleError(err)) throw err;
+        this.store.update(chatId, { mspSessionId: null });
+        this._rotated.set(chatId, {
+          reason: 'history-incompatible',
+          message: formatRpcError(err),
+        });
+        this.store.addMessage(chatId, {
+          role: 'notice',
+          text: HISTORY_INCOMPATIBLE_NOTICE,
+        });
+        await this.releaseClient(chatId, 'history-incompatible');
+      }
+    } else {
+      // Cold chat: the cached catalog stands in for the live validation —
+      // same 400 the client would raise (BUG-079).
+      const cached = this.catalog.selects();
+      if (cached) {
+        const select = kind === 'model' ? cached.model : cached.thinking;
+        const bad = (msg) => {
+          const err = new Error(msg);
+          err.status = 400;
+          throw err;
+        };
+        if (!select) bad(`config ${kind} is not advertised by this agent/model`);
+        if (select.values?.length && !select.values.includes(value)) {
+          bad(`${kind}=${value} not advertised (${select.values.join('/')})`);
+        }
+      }
+    }
+    this.store.update(chatId, kind === 'model' ? { model: value } : { effort: value });
+    const config = this.chatConfig(chatId);
+    this.wire.emit(chatId, 'config_changed', { configId: kind, value, config });
+    return { config };
+  }
+
+  // ------------------------------------------------------------- streaming
+
+  _touch(chatId, turnId) {
+    const slot = this.slots.get(chatId);
+    const turn = slot?.turn;
+    if (!turn || turn.turnId !== turnId || turn.settled) return null;
+    turn.sawActivity = true;
+    turn.lastActivity = Date.now();
+    return turn;
+  }
+
+  /**
+   * Batch one stream chunk per chat. The frame that eventually goes out
+   * carries the accumulated `delta` plus the running-total `text` captured at
+   * queue time — the renderer trusts `text`, so batching loses nothing.
+   */
+  _queueDelta(chatId, turnId, kind, delta, text) {
+    let buf = this._deltaBufs.get(chatId);
+    if (!buf) {
+      buf = {};
+      this._deltaBufs.set(chatId, buf);
+    }
+    const entry = buf[kind] || (buf[kind] = { turnId, delta: '', text: '', timer: null });
+    entry.turnId = turnId;
+    entry.delta += delta;
+    entry.text = text;
+    if (DELTA_FLUSH_MS <= 0 || entry.delta.length >= DELTA_FLUSH_CHARS) {
+      this._flushDelta(chatId, kind);
+      return;
+    }
+    if (!entry.timer) {
+      entry.timer = setTimeout(() => this._flushDelta(chatId, kind), DELTA_FLUSH_MS);
+      entry.timer.unref?.();
+    }
+  }
+
+  _flushDelta(chatId, kind) {
+    const entry = this._deltaBufs.get(chatId)?.[kind];
+    if (!entry) return;
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+    if (!entry.delta) return;
+    const { turnId, delta, text } = entry;
+    entry.delta = '';
+    this.wire.emit(chatId, kind === 'message' ? 'message_delta' : 'thought_delta', {
+      turnId,
+      delta,
+      text,
+    });
+  }
+
+  _onUpdate(chatId, params) {
+    const slot = this.slots.get(chatId);
+    const turn = slot?.turn;
+    // Updates outside a live turn still matter (mode echoes, command lists),
+    // but chunk accumulation only makes sense while a turn is open.
+    const turnId = turn && !turn.settled ? turn.turnId : null;
+    const { kind, update } = readUpdate(params);
+    // Every frame from the agent is liveness, not just the kinds we render —
+    // a turn that emits only thoughts / unknown kinds must still feed the
+    // watchdog (grok-desktop bumps on every RPC frame).
+    const t = turnId ? this._touch(chatId, turnId) : null;
+
+    switch (kind) {
+      case 'agent_message_chunk': {
+        const delta = extractText(update.content);
+        if (!delta) return;
+        if (t) {
+          t.text += delta;
+          this._queueDelta(chatId, turnId, 'message', delta, t.text);
+          return;
+        }
+        this.wire.emit(chatId, 'message_delta', { turnId, delta, text: delta });
+        return;
+      }
+      case 'agent_thought_chunk': {
+        const delta = extractText(update.content);
+        if (!delta) return;
+        if (t) {
+          t.thought += delta;
+          this._queueDelta(chatId, turnId, 'thought', delta, t.thought);
+          return;
+        }
+        this.wire.emit(chatId, 'thought_delta', { turnId, delta, text: delta });
+        return;
+      }
+      case 'user_message_chunk': {
+        // Echo of what we just sent. Dropping it is the whole point — grok
+        // appended these and every restart showed each prompt twice.
+        return;
+      }
+      case 'msp:subagent':
+      case 'msp:workflow':
+      case 'msp:reminder_child': {
+        const snap = update.item && typeof update.item === 'object' ? update.item : null;
+        const id = String(snap?.itemId || update.itemId || '');
+        if (!id) return;
+        if (!slot) return;
+        if (!slot.subagents) slot.subagents = new Map();
+        const prev = slot.subagents.get(id) || {};
+        const record = {
+          ...prev,
+          ...snap,
+          itemId: id,
+          kind: snap?.kind || prev.kind
+            || (kind === 'msp:workflow' ? 'workflow' : kind === 'msp:reminder_child' ? 'reminderChild' : 'subagent'),
+          chatId,
+          turnId: turnId || prev.turnId || null,
+          updatedAt: Date.now(),
+        };
+        slot.subagents.set(id, record);
+        this.wire.emit(chatId, 'subagent', { turnId, subagent: record });
+        return;
+      }
+      case 'msp:subagent_delta': {
+        const id = String(update.itemId || '');
+        const delta = String(update.delta || '');
+        if (!id || !delta || !slot?.subagents?.has(id)) return;
+        const rec = slot.subagents.get(id);
+        const text = `${rec.liveText || ''}${delta}`.slice(-SUBAGENT_LIVE_MAX);
+        rec.liveText = text;
+        rec.updatedAt = Date.now();
+        this.wire.emit(chatId, 'subagent_delta', { turnId, itemId: id, delta, text });
+        return;
+      }
+      case 'tool_call':
+      case 'tool_call_update': {
+        this._noteMcpUsage(mcpServerOfToolKind(update.kind));
+        const id = String(update.toolCallId || update.tool_call_id || update.id || randomUUID());
+        const prev = t?.toolCalls.get(id) || {};
+        const record = {
+          id,
+          title: update.title ?? prev.title ?? update.kind ?? 'tool',
+          kind: update.kind ?? prev.kind ?? null,
+          status: update.status ?? prev.status ?? 'pending',
+          locations: update.locations ?? prev.locations ?? [],
+          output: extractToolOutput(update) || prev.output || '',
+          rawInput: update.rawInput ?? prev.rawInput ?? null,
+        };
+        if (t) t.toolCalls.set(id, record);
+        this.wire.emit(chatId, kind === 'tool_call' ? 'tool_call' : 'tool_call_update', {
+          turnId,
+          tool: record,
+        });
+        return;
+      }
+      case 'plan': {
+        const entries = Array.isArray(update.entries) ? update.entries : [];
+        if (t) t.plan = entries;
+        this.wire.emit(chatId, 'plan', { turnId, entries });
+        return;
+      }
+      case 'msp:goal': {
+        if (!slot) return;
+        slot.goal = update.goal ?? null;
+        this.wire.emit(chatId, 'goal', { turnId, goal: slot.goal });
+        return;
+      }
+      case 'msp:ctx': {
+        if (!slot) return;
+        slot.ctx = update.ctx;
+        this.wire.emit(chatId, 'ctx', { turnId, ctx: slot.ctx, tokens: slot.tokens ?? null });
+        return;
+      }
+      case 'msp:tokens': {
+        if (!slot) return;
+        slot.tokens = update.tokens;
+        this.wire.emit(chatId, 'ctx', { turnId, ctx: slot.ctx ?? null, tokens: slot.tokens });
+        return;
+      }
+      case 'msp:usage': {
+        // Subscription usage is account-level, not per chat — cache it and
+        // broadcast globally so every window's pill moves together.
+        this._usageCache = { usage: update.usage, at: Date.now() };
+        this.wire.emit(null, 'usage', { usage: update.usage });
+        return;
+      }
+      case 'available_commands_update': {
+        this.wire.emit(chatId, 'available_commands', {
+          commands: update.availableCommands || update.commands || [],
+        });
+        return;
+      }
+      case 'current_mode_update': {
+        this.wire.emit(chatId, 'agent_mode_echo', { modeId: update.currentModeId || update.modeId || null });
+        return;
+      }
+      case 'config_option_update': {
+        const slotClient = this.slots.get(chatId)?.client;
+        if (slotClient && Array.isArray(update.configOptions)) {
+          slotClient.configOptions = update.configOptions;
+          this._learnConfig(slotClient); // the push refreshes the catalog too (BUG-079)
+        }
+        this.wire.emit(chatId, 'config_option_update', { update });
+        return;
+      }
+      default: {
+        // Unknown kinds are forwarded rather than swallowed: a silently
+        // dropped channel is how grok lost `plan` for months.
+        this.wire.emit(chatId, 'agent_update_other', { kind: kind || 'unknown', update });
+      }
+    }
+  }
+
+  _onPermission(chatId, req) {
+    if (req?.resolved) {
+      this.pendingInteractions.delete(req.id);
+      this.wire.emit(chatId, 'interaction_resolved', {
+        id: req.id,
+        optionId: req.optionId,
+        reason: req.reason || null,
+      });
+      return;
+    }
+    // Scoped like every other turn event: a renderer that missed turn_started
+    // binds the turn from this frame (BUG-015).
+    const turn = this.slots.get(chatId)?.turn;
+    const payload = {
+      id: req.id,
+      kind: 'permission',
+      toolName: req.toolName,
+      toolCallId: req.toolCallId || null,
+      subtype: req.subtype || null,
+      summary: req.summary,
+      body: req.body || '',
+      options: req.options || [],
+      turnId: turn && !turn.settled ? turn.turnId : null,
+      ts: Date.now(),
+    };
+    // Stored, not just broadcast: a client that was not watching this chat
+    // when the request arrived must still be able to answer it.
+    this.pendingInteractions.set(req.id, { chatId, payload });
+    this._touch(chatId, turn?.turnId);
+    this.wire.emit(chatId, 'interaction', payload);
+  }
+
+  resolveInteraction(interactionId, optionId) {
+    const pending = this.pendingInteractions.get(interactionId);
+    if (!pending) return false;
+    const slot = this.slots.get(pending.chatId);
+    const ok = slot?.client?.resolvePermission(interactionId, optionId);
+    this.pendingInteractions.delete(interactionId);
+    this.wire.emit(pending.chatId, 'interaction_resolved', { id: interactionId, optionId });
+    return !!ok;
+  }
+
+  listPendingInteractions() {
+    return [...this.pendingInteractions.entries()].map(([id, p]) => ({
+      id,
+      chatId: p.chatId,
+      ...p.payload,
+    }));
+  }
+
+  // ------------------------------------------------------------ subagents
+
+  listSubagents(chatId) {
+    const slot = this.slots.get(chatId);
+    if (!slot?.subagents) return [];
+    return [...slot.subagents.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }
+
+  /**
+   * Drill into one child: point-in-time `session/read` of its own session
+   * (no attach, no lease — a pure read). Warms the chat's agent when cold.
+   * Throws NOT_FOUND / NO_SESSION / Error (RPC failure) for the route.
+   */
+  async readSubagent(chatId, itemId) {
+    const rec = this.slots.get(chatId)?.subagents?.get(String(itemId));
+    if (!rec) {
+      const e = new Error(`unknown subagent ${itemId}`);
+      e.code = 'NOT_FOUND';
+      throw e;
+    }
+    if (!rec.childSessionId) {
+      const e = new Error('child has no readable session yet');
+      e.code = 'NO_SESSION';
+      throw e;
+    }
+    const drill = await this.readChildSession(chatId, rec.childSessionId);
+    return { record: rec, ...drill };
+  }
+
+  /**
+   * The same point-in-time read addressed by child session id — nested
+   * children from a drill-down are not in the registry, so the panel chains
+   * through here to go one level deeper.
+   */
+  async readChildSession(chatId, childSessionId) {
+    const client = await this.ensureClient(chatId);
+    const res = await client.request('session/read', {
+      sessionId: childSessionId,
+      excludeItems: false,
+    }, { timeoutMs: 30_000 });
+    const history = res?.history && typeof res.history === 'object' ? res.history : {};
+    const mode = typeof history.mode === 'string' ? history.mode : 'unknown';
+    const rawItems = Array.isArray(history.items) ? history.items : [];
+    const items = rawItems.map(sanitizeDrillItem).filter(Boolean);
+    const CAP = 200;
+    const droppedFromHead = items.length > CAP ? items.length - CAP : 0;
+    return {
+      session: res?.session && typeof res.session === 'object' ? {
+        sessionId: String(res.session.sessionId || childSessionId),
+        status: String(res.session.status || ''),
+        turnCount: Number.isFinite(res.session.turnCount) ? res.session.turnCount : null,
+        title: res.session.title != null ? String(res.session.title) : null,
+      } : { sessionId: childSessionId, status: '', turnCount: null, title: null },
+      mode,
+      ...(mode === 'none' && history.noneReason ? { noneReason: String(history.noneReason) } : {}),
+      items: droppedFromHead ? items.slice(droppedFromHead) : items,
+      droppedFromHead,
+      readAt: Date.now(),
+    };
+  }
+
+  getGoal(chatId) {
+    return this.slots.get(chatId)?.goal ?? null;
+  }
+
+  getCtx(chatId) {
+    const slot = this.slots.get(chatId);
+    return { ctx: slot?.ctx ?? null, tokens: slot?.tokens ?? null };
+  }
+
+  /**
+   * Account subscription usage via any hot agent (`usage/read` needs no
+   * model call). Cached 60s; null when no agent is hot — the pill shows
+   * unknown rather than spawning a whole agent for a quota peek.
+   */
+  async getUsage() {
+    const cached = this._usageCache;
+    if (cached && Date.now() - cached.at < 60_000) return cached.usage;
+    const slot = [...this.slots.values()].find((s) => s?.client);
+    if (!slot) return cached?.usage ?? null;
+    try {
+      const res = await slot.client.request('usage/read', {}, { timeoutMs: 15_000 });
+      const usage = sanitizeSubscriptionUsage(res?.usage);
+      if (usage) this._usageCache = { usage, at: Date.now() };
+      return usage ?? cached?.usage ?? null;
+    } catch {
+      return cached?.usage ?? null;
+    }
+  }
+
+  // ------------------------------------------------------------------ mcp
+
+  mcpUsageSnapshot() {
+    return Object.fromEntries(this.mcpUsage.entries());
+  }
+
+  _mcpUsagePath() {
+    if (!this._mcpUsageFile) {
+      const dir = this.store?.file ? path.dirname(this.store.file) : null;
+      this._mcpUsageFile = dir ? path.join(dir, 'mcp-usage.json') : null;
+    }
+    return this._mcpUsageFile;
+  }
+
+  /** Last-used marks survive restarts — a week of real use is what makes
+   * "never used" in the panel a trustworthy trim signal. */
+  _loadMcpUsage() {
+    try {
+      const file = this._mcpUsagePath();
+      if (!file) return;
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (raw && typeof raw === 'object') {
+        for (const [k, v] of Object.entries(raw)) {
+          if (typeof k === 'string' && Number.isFinite(v)) this.mcpUsage.set(k, v);
+        }
+      }
+    } catch {
+      /* missing or corrupt — start blank */
+    }
+  }
+
+  _saveMcpUsageSoon() {
+    if (this._mcpUsageTimer || !this._mcpUsagePath()) return;
+    this._mcpUsageTimer = setTimeout(() => {
+      this._mcpUsageTimer = null;
+      try {
+        fs.writeFileSync(this._mcpUsagePath(), JSON.stringify(Object.fromEntries(this.mcpUsage.entries())));
+      } catch {
+        /* state dir unwritable — memory still serves this run */
+      }
+    }, 1000);
+    this._mcpUsageTimer.unref?.();
+  }
+
+  _noteMcpUsage(server) {
+    if (!server) return;
+    this.mcpUsage.set(server, Date.now());
+    this._saveMcpUsageSoon();
+  }
+
+  /**
+   * After an MCP toggle: drop every hot agent that is NOT mid-turn so the
+   * next prompt spawns a fresh process with the new config. Running turns
+   * keep the old set — killing them would eat the user's work.
+   */
+  async releaseIdleClients(reason = 'mcp config changed') {
+    const released = [];
+    const keptRunning = [];
+    for (const [chatId, slot] of [...this.slots.entries()]) {
+      if (!slot?.client) continue;
+      if (slot.turn && !slot.turn.settled) {
+        keptRunning.push(chatId);
+        continue;
+      }
+      try {
+        await this.releaseClient(chatId, reason);
+        released.push(chatId);
+      } catch {
+        keptRunning.push(chatId);
+      }
+    }
+    return { released, keptRunning };
+  }
+
+  // -------------------------------------------------------------- teardown
+
+  async shutdown({ killAgents = true } = {}) {
+    if (this._demoteTimer) clearInterval(this._demoteTimer);
+    if (killAgents) {
+      await Promise.all([...this.slots.keys()].map((id) => this.releaseClient(id, 'host shutdown')));
+    }
+    this.store.flushNow();
+  }
+
+  stats() {
+    const live = [...this.slots.values()].filter((s) => s.client).length;
+    const running = [...this.slots.values()].filter((s) => s.turn && !s.turn.settled).length;
+    return {
+      chats: this.store.list().length,
+      groups: this.store.listGroups().length,
+      hot: live,
+      running,
+      maxHot: this.defaults.maxHot,
+      pendingInteractions: this.pendingInteractions.size,
+    };
+  }
+}

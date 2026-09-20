@@ -1,0 +1,39 @@
+{
+  "name": "muse-desktop",
+  "productName": "Muse Desktop",
+  "version": "1.0.0",
+  "description": "Muse Desktop — native macOS multi-session MSP client for Muse CLI (muse serve)",
+  "type": "module",
+  "private": true,
+  "main": "src/server/index.js",
+  "scripts": {
+    "start": "node src/server/index.js",
+    "dev": "NO_OPEN=1 node src/server/index.js",
+    "mac": "bash scripts/mac-launch.sh open",
+    "mac:build": "bash scripts/mac-launch.sh build",
+    "mac:host": "bash scripts/mac-launch.sh host",
+    "mac:stop": "bash scripts/mac-launch.sh stop",
+    "deploy": "bash scripts/deploy.sh",
+    "deploy:stop": "bash scripts/deploy.sh --stop",
+    "deploy:status": "bash scripts/deploy.sh --status",
+    "test": "node scripts/unit-test-all.mjs",
+    "test:store": "node scripts/unit-test-session-store.mjs",
+    "test:groups": "node scripts/unit-test-groups.mjs",
+    "test:contrast": "node scripts/unit-test-theme-contrast.mjs",
+    "test:wire": "node scripts/unit-test-sse-wire.mjs",
+    "test:turn": "node scripts/unit-test-turn-core.mjs",
+    "test:mode": "node scripts/unit-test-session-mode.mjs",
+    "test:msp": "node scripts/smoke-msp.mjs",
+    "test:e2e": "node scripts/e2e-mock-agent.mjs",
+    "test:mac-app": "node scripts/test-mac-app.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "marked": "^18.0.0",
+    "mermaid": "^11.17.2"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#10294f"/>
+      <stop offset="0.55" stop-color="#0a1834"/>
+      <stop offset="1" stop-color="#050a18"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#f2feff"/>
+      <stop offset="0.55" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#2f7de1"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 4-point sparkle with concave quadratic sides + a small satellite. -->
+    <mask id="sparkle">
+      <rect width="1024" height="1024" fill="black"/>
+      <path fill="white" d="M 512,130 Q 573,339 782,400 Q 573,461 512,670 Q 451,461 242,400 Q 451,339 512,130 Z"/>
+      <path fill="white" d="M 770,590 Q 781,629 820,640 Q 781,651 770,690 Q 759,651 720,640 Q 759,629 770,590 Z"/>
+    </mask>
+  </defs>
+
+  <rect width="1024" height="1024" rx="228" ry="228" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="228" ry="228" fill="none"
+        stroke="#ffffff" stroke-opacity="0.07" stroke-width="3"/>
+
+  <circle cx="512" cy="400" r="330" fill="url(#glow)"/>
+  <rect width="1024" height="1024" fill="url(#spark)" mask="url(#sparkle)"/>
+
+  <!-- Terminal caret: this is a coding agent, not a chat toy. -->
+  <g opacity="0.92">
+    <path d="M 340 716 L 424 772 L 340 828" fill="none" stroke="#eaf6ff"
+          stroke-opacity="0.9" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="466" y="800" width="230" height="30" rx="15" fill="#7dd3fc"/>
+  </g>
+</svg>

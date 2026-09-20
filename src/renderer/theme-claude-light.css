@@ -1,0 +1,161 @@
+/*
+ * Claude Light — warm cream paper with a terracotta accent.
+ * Apply with <html data-theme="claude-light">.
+ *
+ * Palette ported from grok-desktop's theme-claude-light.css, including the
+ * values its live WCAG audit corrected. Those corrections are the whole point
+ * of the shades below looking "too dark" next to Anthropic's marketing coral:
+ *
+ *   --muted     #8a8279 → #666057   (3.7 → 5.5 on panel)
+ *   accent ink  #c15f3c → #9c4a2c   (4.13 → 5.4)
+ *   green       #3d8b5a → #2f6e47   (4.07 → 5.4)
+ *   plan purple #9a6bb8 → #6b4a8a   (3.97 → ≥4.5)
+ *
+ * Two more came out of auditing this port itself: the accent *fill* had to
+ * drop to #b5573a for the white ＋/Send glyphs, and --danger to #9e5147 to
+ * survive as text on paper. `npm run test:contrast` pins all of it.
+ *
+ * The audit's blind spot is worth repeating: form controls are not text nodes,
+ * so a DOM walk that only measures text misses ::placeholder entirely. Hence
+ * --placeholder is pinned against --input-bg, not against the page background.
+ *
+ * Mood: fade the surfaces, reserve intensity for type. Almost everything here
+ * is a token; the handful of rules at the bottom exist only where the paper
+ * language needs more than a colour swap.
+ */
+
+html[data-theme='claude-light'] {
+  color-scheme: light;
+
+  /* Paper */
+  --bg: #faf7f2;
+  --panel: #f5f0e8; /* sidebar */
+  --panel-2: #efe9e0; /* chips, hovers, inset surfaces */
+  --raised: #fffcf8; /* menus, popovers */
+  --line: #ebe4d9;
+  --line-soft: #f0ebe3;
+
+  /* Type */
+  --ink: #2c2723;
+  --ink-dim: #524d44;
+  --muted: #666057;
+
+  /* Terracotta: fill for surfaces, darker ink for type.
+     The fill is #b5573a rather than the brighter #c15f3c because the ＋ and
+     Send buttons put white glyphs on it — #c15f3c measures 4.23 against white,
+     just under AA; #b5573a is 4.78 and still reads as the same colour. */
+  --accent: #b5573a;
+  --accent-text: #9c4a2c;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(181, 87, 58, 0.1);
+  --accent-line: rgba(181, 87, 58, 0.42);
+  --focus-ring: rgba(181, 87, 58, 0.3);
+
+  --ok: #2f6e47;
+  --warn: #8a6a28;
+  --warn-ink: #fffcf8;
+  --danger: #9e5147;
+  --on-danger: #ffffff;
+
+  /* Warm blush user bubble, tinted by the accent rather than grey */
+  --user-bubble: #f0d2c4;
+
+  /* Code islands: warm paper fill, emphasised dark-brown outline */
+  --code-bg: #f4ecde;
+  --code-line: #8f5a33;
+  --code-ink: #33291f;
+
+  --input-bg: #fffcf6;
+  --placeholder: #6f6a5f; /* 5.25 on --input-bg */
+
+  --shadow: 0 8px 28px rgba(60, 40, 20, 0.1);
+}
+
+/* Warm, low-contrast scrollbars — the dark theme's grey reads as dirt here. */
+html[data-theme='claude-light'] ::-webkit-scrollbar-thumb {
+  background: #d9d0c2;
+  background-clip: content-box;
+}
+
+html[data-theme='claude-light'] ::-webkit-scrollbar-thumb:hover {
+  background: #c4b8a6;
+  background-clip: content-box;
+}
+
+html[data-theme='claude-light'] ::selection {
+  background: rgba(193, 95, 60, 0.22);
+}
+
+/* The user bubble carries an accent-tinted edge instead of the neutral line,
+   so it reads as "mine" without needing a heavier fill. */
+html[data-theme='claude-light'] .msg-user {
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  color: #1e1a17;
+  box-shadow: 0 1px 2px rgba(80, 55, 30, 0.05);
+}
+
+/* Code keeps a visible brown rule on all four sides — on cream, a hairline in
+   --line-soft disappears and the block stops reading as a distinct island. */
+html[data-theme='claude-light'] .msg-assistant pre {
+  box-shadow: 0 1px 2px rgba(80, 55, 30, 0.05);
+}
+
+html[data-theme='claude-light'] .msg-assistant :not(pre) > code {
+  border-color: color-mix(in srgb, var(--code-line) 45%, transparent);
+  color: var(--code-ink);
+}
+
+/* Tool output is a quieter island than a code block: same paper, hairline. */
+html[data-theme='claude-light'] .tool-body {
+  border-top-color: color-mix(in srgb, var(--code-line) 30%, transparent);
+  color: var(--ink-dim);
+}
+
+html[data-theme='claude-light'] .ix-summary,
+html[data-theme='claude-light'] .auth-cmd {
+  border: 1px solid color-mix(in srgb, var(--code-line) 25%, transparent);
+  color: var(--ink-dim);
+}
+
+/* Plan states get their own hues so the checklist stays readable on paper. */
+html[data-theme='claude-light'] .plan-card li.in_progress {
+  color: #6b4a8a;
+}
+
+/* Done items are struck through and de-emphasised, but still have to clear AA
+   on paper — #7a7268 measured 4.17 on the panel. */
+html[data-theme='claude-light'] .plan-card li.completed {
+  color: #6b645a;
+}
+
+/* Blockquote and links lean on the label ink, keeping a hue hierarchy
+   between decorative accent (fills) and semantic accent (type). */
+html[data-theme='claude-light'] .msg-assistant a {
+  color: #964828;
+}
+
+html[data-theme='claude-light'] .msg-assistant blockquote {
+  color: var(--ink-dim);
+  border-left-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Paper wants softer separation than a hard border between panels. */
+html[data-theme='claude-light'] #sidebar {
+  border-right-color: var(--line);
+}
+
+html[data-theme='claude-light'] #chat-head,
+html[data-theme='claude-light'] .side-head,
+html[data-theme='claude-light'] .side-foot {
+  border-color: var(--line);
+}
+
+/* Buttons on cream need a real edge; transparent-on-paper looks unfinished. */
+html[data-theme='claude-light'] .group-btn,
+html[data-theme='claude-light'] .s-del {
+  background: var(--raised);
+}
+
+html[data-theme='claude-light'] .dashed-tab {
+  border-color: #ded5c6;
+}

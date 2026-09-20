@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="th" translate="no" class="notranslate" data-theme="moonlight">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Keep Chrome's translate banner from hijacking the app window (the host
+         opens the default browser when NO_OPEN is unset). -->
+    <meta name="google" content="notranslate" />
+    <meta name="googlebot" content="notranslate" />
+    <title>Muse Desktop</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="/icon.png" />
+    <!-- Blocking on purpose: sets data-theme before the first paint. -->
+    <script src="/theme-boot.js?v=1.0.0"></script>
+    <link rel="stylesheet" href="/style.css?v=1.0.0" />
+    <link rel="stylesheet" href="/theme-claude-light.css?v=1.0.0" />
+    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.0.0" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header class="side-head">
+          <div class="brand">
+            <span class="brand-mark">◗</span>
+            <span class="brand-name">Muse Desktop</span>
+          </div>
+          <button id="new-chat" class="btn primary" type="button" title="Session ใหม่ (⌘N)">＋</button>
+          <button id="new-group" class="btn" type="button" title="Group ใหม่ (⇧⌘N)">▤</button>
+        </header>
+        <!-- Cross-chat search (power-user: find work across rooms) -->
+        <div class="session-search" id="session-search">
+          <input
+            type="search"
+            id="session-search-input"
+            class="session-search-input"
+            placeholder="ค้นหาทุกแชท…"
+            autocomplete="off"
+            spellcheck="false"
+            title="ค้นหา title / messages / tools ข้ามแชท"
+          />
+          <div class="session-search-hits" id="session-search-hits" hidden role="listbox" aria-label="search results"></div>
+        </div>
+        <div id="sidebar-nav" class="sidebar-nav" role="list" aria-label="groups และ sessions"></div>
+        <footer class="side-foot">
+          <div id="agent-badge" class="agent-badge" title="Muse">agent…</div>
+          <div id="version-badge" class="version-badge" title="version">…</div>
+          <button id="theme-toggle" class="btn ghost" type="button" title="Toggle theme">◐</button>
+        </footer>
+      </aside>
+
+      <div id="sidebar-gutter" role="separator" aria-orientation="vertical" aria-controls="sidebar" aria-label="ปรับความกว้างแถบซ้าย" tabindex="0" title="ลากเพื่อปรับความกว้าง (ดับเบิลคลิกเพื่อรีเซ็ต)"></div>
+
+      <main id="main">
+        <header id="chat-head">
+          <div class="head-left">
+            <h1 id="chat-title">Muse Desktop</h1>
+            <button id="chat-cwd" class="cwd" type="button" title="Working directory — click to change"></button>
+          </div>
+          <div class="head-right">
+            <span id="agent-state" class="pill muted">cold</span>
+            <!-- Live subagent count of the active turn (BUG-077) — hidden
+                 when the turn has no agent rows. Click opens the panel. -->
+            <button id="agents-chip" class="pill" type="button" title="subagent ในเทิร์นนี้" hidden>agents 0/0</button>
+            <button id="tasks-chip" class="pill" type="button" title="tasks ในเทิร์นนี้" hidden>tasks 0/0</button>
+            <button id="goal-chip" class="pill" type="button" title="goal ของแชทนี้" hidden>
+              <span class="goal-pct" aria-hidden="true"></span><span class="goal-label"></span>
+            </button>
+            <button id="mcp-btn" class="pill mode" type="button" title="MCP servers">
+              <span class="dot idle" aria-hidden="true"></span><span class="mcp-label">MCP</span>
+            </button>
+            <span class="pill ctx-progress" id="context-pill" role="status" title="Context window" data-level="idle">
+              <span class="ctx-bar-fill" id="ctx-bar-fill" aria-hidden="true"></span>
+              <span class="ctx-bar-text" id="ctx-bar-text">ctx — / —</span>
+            </span>
+            <span class="pill" id="usage-pill" role="status" title="Subscription usage" data-level="idle">5h — · wk —</span>
+            <!-- Config pickers (BUG-075): disabled until the live agent
+                 advertises its selects; effort hides on non-thinking models. -->
+            <button id="model-chip" class="pill mode" type="button" title="โมเดล — คลิกเพื่อเปลี่ยน" hidden>—</button>
+            <button id="effort-chip" class="pill mode" type="button" title="Effort การคิด — คลิกเพื่อเปลี่ยน" hidden>—</button>
+            <button id="mode-chip" class="pill mode" type="button" title="Mode (Shift+Tab)">yolo</button>
+            <button id="btn-session-find" class="btn ghost" type="button" title="ค้นหาในแชทนี้ (⌘F)" aria-expanded="false" aria-label="ค้นหาในแชทนี้">⌕</button>
+            <button id="release-agent" class="btn ghost" type="button" title="Stop this chat's agent">⏻</button>
+          </div>
+        </header>
+
+        <div id="auth-gate" class="auth-gate" hidden>
+          <div class="auth-card">
+            <h2>ยังไม่ได้ล็อกอิน Muse</h2>
+            <p>
+              <code>muse serve</code> ตอบว่า <strong>not logged in</strong> —
+              การล็อกอินเป็นแบบ device-code ต้องทำในเทอร์มินัลจริง กดปุ่มข้างล่างเพื่อเปิด
+              Terminal แล้วทำตามขั้นตอน จากนั้นกลับมาพิมพ์ต่อได้เลย
+            </p>
+            <div class="auth-actions">
+              <button id="auth-login" class="btn primary" type="button">เปิด Terminal แล้ว login</button>
+              <button id="auth-retry" class="btn ghost" type="button">ลองใหม่</button>
+            </div>
+            <code id="auth-cmd" class="auth-cmd"></code>
+          </div>
+        </div>
+
+        <!-- Find-in-chat: generated content of THIS chat only -->
+        <div class="session-find" id="session-find" hidden>
+          <span class="session-find-icon" aria-hidden="true">⌕</span>
+          <input
+            type="search"
+            id="session-find-input"
+            class="session-find-input"
+            placeholder="ค้นหาในเนื้อหาที่ generate ของแชทนี้…"
+            autocomplete="off"
+            spellcheck="false"
+            title="ค้นเฉพาะเนื้อหาที่ AI generate ในแชทนี้ (ไม่รวมคำสั่ง/prompt ของเรา · ไม่ข้ามแชท)"
+          />
+          <span class="session-find-count" id="session-find-count" aria-live="polite"></span>
+          <button type="button" id="session-find-prev" class="session-find-nav" title="ผลก่อนหน้า (Shift+Enter)" aria-label="Previous match">↑</button>
+          <button type="button" id="session-find-next" class="session-find-nav" title="ผลถัดไป (Enter)" aria-label="Next match">↓</button>
+          <button type="button" id="session-find-close" class="session-find-close" title="ปิด (Esc)" aria-label="Close find">✕</button>
+          <div class="session-find-hits" id="session-find-hits" hidden role="listbox" aria-label="matches in this chat"></div>
+        </div>
+
+        <div id="transcript" class="transcript"></div>
+
+        <!-- Recovery affordance once the user unpins (scrolls up): jump back
+             to the live tail. Shown from app.js when new content lands while
+             unpinned (BUG-047; grok-desktop ensureJumpButton). -->
+        <button id="jump-latest" class="jump-latest" type="button" hidden>↓ ล่าสุด</button>
+
+        <div id="status-line" class="status-line" hidden>
+          <span class="spark">✳</span>
+          <span id="status-text">กำลังคิด…</span>
+          <span id="status-timer" class="timer"></span>
+        </div>
+
+        <!-- Queued prompts (per-chat FIFO, in-memory only): quiet chip above
+             the composer, click expands per-item list with ✕ (BUG-051). -->
+        <div id="prompt-queue" class="prompt-queue" hidden>
+          <button
+            type="button"
+            class="prompt-queue-chip"
+            id="prompt-queue-chip"
+            title="ข้อความรอส่งเมื่อเทิร์นจบ (ไม่บันทึกข้าม restart)"
+          >⏳ รอส่ง 0 ข้อความ</button>
+          <ul class="prompt-queue-list" id="prompt-queue-list" hidden></ul>
+        </div>
+
+        <!-- Attached files (paths handed to the agent; images ride as parts) -->
+        <div class="attach-bar" id="attach-bar" hidden aria-label="ไฟล์แนบ"></div>
+
+        <form id="composer" class="composer">
+          <!-- The wrapper mirrors the value into a hidden ::after so the grid
+               sizes itself. Measuring textarea.scrollHeight in this flex row
+               reports a bogus height and pins the box open at max-height. -->
+          <div id="grow" class="grow-wrap" data-value="">
+            <textarea
+              id="prompt"
+              rows="1"
+              placeholder="ถาม Muse… (⏎ ส่ง · ⇧⏎ ขึ้นบรรทัด · ⇧⇥ สลับโหมด)"
+              autocomplete="off"
+              spellcheck="false"
+            ></textarea>
+          </div>
+          <button
+            type="button"
+            id="btn-attach"
+            class="btn ghost"
+            title="แนบไฟล์ให้ Muse อ่าน (เลือกได้หลายไฟล์)"
+            aria-label="แนบไฟล์"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+          >📎</button>
+          <button id="send" class="btn send" type="submit" title="Send (⏎)">↑</button>
+          <!-- Attach popover: native picker + paste-paths fallback -->
+          <div id="attach-pop" class="attach-pop" hidden role="dialog" aria-label="แนบไฟล์ให้ Muse">
+            <div class="attach-pop-head">แนบไฟล์ / โฟลเดอร์ให้ Muse อ่าน</div>
+            <div class="attach-browse-row">
+              <button type="button" id="attach-browse" class="btn ghost attach-browse-btn">📄 เลือกไฟล์</button>
+              <button type="button" id="attach-browse-folder" class="btn ghost attach-browse-btn">📁 เลือกโฟลเดอร์</button>
+            </div>
+            <div class="attach-pop-or">หรือวาง absolute path (บรรทัดละไฟล์/โฟลเดอร์)</div>
+            <textarea id="attach-paste" class="attach-paste" rows="3" spellcheck="false" placeholder="/Users/s89061/…/file1.py&#10;/Users/s89061/…/notes.md"></textarea>
+            <div class="attach-pop-actions">
+              <button type="button" id="attach-add" class="btn primary">เพิ่ม</button>
+              <button type="button" id="attach-close" class="btn ghost">ปิด</button>
+            </div>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <!-- Standalone version paint: runs even when app.js fails to load, so a
+         dead boot never leaves a silent shell (BUG-066). External file rather
+         than an inline script because the CSP is script-src 'self'. -->
+    <script src="/version-boot.js?v=1.0.0"></script>
+    <script type="module" src="/app.js?v=1.0.0"></script>
+  </body>
+</html>

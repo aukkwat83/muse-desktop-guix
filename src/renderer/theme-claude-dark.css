@@ -1,0 +1,71 @@
+/*
+ * Claude Dark — warm charcoal with the same terracotta accent as Claude Light.
+ * Apply with <html data-theme="claude-dark">.
+ *
+ * Palette ported from grok-desktop's theme-claude-dark.css onto muse's smaller
+ * token set. muse has one --panel where grok splits --panel/--sidebar, so the
+ * sidebar/cards take grok's darker --sidebar shade — grok's #30302e panel
+ * would put its own --muted at 3.68 under muse's audit, which measures muted
+ * text on raised and panel-2 too. Two more values moved for the same audit:
+ *
+ *   accent fill  #da7756 → #b5573a   (white glyphs: ~3.1 → 4.78 — the exact
+ *                                     call Claude Light already made)
+ *   --muted      #8a877e → #a19e95   (3.68 on raised #30302e → 4.93)
+ *
+ * Base style.css is already a dark theme, so this file needs few component
+ * overrides — tokens do almost all of the work.
+ */
+
+html[data-theme='claude-dark'] {
+  color-scheme: dark;
+
+  /* Warm charcoal */
+  --bg: #262624;
+  --panel: #1f1e1b; /* sidebar + cards — grok's --sidebar */
+  --panel-2: #2a2926; /* chips, hovers, inset surfaces */
+  --raised: #30302e; /* menus, popovers — grok's --panel */
+  --line: rgba(255, 250, 240, 0.12);
+  --line-soft: rgba(255, 250, 240, 0.08);
+
+  /* Type */
+  --ink: #f0eee6;
+  --ink-dim: #b8b5ad;
+  --muted: #a19e95;
+
+  /* Terracotta: fill for surfaces, brighter ink for type. */
+  --accent: #b5573a;
+  --accent-text: #da7756;
+  --accent-ink: #ffffff;
+  --accent-soft: rgba(218, 119, 86, 0.12);
+  --accent-line: rgba(218, 119, 86, 0.42);
+  --focus-ring: rgba(181, 87, 58, 0.3);
+
+  --ok: #6fa87e;
+  --warn: #b8924a;
+  --warn-ink: #1b1400;
+  /* grok's text danger; light enough to read on the panel, and a dark ink on
+     the fill measures ~7 — same shape as moonlight's danger pair. */
+  --danger: #d0887e;
+  --on-danger: #2e0709;
+
+  --user-bubble: #3a332c;
+
+  /* Code islands stay slightly darker warm for readability */
+  --code-bg: #1a1916;
+  --code-line: #2e2c28;
+
+  --input-bg: #3a3a37;
+  --placeholder: #ada9a0; /* 4.87 on --input-bg (grok's audit) */
+
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+
+html[data-theme='claude-dark'] ::selection {
+  background: rgba(218, 119, 86, 0.28);
+}
+
+/* The user bubble carries an accent-tinted edge instead of the neutral line,
+   so it reads as "mine" without needing a heavier fill. */
+html[data-theme='claude-dark'] .msg-user {
+  border-color: color-mix(in srgb, var(--accent-text) 35%, transparent);
+}
