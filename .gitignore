@@ -6,3 +6,7 @@ node_modules
 # build output
 dist/
 macos/MuseDesktopShell/.build/
+
+# native GTK shell binary (built by scripts/native-launch.sh build)
+linux/gtk-shell/muse-desktop-shell
+__pycache__/

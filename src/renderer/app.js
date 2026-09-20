@@ -2850,7 +2850,9 @@ function wireUi() {
       void stopTurn();
       return;
     }
-    if (ev.key.toLowerCase() === 'n' && ev.metaKey) {
+    // New chat: Cmd+N on mac, Ctrl+N on Linux (the GTK shell has no browser
+    // chrome, so Ctrl+N is free there; same dual binding as find-in-chat).
+    if (ev.key.toLowerCase() === 'n' && (ev.metaKey || ev.ctrlKey)) {
       ev.preventDefault();
       if (ev.shiftKey) sidebar.actions.createGroup(`Group ${state.groups.length + 1}`);
       else void newChat();

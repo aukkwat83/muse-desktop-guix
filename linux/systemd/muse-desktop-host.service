@@ -1,0 +1,30 @@
+[Unit]
+Description=Muse Desktop MSP host (Node multi-session)
+Documentation=file:%h/muse-desktop-guix/GUIX.md
+After=network-online.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/muse-desktop-guix
+# Keep host when UI closes; warm pool for work
+Environment=NO_OPEN=1
+Environment=MUSE_DESKTOP_KEEP_ON_EXIT=1
+Environment=MUSE_DESKTOP_MAX_HOT_AGENTS=6
+Environment=MUSE_DESKTOP_CREATE_WARM=1
+Environment=UV_THREADPOOL_SIZE=8
+Environment=PATH=%h/.guix-profile/bin:%h/.local/bin:/run/current-system/profile/bin
+# Prefer host survival under GNOME memory pressure (sessions evict beyond maxHot)
+Nice=-5
+OOMScoreAdjust=-200
+# SQLite + many agents open FDs
+LimitNOFILE=65536
+ExecStart=/usr/bin/env node src/server/index.js
+Restart=on-failure
+RestartSec=3
+# Soft memory high-water: warn kernel before hard OOM (16 GB class machines)
+# MemoryHigh=12G
+# MemoryMax=14G
+
+[Install]
+WantedBy=default.target

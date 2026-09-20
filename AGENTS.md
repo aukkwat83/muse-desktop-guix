@@ -105,8 +105,9 @@ has never worked.
   binary decides). It is advisory like the mode set: an unadvertised value is skipped with a
   stderr note, never a session failure.
 - `MspClient.spawnEnv()` falls back to the local PAC proxy (`SCB_PAC_PROXY`, default
-  `http://127.0.0.1:39080`): Finder/Dock launches strip the shell env. An explicitly exported
-  env always wins over the fallback.
+  `http://127.0.0.1:39080`) **on macOS only** (`defaultPacProxy`): Finder/Dock launches strip
+  the shell env. Linux/Guix has no PAC bridge, so the fallback there is direct connection.
+  An explicitly exported env always wins over the fallback on both platforms.
 - Agent sandboxes: a `muse serve` child started from inside a sandboxed agent session can
   fail its MCP startup audit (turns die with `MCP startup audit failed`). That is an
   environment artifact, not a product bug — the deployed app runs as the user, unsandboxed,
@@ -134,9 +135,36 @@ in this family passed its unit tests.
   and the change looks like it did nothing, and the version badge lies about the serving build
   (the css-guards suite fails when the two drift, BUG-078).
 
+## Guix / Linux shell
+
+`linux/gtk-shell/main.c` is the C shell (GTK4 + WebKitGTK); `muse_desktop_shell.py`
+is the fallback/reference. Same contracts as the mac shell: reload bypasses the
+cache, restart goes through `POST /api/host/shutdown {killAgents:false}`, the
+Inspector is on. Guix stack modelled on grok-desktop `deploy/v0.8.9-guix`.
+
+- **Launch path.** `build.sh` links the binary against `/gnu/store`, so
+  `native-launch.sh` execs it directly. Never wrap that exec in
+  `guix shell -m manifest.scm` (re-realizes ~105 MB per launch, no output —
+  reads as "the app won't open"). The slow path stays behind
+  `MUSE_DESKTOP_FORCE_GUIX_SHELL=1`. Guarded by `npm run test:guix-shell`.
+- **`bin/muse-desktop` resolves itself through symlinks** (`~/.local/bin`
+  points at it). Without that, ROOT becomes `~/.local` and the built binary is
+  "not found" (HAZ-10). Guarded by the same suite.
+- **Reload is renderer-only.** After a server-side change, ↻ Restart host (or
+  `deploy.sh --stop` + `--start`) — Ctrl+R alone repaints the new bundle
+  against the old node process.
+- **No PAC on Guix** (see above). No `chrome-shell.js` SoT — the Chrome
+  fallback uses minimal inline `--app` flags.
+- **Thai clip trap.** Sarabun's raised tone marks paint outside the line box;
+  never ship a bare `overflow: hidden` + tight `line-height` on one-line
+  elements (see `GUIX.md`).
+- The `cardDrag` bridge is registered but **dormant** — no sender exists yet.
+  `diagramSave` stays macOS-only; the renderer falls back to in-page download.
+
 ## Things deliberately not built
 
-- Linux/Windows. `docs/attic/` has two sketches from the original scaffold; neither runs.
+- Windows. (`docs/attic/` has two sketches from the original scaffold; neither runs.
+  Linux is implemented now — this section used to say otherwise.)
 - Electron. The shell is Swift; there is no `electron-builder` path.
 - Multi-question / multi-select / free-text agent questions. The card posts a single optionId
   and `userInput/answer` requires every question answered, so shapes that do not fit are

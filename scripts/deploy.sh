@@ -11,6 +11,10 @@
 #   ./scripts/deploy.sh --stop     stop the host
 #   ./scripts/deploy.sh --status   print /api/state
 #
+# Platform: macOS builds dist/MuseDesktop.app via mac-launch.sh; Linux/Guix
+# builds linux/gtk-shell/muse-desktop-shell via native-launch.sh and stops the
+# host via linux-launch.sh. The host itself is the same node process.
+#
 # HARD SAFETY: the local PAC proxy (127.0.0.1:39080) is referenced only as a
 # URL passed through the environment (existing SCB_PAC_PROXY behavior). This
 # script never probes, starts, stops, or signals that process.
@@ -32,14 +36,18 @@ APP_OUT="$ROOT/dist/MuseDesktop.app"
 NODE_BIN_DIR="$(dirname "$(command -v node || echo /usr/local/bin/node)")"
 export PATH="$NODE_BIN_DIR:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-# Proxy: adopt the machine's PAC bridge as an env var only (same default as
-# msp-client.js spawnEnv's SCB_PAC_PROXY fallback; an explicitly exported env
-# always wins). Pre-setting https_proxy also short-circuits the nc probe in
-# mac-launch.sh, so nothing on the deploy path ever probes the proxy port.
-export https_proxy="${https_proxy:-${SCB_PAC_PROXY:-http://127.0.0.1:39080}}"
-export http_proxy="${http_proxy:-$https_proxy}"
-export HTTPS_PROXY="${HTTPS_PROXY:-$https_proxy}"
-export HTTP_PROXY="${HTTP_PROXY:-$http_proxy}"
+# Proxy: on macOS, adopt the machine's PAC bridge as an env var only (same
+# default as msp-client.js spawnEnv's SCB_PAC_PROXY fallback; an explicitly
+# exported env always wins). Pre-setting https_proxy also short-circuits the nc
+# probe in mac-launch.sh, so nothing on the deploy path ever probes the proxy
+# port. On Linux/Guix there is no PAC bridge — honor explicit env only, never
+# default a dead 127.0.0.1:39080 (it would break agent TLS).
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  export https_proxy="${https_proxy:-${SCB_PAC_PROXY:-http://127.0.0.1:39080}}"
+  export http_proxy="${http_proxy:-$https_proxy}"
+  export HTTPS_PROXY="${HTTPS_PROXY:-$https_proxy}"
+  export HTTP_PROXY="${HTTP_PROXY:-$http_proxy}"
+fi
 export no_proxy="${no_proxy:-localhost,127.0.0.1,::1}"
 export NO_PROXY="${NO_PROXY:-$no_proxy}"
 
@@ -49,7 +57,12 @@ fail() { printf '[deploy] ERROR: %s\n' "$*" >&2; exit 1; }
 healthy() { curl -fsS -m 2 "$BASE/api/state" >/dev/null 2>&1; }
 
 install_deps() {
-  command -v node >/dev/null 2>&1 || fail "missing required command: node"
+  if ! command -v node >/dev/null 2>&1; then
+    if command -v guix >/dev/null 2>&1; then
+      fail "missing required command: node (run: guix install node curl, then re-login)"
+    fi
+    fail "missing required command: node"
+  fi
   command -v npm >/dev/null 2>&1 || fail "missing required command: npm"
   local major
   major="$(node -p 'process.versions.node.split(".")[0]')"
@@ -63,8 +76,17 @@ install_deps() {
 }
 
 build_app() {
-  # The whole build (swift build + wrap_app) already lives in mac-launch.sh.
-  bash "$ROOT/scripts/mac-launch.sh" build
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    # The whole build (swift build + wrap_app) already lives in mac-launch.sh.
+    bash "$ROOT/scripts/mac-launch.sh" build
+    return 0
+  fi
+  # Linux/Guix: compile the native GTK shell (no-op guidance without guix).
+  if command -v guix >/dev/null 2>&1; then
+    bash "$ROOT/scripts/native-launch.sh" build
+  else
+    log "no guix — skipping native shell build (host + Chrome fallback still work)"
+  fi
 }
 
 check_muse() {
@@ -78,7 +100,11 @@ check_muse() {
 stop_host() {
   # One implementation of the HTTP-first, verified-pid teardown (BUG-068) —
   # deploy never re-implements (or weakens) it.
-  MUSE_DESKTOP_PORT="$PORT" bash "$ROOT/scripts/mac-launch.sh" stop
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    MUSE_DESKTOP_PORT="$PORT" bash "$ROOT/scripts/mac-launch.sh" stop
+  else
+    MUSE_DESKTOP_PORT="$PORT" bash "$ROOT/scripts/linux-launch.sh" stop
+  fi
   local i
   for i in $(seq 1 40); do
     healthy || return 0
@@ -122,9 +148,11 @@ open_app() {
     log "skip open (NO_OPEN/CI)"
     return 0
   fi
-  if [[ -d "$APP_OUT" ]]; then
+  if [[ "$(uname -s)" == "Darwin" && -d "$APP_OUT" ]]; then
     open "$APP_OUT"
     log "opened $APP_OUT"
+  elif [[ "$(uname -s)" != "Darwin" ]]; then
+    log "UI at $BASE — open it with ./bin/muse-desktop"
   else
     log "no app bundle — UI at $BASE"
   fi

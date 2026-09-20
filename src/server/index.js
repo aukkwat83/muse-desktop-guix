@@ -21,6 +21,13 @@ import { MUSE_BIN, terminalAuthCommand } from './msp-client.js';
 import { debugSnapshot } from './debug-info.js';
 import { probeAll, probeServer, readCatalog, setEnabled } from './mcp.js';
 import { saveUpload } from './attachments.js';
+import {
+  resolveDialog,
+  dialogArgs,
+  parsePickerPaths,
+  isPickerCancel,
+  noDialogMessage,
+} from './file-picker.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '../..');
@@ -585,16 +592,40 @@ const server = http.createServer(async (req, res) => {
     // Native macOS picker (osascript, grok-desktop parity) + an upload inbox
     // for dropped files (browsers hide their paths, so bytes come inline).
     if (pathname === '/api/pick-files' && method === 'POST') {
+      const folder = url.searchParams.get('mode') === 'folder';
       if (process.platform !== 'darwin') {
-        return send(res, 200, {
-          ok: false,
-          paths: [],
-          error: 'native picker available on macOS only — paste paths instead',
-        });
+        // Linux/Guix: no osascript, and no GTK binding in this process — drive
+        // a freedesktop dialog binary instead. Resolved per request so a later
+        // `guix install zenity` takes effect without restarting the host.
+        // (Wayland gives us no way to parent the dialog to the shell window,
+        // so it is its own toplevel and may open unfocused. Harmless.)
+        const dialog = resolveDialog();
+        if (!dialog) {
+          return send(res, 200, { ok: false, paths: [], error: noDialogMessage() });
+        }
+        try {
+          const stdout = await new Promise((resolve, reject) => {
+            execFile(
+              dialog.bin,
+              dialogArgs(dialog.kind, { folder }),
+              { timeout: 180000, maxBuffer: 1 << 20 },
+              (err, out) => (err ? reject(err) : resolve(out)),
+            );
+          });
+          return send(res, 200, { ok: true, paths: parsePickerPaths(stdout) });
+        } catch (err) {
+          // Dismissed dialog (exit 1, nothing selected) is a normal cancel.
+          const canceled = isPickerCancel(err, '');
+          return send(res, 200, {
+            ok: true,
+            canceled,
+            paths: [],
+            ...(canceled ? {} : { error: String(err?.message || err).slice(0, 200) }),
+          });
+        }
       }
       // `activate` brings the picker frontmost (host runs detached in the
       // background, so it would otherwise open behind the window).
-      const folder = url.searchParams.get('mode') === 'folder';
       const chooser = folder
         ? 'choose folder with prompt "เลือกโฟลเดอร์ให้ Muse อ่าน (เลือกได้หลายโฟลเดอร์)" with multiple selections allowed'
         : 'choose file with prompt "แนบไฟล์ให้ Muse อ่าน (เลือกได้หลายไฟล์)" with multiple selections allowed';

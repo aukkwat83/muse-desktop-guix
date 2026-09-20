@@ -649,13 +649,14 @@ export class MspClient extends EventEmitter {
   }
 
   spawnEnv() {
-    // Finder/Dock launches strip the shell env, and on this machine direct
-    // TLS is unreliable — default the child to the local PAC proxy.
+    // Finder/Dock launches strip the shell env, and on the mac direct
+    // TLS is unreliable — default the child to the local PAC proxy there.
+    // Linux/Guix has no PAC bridge: pointing the child at a dead
+    // 127.0.0.1:39080 would break agent TLS, so the fallback is darwin-only.
     // An explicitly exported env always wins over the fallback.
-    const pac = this.env.SCB_PAC_PROXY || 'http://127.0.0.1:39080';
+    const pac = defaultPacProxy(this.env);
     return {
-      HTTPS_PROXY: pac,
-      HTTP_PROXY: pac,
+      ...(pac ? { HTTPS_PROXY: pac, HTTP_PROXY: pac } : {}),
       NO_PROXY: 'localhost,127.0.0.1,::1',
       ...this.env,
     };
@@ -1509,6 +1510,19 @@ export class MspClient extends EventEmitter {
       }, 2000).unref?.();
     }
   }
+}
+
+/**
+ * Proxy fallback for spawned `muse serve` children. Pure (env + platform in,
+ * URL-or-empty out) so the Guix rule is unit-testable on any platform.
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {NodeJS.Platform} [platform]
+ * @returns {string} proxy URL, or '' for direct connection
+ */
+export function defaultPacProxy(env = {}, platform = process.platform) {
+  if (env.SCB_PAC_PROXY) return env.SCB_PAC_PROXY;
+  if (platform === 'darwin') return 'http://127.0.0.1:39080';
+  return '';
 }
 
 /**

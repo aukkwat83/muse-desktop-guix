@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Launch Muse Desktop (local server + Chrome app window).
+set -euo pipefail
+
+# Resolve through symlinks (e.g. ~/.local/bin/muse-desktop → …/bin/muse-desktop).
+# Without this, dirname of the symlink is ~/.local/bin and ROOT becomes ~/.local,
+# so the native shell binary is "not found" and launch falls through to a broken
+# Chrome path ("Open manually").
+_script="${BASH_SOURCE[0]}"
+while [[ -L "$_script" ]]; do
+  _dir="$(cd -P "$(dirname "$_script")" && pwd)"
+  _script="$(readlink "$_script")"
+  [[ "$_script" != /* ]] && _script="$_dir/$_script"
+done
+ROOT="$(cd -P "$(dirname "$_script")/.." && pwd)"
+unset _script _dir
+PORT="${MUSE_DESKTOP_PORT:-3850}"
+HOST="${MUSE_DESKTOP_HOST:-127.0.0.1}"
+URL="http://${HOST}:${PORT}/"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/muse-desktop"
+LOG_FILE="${LOG_DIR}/host.log"
+PID_FILE="${LOG_DIR}/host.pid"
+LEGACY_PID_FILE="${LOG_DIR}/server.pid"
+
+# Prefer user Guix profile (node/curl after `guix install`) over bare login PATH.
+export PATH="${HOME}/.local/bin:${HOME}/.guix-profile/bin:${HOME}/.npm-global/bin:/run/current-system/profile/bin:${PATH}"
+export MUSE_BIN="${MUSE_BIN:-$(command -v muse || true)}"
+# Host pool defaults (same as src/server/sessions.js) — override via env before launch
+export MUSE_DESKTOP_MAX_HOT_AGENTS="${MUSE_DESKTOP_MAX_HOT_AGENTS:-6}"
+export MUSE_DESKTOP_CREATE_WARM="${MUSE_DESKTOP_CREATE_WARM:-1}"
+export MUSE_DESKTOP_KEEP_ON_EXIT="${MUSE_DESKTOP_KEEP_ON_EXIT:-1}"
+
+mkdir -p "$LOG_DIR"
+
+resolve_chrome() {
+  if [[ -n "${MUSE_DESKTOP_CHROME:-}" && -x "$MUSE_DESKTOP_CHROME" ]]; then
+    echo "$MUSE_DESKTOP_CHROME"
+    return
+  fi
+  if [[ -n "${CHROME_BIN:-}" && -x "$CHROME_BIN" ]]; then
+    echo "$CHROME_BIN"
+    return
+  fi
+  for c in \
+    "${HOME}/.local/bin/google-chrome" \
+    "${HOME}/.guix-profile/bin/chromium" \
+    "${HOME}/.guix-profile/bin/google-chrome-stable" \
+    /run/current-system/profile/bin/chromium \
+    /usr/bin/google-chrome \
+    /usr/bin/google-chrome-stable \
+    /usr/bin/chromium \
+    /usr/bin/chromium-browser
+  do
+    if [[ -x "$c" ]]; then
+      echo "$c"
+      return
+    fi
+  done
+  command -v google-chrome 2>/dev/null || command -v chromium 2>/dev/null || true
+}
+
+port_open() {
+  # true if something already listens on PORT
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -qE "[:.]${PORT}\\s"
+    return $?
+  fi
+  # fallback: try connect
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 1 "$URL" >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+start_server() {
+  if port_open; then
+    echo "[muse-desktop] already running on ${URL}"
+    return 0
+  fi
+
+  if ! command -v node >/dev/null 2>&1; then
+    echo "node not found on PATH" >&2
+    exit 1
+  fi
+  if [[ -z "${MUSE_BIN}" || ! -x "${MUSE_BIN}" ]]; then
+    # still allow start — agent start will fail with a clear UI error
+    echo "[muse-desktop] warning: muse CLI not found on PATH" >&2
+  fi
+
+  cd "$ROOT"
+  # NO_OPEN: launcher opens the app window itself (single place)
+  export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-8}"
+  NO_OPEN=1 nohup env \
+    UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE}" \
+    MUSE_DESKTOP_MAX_HOT_AGENTS="${MUSE_DESKTOP_MAX_HOT_AGENTS}" \
+    MUSE_DESKTOP_KEEP_ON_EXIT="${MUSE_DESKTOP_KEEP_ON_EXIT}" \
+    node src/server/index.js >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+
+  # wait for readiness
+  for _ in $(seq 1 40); do
+    if port_open; then
+      echo "[muse-desktop] server ready at ${URL}"
+      return 0
+    fi
+    sleep 0.15
+  done
+  echo "[muse-desktop] server failed to start — see ${LOG_FILE}" >&2
+  exit 1
+}
+
+open_window() {
+  local chrome
+  chrome="$(resolve_chrome)"
+  if [[ -z "$chrome" ]]; then
+    if command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$URL" >/dev/null 2>&1 &
+      return
+    fi
+    echo "Open manually: $URL" >&2
+    return 1
+  fi
+  # Minimal --app flags (same shape as scripts/linux-launch.sh open_ui).
+  local profile_dir="${XDG_STATE_HOME:-$HOME/.local/state}/muse-desktop/chrome-profile"
+  mkdir -p "$profile_dir"
+  local -a args=(--app="$URL" --class=MuseDesktop --user-data-dir="$profile_dir"
+    --enable-gpu-rasterization --enable-zero-copy --disable-extensions)
+  export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-8}"
+  nohup "$chrome" "${args[@]}" >>"${LOG_DIR}/chrome.log" 2>&1 &
+}
+
+case "${1:-}" in
+  stop)
+    # host.pid is canonical; server.pid is legacy (old scripts only)
+    for f in "$PID_FILE" "$LEGACY_PID_FILE"; do
+      if [[ -f "$f" ]]; then
+        kill "$(cat "$f")" 2>/dev/null || true
+        rm -f "$f"
+      fi
+    done
+    # also kill by port if possible
+    if command -v fuser >/dev/null 2>&1; then
+      fuser -k "${PORT}/tcp" 2>/dev/null || true
+    fi
+    echo "[muse-desktop] stopped"
+    exit 0
+    ;;
+  status)
+    if port_open; then
+      echo "running ${URL}"
+      exit 0
+    fi
+    echo "stopped"
+    exit 1
+    ;;
+  url)
+    echo "$URL"
+    exit 0
+    ;;
+  chrome|browser)
+    # Force Chrome --app fallback
+    start_server
+    open_window
+    exit 0
+    ;;
+  native)
+    exec "$ROOT/scripts/native-launch.sh" open
+    ;;
+esac
+
+# Default: native GTK+WebKit app when Guix is available (not tied to any browser).
+# Override: MUSE_DESKTOP_SHELL=chrome  or  muse-desktop chrome
+SHELL_MODE="${MUSE_DESKTOP_SHELL:-native}"
+if [[ "$SHELL_MODE" == "native" || "$SHELL_MODE" == "gtk" || "$SHELL_MODE" == "webkit" ]]; then
+  # Require a ready-to-run shell binary, not merely the presence of guix: on Guix System
+  # `command -v guix` always succeeds, so gating on it alone made this fallback unreachable
+  # and a missing/unbuilt binary turned the default launch into a silent multi-minute build.
+  # Explicit `muse-desktop native` bypasses this guard and will still build on demand.
+  if command -v guix >/dev/null 2>&1 && [[ -x "$ROOT/linux/gtk-shell/muse-desktop-shell" ]]; then
+    exec "$ROOT/scripts/native-launch.sh" open
+  fi
+  echo "[muse-desktop] native shell not built (run: muse-desktop native) — using Chrome app" >&2
+fi
+start_server
+open_window

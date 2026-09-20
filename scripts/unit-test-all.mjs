@@ -15,6 +15,8 @@ const SUITES = [
   ['theme-boot', 'unit-test-theme-boot.mjs'],
   ['css-guards', 'unit-test-css-guards.mjs'],
   ['mac-app', 'test-mac-app.mjs'],
+  ['guix-shell', 'unit-test-guix-shell.mjs'],
+  ['guix-platform', 'unit-test-guix-platform.mjs'],
   ['debug-info', 'unit-test-debug-info.mjs'],
   ['sse-wire', 'unit-test-sse-wire.mjs'],
   ['permission-host', 'unit-test-permission-host.mjs'],

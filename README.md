@@ -1,11 +1,12 @@
 # Muse Desktop
 
-A native macOS client for [Muse CLI](https://www.meta.ai/code), driving it
+A native desktop client for [Muse CLI](https://www.meta.ai/code), driving it
 over MSP — the Muse Session Protocol (`muse serve`, JSON-RPC 2.0 over stdio).
 
 Same shape as its siblings `kimi-desktop` / `grok-desktop`, from which it was
-forked: a long-lived Node host owns the agents, a small SwiftUI + WKWebView
-shell is the window. Closing the window does not kill a running task.
+forked: a long-lived Node host owns the agents, a small native shell is the
+window — SwiftUI + WKWebView on macOS, GTK4 + WebKitGTK on Guix System.
+Closing the window does not kill a running task.
 
 ```
 ┌── MuseDesktop.app (SwiftUI) ──┐      ┌── Node host :3850 ──┐      ┌── muse serve ──┐
@@ -47,6 +48,17 @@ To run only the host and use a browser instead:
 npm run dev        # http://127.0.0.1:3850
 ```
 
+On Guix System (native GTK shell, no mac needed):
+
+```bash
+git clone https://github.com/aukkwat83/muse-desktop-guix.git ~/muse-desktop-guix
+cd ~/muse-desktop-guix
+npm install
+./scripts/native-launch.sh open
+```
+
+See [GUIX.md](GUIX.md) and [docs/DEPLOY-GUIX.md](docs/DEPLOY-GUIX.md).
+
 ## What it does
 
 - **Groups and sessions.** Chats live in named, reorderable groups. Drag the ⋮⋮ handle to reorder
@@ -77,9 +89,9 @@ npm run dev        # http://127.0.0.1:3850
 | ⇧⏎ | newline |
 | ⇧⇥ | cycle mode |
 | Esc | stop the running turn |
-| ⌘N | new session |
-| ⇧⌘N | new group |
-| ⌘R | reload the UI (shell) |
+| ⌘N / Ctrl+N | new session |
+| ⇧⌘N / ⇧Ctrl+N | new group |
+| ⌘R / Ctrl+R | reload the UI (shell) |
 
 ## Layout
 
@@ -99,6 +111,8 @@ src/renderer/   app.js            state, SSE, transcript
                 theme-claude-light.css
                 (vanilla ES modules — no framework, no build step)
 macos/          MuseDesktopShell — SwiftUI + WKWebView + HostSupervisor
+linux/          gtk-shell (C + Python fallback, Guix manifest) + systemd unit
+bin/            muse-desktop — Guix launcher (native shell, else Chrome)
 scripts/        launch, tests, mock agent, icon
 ```
 
@@ -115,7 +129,8 @@ See [docs/TESTING.md](docs/TESTING.md).
 
 ## Status
 
-Working on macOS. Linux and Windows are **not** implemented — [docs/attic/](docs/attic/) holds two
+Working on macOS; Guix System ported (native GTK shell — see [GUIX.md](GUIX.md)).
+Windows is **not** implemented — [docs/attic/](docs/attic/) holds two
 non-functional sketches kept from the original scaffold.
 
 ## License

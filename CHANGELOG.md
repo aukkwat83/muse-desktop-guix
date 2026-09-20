@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.0 — 2026-09-21
+
+Guix System port (new repo `muse-desktop-guix`, mac v1.0.0 imported as baseline).
+Guix stack modelled on grok-desktop `deploy/v0.8.9-guix` @ `35dac5c`
+(`v0.9.4-guix-shell-host`). Nothing mac removed. Full note:
+[docs/releases/v1.1.0-guix-parity.md](docs/releases/v1.1.0-guix-parity.md).
+
+### Added
+
+- **Native GTK shell** (`linux/gtk-shell/main.c` + Python fallback): real GNOME
+  window over WebKitGTK — cache-ignoring Reload (Ctrl+R/F5), ↻ Restart host
+  (`app.restart-host` GAction, warm agents survive), Web Inspector, memory
+  meter, external-link trap. `cardDrag` bridge registered but dormant (no
+  renderer sender yet).
+- **Launchers**: `bin/muse-desktop` (symlink-safe ROOT, native-first with
+  Chrome fallback), `scripts/native-launch.sh` (prebuilt fast path, no
+  per-launch `guix shell`), `scripts/linux-launch.sh` (host + Chrome `--app`),
+  `scripts/install-desktop.sh` (menu/Desktop/CLI/icon), Guix manifest,
+  systemd user unit (foreign distros; Guix System uses Shepherd).
+- **Attach picker on Linux**: `/api/pick-files` drives zenity/qarma/yad/kdialog
+  (`src/server/file-picker.js`); the "macOS only" dead-end is gone.
+- **Darwin-only PAC fallback** (`defaultPacProxy`): Linux agents connect direct
+  unless proxy env is explicit; `deploy.sh` matches and builds/stops per platform.
+- **Ctrl+N / ⇧Ctrl+N** for new session/group on Linux (Cmd variants unchanged).
+- **Suites**: `test:guix` (18, platform contracts) + `test:guix-shell` (16, C
+  contracts + stale-binary guard), both in `npm test`.
+- **Docs**: `GUIX.md`, `docs/DEPLOY-GUIX.md`, `docs/releases/`.
+
 ## 1.0.0 — 2026-09-21
 
 First stable release. Everything below landed on top of 0.1.0 (MSP port) and
