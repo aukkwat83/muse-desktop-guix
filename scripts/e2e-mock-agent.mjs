@@ -661,6 +661,10 @@ await step('cancel settles the in-flight turn', async () => {
   );
   assert.ok(settled, 'a cancelled turn must persist its partial text');
   assert.equal(settled.meta.reason, 'cancelled');
+  // History's `ทำไป Xs` header reads this — the clock must survive the
+  // reload, not just the transcript text (1.1.26).
+  assert.equal(typeof settled.meta.durationMs, 'number', 'settled meta carries durationMs');
+  assert.ok(settled.meta.durationMs >= 0, 'durationMs is non-negative');
 });
 
 await step('the prompt queue contract: 409 while busy, in-order sends after each settle (BUG-051)', async () => {

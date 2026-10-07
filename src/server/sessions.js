@@ -1315,9 +1315,13 @@ export class SessionManager extends EventEmitter {
     // chunks can be partial or re-ordered; the result is authoritative.
     const finalText = content != null && String(content).length ? String(content) : turn.text;
 
+    // History's `ทำไป Xs` header (ChatGPT Desktop's `Worked for …`) reads
+    // this — without it a reload can only show counts, never the clock.
+    const durationMs = Date.now() - turn.startedAt;
     if (finalText && finalText.trim()) {
       this.store.setAssistantMessage(chatId, turnId, finalText, {
         reason,
+        durationMs,
         toolCalls: [...turn.toolCalls.values()],
         // The plan is part of what the agent produced for this turn; without
         // persisting it, it vanishes the instant the turn settles and the
@@ -1333,6 +1337,7 @@ export class SessionManager extends EventEmitter {
       if (turn.toolCalls.size) {
         this.store.setAssistantMessage(chatId, turnId, '', {
           reason,
+          durationMs,
           toolCalls: [...turn.toolCalls.values()],
           ...(turn.plan ? { plan: turn.plan } : {}),
         });
@@ -1379,7 +1384,7 @@ export class SessionManager extends EventEmitter {
       content: finalText,
       error,
       toolCalls: [...turn.toolCalls.values()],
-      durationMs: Date.now() - turn.startedAt,
+      durationMs,
       chat: this.chatSummary(this.store.get(chatId) || { id: chatId, messages: [] }),
     });
     slot.turn = null;

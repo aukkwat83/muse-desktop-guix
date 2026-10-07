@@ -14,10 +14,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/icon.png" />
     <!-- Blocking on purpose: sets data-theme before the first paint. -->
-    <script src="/theme-boot.js?v=1.1.25"></script>
-    <link rel="stylesheet" href="/style.css?v=1.1.25" />
-    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.25" />
-    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.25" />
+    <script src="/theme-boot.js?v=1.1.26"></script>
+    <link rel="stylesheet" href="/style.css?v=1.1.26" />
+    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.26" />
+    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.26" />
   </head>
   <body>
     <div id="app">
@@ -77,6 +77,7 @@
             <button id="mode-chip" class="pill mode" type="button" title="Mode (Shift+Tab)">yolo</button>
             <button id="btn-session-find" class="btn ghost" type="button" title="ค้นหาในแชทนี้ (⌘F)" aria-expanded="false" aria-label="ค้นหาในแชทนี้">⌕</button>
             <button id="release-agent" class="btn ghost" type="button" title="Stop this chat's agent">⏻</button>
+            <button id="overview-btn" class="btn ghost" type="button" title="ภาพรวมเทิร์น: subagents · tasks · goal (แบบ ChatGPT Desktop)" aria-label="ภาพรวมเทิร์น">▦</button>
             <button id="rightbar-toggle" class="btn ghost" type="button" title="แผงขวา: ค่าใช้จ่าย · goal/tasks · subagents · SCB (ซ่อนเป็นค่าเริ่มต้น)" aria-expanded="false" aria-label="แผงขวา" aria-controls="rightbar">☰</button>
           </div>
         </header>
@@ -157,6 +158,15 @@
         <div class="attach-bar" id="attach-bar" hidden aria-label="ไฟล์แนบ"></div>
 
         <form id="composer" class="composer">
+          <!-- Thread goal strip (ChatGPT Desktop's goal bar): the CLI-owned
+               session goal for this chat — objective, percent, status word,
+               pause/resume. Hidden when the chat has no goal. -->
+          <div id="goal-bar" class="goal-bar" hidden>
+            <span class="goal-glyph" aria-hidden="true">◎</span>
+            <span class="goal-objective"></span>
+            <span class="goal-meta"></span>
+            <button id="goal-bar-btn" class="goal-btn" type="button"></button>
+          </div>
           <!-- The wrapper mirrors the value into a hidden ::after so the grid
                sizes itself. Measuring textarea.scrollHeight in this flex row
                reports a bogus height and pins the box open at max-height. -->
@@ -207,7 +217,7 @@
     <!-- Standalone version paint: runs even when app.js fails to load, so a
          dead boot never leaves a silent shell (BUG-066). External file rather
          than an inline script because the CSP is script-src 'self'. -->
-    <script src="/version-boot.js?v=1.1.25"></script>
-    <script type="module" src="/app.js?v=1.1.25"></script>
+    <script src="/version-boot.js?v=1.1.26"></script>
+    <script type="module" src="/app.js?v=1.1.26"></script>
   </body>
 </html>

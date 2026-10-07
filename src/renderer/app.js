@@ -17,9 +17,9 @@ import { escapeHtml } from './markdown-core.js?v=0.4.1';
 import { Sidebar } from './sidebar.js?v=0.4.6';
 import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
 import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
-import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.4.2';
+import { closePopover, miniConfirm, openMenu, openPanel } from './popover.js?v=0.4.2';
 import { createMcpPanel } from './mcp-panel.js?v=1.0.0';
-import { createRightbar, goalControlFor } from './rightbar.js?v=1.1.3';
+import { createRightbar, goalControlFor, goalStatusWord } from './rightbar.js?v=1.1.3';
 import { createChildActivity } from './child-activity.js?v=1.0.0';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
 import { formatCtxMeter } from './ctx-meter.js?v=1.0.0';
@@ -29,7 +29,7 @@ import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.4.0';
 import { adaptiveHistoryDefaults, computeHistoryStartIndex, expandHistoryStartIndex, sliceHistoryMessages } from './history-window.js?v=0.4.0';
 import { parseSlashCommand } from './slash-commands.js?v=0.4.0';
 import { chatToMarkdown } from './transcript-markdown.js?v=0.4.0';
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from './turn-view.js?v=0.4.23';
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.4.24';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -44,6 +44,11 @@ const el = {
   tasksChip: $('#tasks-chip'),
   goalChip: $('#goal-chip'),
   liveCluster: $('#live-cluster'),
+  overviewBtn: $('#overview-btn'),
+  goalBar: $('#goal-bar'),
+  goalObjective: $('#goal-bar .goal-objective'),
+  goalMeta: $('#goal-bar .goal-meta'),
+  goalBarBtn: $('#goal-bar-btn'),
   mcpBtn: $('#mcp-btn'),
   contextPill: $('#context-pill'),
   ctxBarFill: $('#ctx-bar-fill'),
@@ -502,8 +507,19 @@ function messageNode(msg, index = null) {
   let histPg = null;
   const ensureHistPg = () => {
     if (histPg) return histPg;
+    // Settled turns keep the same header shape as live ones — ChatGPT
+    // Desktop's `Worked for 36s · …`; pre-1.1.26 transcripts without a
+    // persisted duration fall back to counts only.
+    const histAgents = histTools.filter((t) => agentToolMeta(subKindOf(t))).length;
     const pg = progressGroupNode(
-      progressLabel(histTools.length, 0, histPlan.length, histPlanDone),
+      turnHeaderLabel({
+        running: false,
+        durationMs: msg.meta?.durationMs ?? null,
+        tools: histTools.length,
+        planSteps: histPlan.length,
+        planDone: histPlanDone,
+        agentsTotal: histAgents,
+      }),
       false,
       () => {
         const collapsed = !pg.group.classList.contains('pg-collapsed');
@@ -687,6 +703,25 @@ function progressLabel(toolsCount, running, planSteps, planDone, topic) {
   if (toolsCount) bits.push(`${toolsCount} tools${running ? ` · ${running} กำลังรัน` : ''}`);
   if (planSteps) bits.push(`plan ${planDone}/${planSteps}`);
   return bits.join(' · ');
+}
+
+/**
+ * Live turn header — ChatGPT Desktop's `Working for 24s · …`: a ticking
+ * clock plus topic/counts. The 500 ms running tick repaints through this so
+ * the header counts up without a structural repaint.
+ */
+function liveTurnHeaderLabel(tv, sum = progressSummary(tv), agents = agentCounts(tv)) {
+  return turnHeaderLabel({
+    running: true,
+    elapsedMs: Date.now() - (tv.startedAt || Date.now()),
+    topic: progressTopic(tv),
+    tools: sum.tools,
+    runningTools: sum.running,
+    planSteps: sum.planSteps,
+    planDone: sum.planDone,
+    agentsRunning: agents.running,
+    agentsTotal: agents.total,
+  });
 }
 
 // Fallback for pre-options agents (grok-shaped hosts with no option list).
@@ -978,11 +1013,15 @@ function paintLiveTurn(rebuild = false) {
     if (!existing) liveChildren.set(key, interactionNode(ix));
   }
 
-  // The progress group owns the tool + plan nodes; its header carries live
-  // counts and flips tv.progressOpen (rev bump → next paint is structural).
+  // The progress group owns the tool + plan nodes; its header carries the
+  // live ChatGPT-style `กำลังทำ Xs · …` clock plus counts, and flips
+  // tv.progressOpen (rev bump → next paint is structural). The open turn
+  // ALWAYS shows the header — even before the first tool lands — so the
+  // task row stays visible like Codex Desktop's working block.
   const sum = progressSummary(tv);
-  const hasProgress = sum.tools > 0 || sum.planSteps > 0;
-  if (hasProgress && (!liveProgress || !liveProgress.group.isConnected)) {
+  const agents = agentCounts(tv);
+  const hasProgress = true;
+  if (!liveProgress || !liveProgress.group.isConnected) {
     const chatOfPaint = chatId;
     liveProgress = progressGroupNode('', !!tv.progressOpen, () => {
       const cur = state.turnViews.get(chatOfPaint);
@@ -991,19 +1030,10 @@ function paintLiveTurn(rebuild = false) {
       if (chatOfPaint === state.activeId) paintLiveTurn();
     });
   }
-  if (liveProgress) {
-    if (!hasProgress) {
-      // Everything inside was pruned (e.g. a cleared plan) — drop the empty
-      // shell rather than painting a header with nothing under it.
-      liveProgress.group.remove();
-      liveProgress = null;
-    } else {
-      liveProgress.labelEl.textContent = progressLabel(sum.tools, sum.running, sum.planSteps, sum.planDone, progressTopic(tv));
-      liveProgress.group.classList.toggle('pg-collapsed', !tv.progressOpen);
-      liveProgress.glyphEl.textContent = tv.progressOpen ? '▾' : '▸';
-      liveProgress.group.classList.toggle('pg-running', sum.running > 0);
-    }
-  }
+  liveProgress.labelEl.textContent = liveTurnHeaderLabel(tv, sum, agents);
+  liveProgress.group.classList.toggle('pg-collapsed', !tv.progressOpen);
+  liveProgress.glyphEl.textContent = tv.progressOpen ? '▾' : '▸';
+  liveProgress.group.classList.toggle('pg-running', sum.running > 0);
 
   // Pin the order — a tool call that starts after some answer text must still
   // render ABOVE the streaming bubble, not below it. append() moves connected
@@ -1072,6 +1102,11 @@ function updateRunningChrome() {
       if (!t?.startedAt) return;
       const secs = Math.round((Date.now() - t.startedAt) / 1000);
       el.statusTimer.textContent = `${secs}s · Esc เพื่อหยุด`;
+      // The live turn header counts up on the same tick — ChatGPT Desktop's
+      // `Working for …` clock, repainted without a structural pass.
+      if (t.turnId && liveProgress?.labelEl?.isConnected) {
+        liveProgress.labelEl.textContent = liveTurnHeaderLabel(t);
+      }
     };
     tick(); // no reason the hint waits a half second for the first interval
     if (!timerHandle) {
@@ -1116,7 +1151,126 @@ function updateTasksGoalChips() {
     el.goalChip.classList.toggle('busy', goalControlFor(goal.status) === 'pause');
     el.goalChip.title = `${goal.objective || ''} — ${pct}% ${goal.status || ''} — คลิกเพื่อดูรายละเอียด`;
   }
+  updateGoalBar(goal);
   updateLiveCluster();
+}
+
+/**
+ * Thread goal strip above the composer — ChatGPT Desktop's goal bar: the
+ * CLI-owned session goal for this chat (objective, percent, status word,
+ * pause/resume). Hidden when the chat has no goal; the goal itself is set
+ * in the CLI, the desktop only mirrors + pauses/resumes it.
+ */
+function updateGoalBar(goal) {
+  if (!el.goalBar) return;
+  el.goalBar.hidden = !goal;
+  if (!goal) return;
+  const pct = Math.min(100, Math.max(0, Math.round(Number(goal.percentComplete) || 0)));
+  if (el.goalObjective) el.goalObjective.textContent = String(goal.objective || 'goal');
+  if (el.goalMeta) el.goalMeta.textContent = `${pct}% · ${goalStatusWord(goal.status)}`;
+  if (el.goalBarBtn) {
+    const control = goalControlFor(goal.status);
+    el.goalBarBtn.hidden = !control;
+    if (control) {
+      el.goalBarBtn.textContent = control === 'pause' ? '⏸ หยุดชั่วคราว' : '▶ ทำต่อ';
+      el.goalBarBtn.title = control === 'pause' ? 'หยุด goal ชั่วคราว' : 'ทำ goal ต่อ';
+      el.goalBarBtn.dataset.action = control;
+    }
+  }
+}
+
+async function sendGoalBarCommand() {
+  const chatId = state.activeId;
+  const action = el.goalBarBtn?.dataset.action;
+  if (!chatId || !action) return;
+  if (el.goalBarBtn) el.goalBarBtn.disabled = true;
+  try {
+    await api(`/api/chats/${encodeURIComponent(chatId)}/goal`, { method: 'POST', body: { action } });
+  } catch (err) {
+    if (el.goalBarBtn) {
+      el.goalBarBtn.disabled = false;
+      el.goalBarBtn.title = `สั่งไม่ได้: ${err?.message || err}`;
+    }
+  }
+}
+
+/**
+ * Thread overview popup — ChatGPT Desktop's header toggle (Outputs /
+ * Subagents / Sources): one glance at this chat's live turn with a row per
+ * subagent, task, and the session goal. Rows drill into the right rail;
+ * empty sections collapse to a quiet hint instead of a bare list.
+ */
+function openThreadOverview() {
+  const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
+  const goal = state.activeId ? wireGoals.get(state.activeId) : null;
+  const root = document.createElement('div');
+  root.className = 'panel thread-overview';
+  const mkSection = (title) => {
+    const h = document.createElement('h2');
+    h.textContent = title;
+    root.append(h);
+    const ul = document.createElement('ul');
+    root.append(ul);
+    return ul;
+  };
+  const mkRow = (icon, label, trailing, title, onPick) => {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ov-row';
+    const avatar = document.createElement('span');
+    avatar.className = 'ov-avatar';
+    avatar.textContent = icon;
+    avatar.setAttribute('aria-hidden', 'true');
+    const name = document.createElement('span');
+    name.className = 'ov-label';
+    name.textContent = label;
+    btn.append(avatar, name);
+    if (trailing) {
+      const trail = document.createElement('span');
+      trail.className = 'ov-trailing';
+      trail.textContent = trailing;
+      btn.append(trail);
+    }
+    if (title) btn.title = title;
+    btn.addEventListener('click', () => { closePopover(); onPick(); });
+    li.append(btn);
+    return li;
+  };
+  const mkEmpty = (text) => {
+    const li = document.createElement('li');
+    li.className = 'ov-empty';
+    li.textContent = text;
+    return li;
+  };
+  // Subagents — agent rows of the live turn, newest last like the rail.
+  const agentsUl = mkSection('Subagents');
+  const agentTools = tv ? [...tv.tools.values()].map((n) => n.tool).filter((t) => agentToolMeta(subKindOf(t))) : [];
+  if (!agentTools.length) agentsUl.append(mkEmpty('ยังไม่มี subagent ในเทิร์นนี้'));
+  for (const tool of agentTools) {
+    const meta = agentToolMeta(subKindOf(tool));
+    const label = agentSubtitle(tool, meta) || meta.label;
+    const status = toolDisplayState(tool).status;
+    const word = status === 'running' ? 'กำลังรัน' : status === 'error' ? 'ล้มเหลว' : 'เสร็จ';
+    agentsUl.append(mkRow(meta.icon || '✳', label, word, `${label} — ${word}`, () => rightbar.reveal('agents')));
+  }
+  // Tasks — live plan checklist.
+  const tasksUl = mkSection('Tasks');
+  const entries = Array.isArray(tv?.plan) ? tv.plan : [];
+  if (!entries.length) tasksUl.append(mkEmpty('ยังไม่มี tasks ในเทิร์นนี้'));
+  for (const t of entries) {
+    const done = String(t?.status) === 'completed';
+    const active = String(t?.status) === 'in_progress';
+    tasksUl.append(mkRow(done ? '☑' : '☐', String(t?.content || '(ไม่มีชื่อ task)'), active ? 'กำลังทำ' : '', '', () => rightbar.reveal('tasks')));
+  }
+  // Goal — the CLI-owned session goal.
+  const goalUl = mkSection('Goal');
+  if (!goal) goalUl.append(mkEmpty('แชทนี้ยังไม่มี goal (ตั้งใน CLI)'));
+  else {
+    const pct = Math.min(100, Math.max(0, Math.round(Number(goal.percentComplete) || 0)));
+    goalUl.append(mkRow('◎', String(goal.objective || 'goal'), `${pct}% · ${goalStatusWord(goal.status)}`, '', () => rightbar.reveal('goal')));
+  }
+  openPanel(el.overviewBtn, root);
 }
 
 /** The live cluster collapses when both of its chips hide — no stray gap. */
@@ -3261,6 +3415,8 @@ function wireUi() {
   el.agentsChip.addEventListener('click', () => rightbar.reveal('agents'));
   el.tasksChip.addEventListener('click', () => rightbar.reveal('tasks'));
   el.goalChip.addEventListener('click', () => rightbar.reveal('goal'));
+  if (el.overviewBtn) el.overviewBtn.addEventListener('click', openThreadOverview);
+  if (el.goalBarBtn) el.goalBarBtn.addEventListener('click', sendGoalBarCommand);
   el.rightbarToggle?.addEventListener('click', () => rightbar.toggle());
 
   el.releaseAgent.addEventListener('click', async () => {

@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from '../src/renderer/turn-view.js';
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, formatElapsed, turnHeaderLabel } from '../src/renderer/turn-view.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -676,6 +676,41 @@ test('agentCounts: swarm is one row, background-done leaves the running count (B
   assert.deepEqual(agentCounts(tv), { running: 1, total: 2 }, 'background-done is excluded from running');
   tv.tools.get('a2').status = 'failed';
   assert.deepEqual(agentCounts(tv), { running: 0, total: 2 }, 'failed agents are not running');
+});
+
+test('formatElapsed: compact clock for turn headers (1.1.26)', () => {
+  assert.equal(formatElapsed(0), '0s');
+  assert.equal(formatElapsed(24_000), '24s');
+  assert.equal(formatElapsed(59_999), '59s');
+  assert.equal(formatElapsed(60_000), '1m');
+  assert.equal(formatElapsed(349_000), '5m 49s');
+  assert.equal(formatElapsed(3_600_000), '1h');
+  assert.equal(formatElapsed(3_720_000), '1h 2m');
+  assert.equal(formatElapsed(-5), '0s');
+  assert.equal(formatElapsed(NaN), '0s');
+});
+
+test('turnHeaderLabel: live clock + counts like ChatGPT Desktop (1.1.26)', () => {
+  assert.equal(
+    turnHeaderLabel({ running: true, elapsedMs: 24_000 }),
+    'กำลังทำ 24s',
+    'empty live turn still shows the clock',
+  );
+  assert.equal(
+    turnHeaderLabel({ running: true, elapsedMs: 65_000, topic: 'npm test', tools: 3, runningTools: 1, planSteps: 4, planDone: 2, agentsRunning: 1, agentsTotal: 2 }),
+    'กำลังทำ 1m 5s · npm test · 3 tools · 1 กำลังรัน · plan 2/4 · agents 1/2',
+  );
+  assert.equal(
+    turnHeaderLabel({ running: false, durationMs: 36_000, tools: 2 }),
+    'ทำไป 36s · 2 tools',
+    'settled turn shows the persisted clock',
+  );
+  assert.equal(
+    turnHeaderLabel({ running: false, tools: 2, planSteps: 1, planDone: 1 }),
+    '2 tools · plan 1/1',
+    'old transcripts without duration fall back to counts',
+  );
+  assert.equal(turnHeaderLabel({}), 'เทิร์นนี้');
 });
 
 let failed = 0;

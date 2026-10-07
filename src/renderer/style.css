@@ -3615,3 +3615,126 @@ button.drill-row:hover {
   border-color: var(--danger);
   color: var(--danger);
 }
+
+/* ------ ChatGPT Desktop parity: goal bar, overview popup, agent chips (1.1.26) ------ */
+
+/* Thread goal strip docked above the composer input. */
+.goal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-footnote);
+}
+.goal-bar[hidden] {
+  display: none;
+}
+.goal-bar .goal-glyph {
+  color: var(--accent-text);
+  flex: none;
+}
+.goal-bar .goal-objective {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.goal-bar .goal-meta {
+  flex: none;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.goal-bar .goal-btn {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink-dim);
+  font-size: var(--fs-footnote);
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.goal-bar .goal-btn:hover {
+  border-color: var(--accent-line);
+  color: var(--ink);
+}
+.goal-bar .goal-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Thread overview popup: sectioned Subagents / Tasks / Goal rows. */
+.thread-overview {
+  min-width: 300px;
+}
+.thread-overview h2 {
+  font-size: var(--fs-footnote);
+  font-weight: 700;
+  color: var(--muted);
+  margin: 8px 2px 4px;
+}
+.thread-overview h2:first-child {
+  margin-top: 0;
+}
+.thread-overview ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.thread-overview .ov-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  padding: 5px 6px;
+  color: var(--ink);
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: pointer;
+}
+.thread-overview .ov-row:hover {
+  background: var(--raised);
+}
+.thread-overview .ov-avatar {
+  flex: none;
+  width: 1.4em;
+  text-align: center;
+}
+.thread-overview .ov-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thread-overview .ov-trailing {
+  flex: none;
+  color: var(--muted);
+  font-size: var(--fs-footnote);
+  white-space: nowrap;
+}
+.thread-overview .ov-empty {
+  color: var(--muted);
+  font-size: var(--fs-footnote);
+  padding: 2px 6px;
+}
+
+/* Agent rows read as subagent chips: compact, tinted, ✳ marker. */
+.tool-toggle.agent .t-name::before {
+  content: '✳ ';
+  color: var(--accent-text);
+}

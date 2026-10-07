@@ -630,3 +630,51 @@ export function configMenuItems(select, currentValue) {
     current: value === cur,
   }));
 }
+
+/**
+ * Compact elapsed clock for turn headers — ChatGPT Desktop's `Working for
+ * 24s` / `Worked for 5m 49s` shape, units only (the caller adds the verb).
+ * `24s` under a minute, `5m 49s` under an hour, `1h 2m` beyond; zero parts
+ * drop (`5m`, never `5m 0s`).
+ */
+export function formatElapsed(ms) {
+  const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) {
+    const r = s % 60;
+    return r ? `${m}m ${r}s` : `${m}m`;
+  }
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  return rm ? `${h}h ${rm}m` : `${h}h`;
+}
+
+/**
+ * One-line turn header — the always-visible disclosure ChatGPT Desktop
+ * paints per turn: `กำลังทำ 24s · …` while running, `ทำไป 36s · …` once
+ * settled. Counts follow the clock (topic → tools → plan → agents); a
+ * settled turn without a persisted duration falls back to counts only.
+ */
+export function turnHeaderLabel({
+  running = false,
+  elapsedMs = 0,
+  durationMs = null,
+  topic = '',
+  tools = 0,
+  runningTools = 0,
+  planSteps = 0,
+  planDone = 0,
+  agentsRunning = 0,
+  agentsTotal = 0,
+} = {}) {
+  const bits = [];
+  if (running) bits.push(`กำลังทำ ${formatElapsed(elapsedMs)}`);
+  else if (durationMs != null) bits.push(`ทำไป ${formatElapsed(durationMs)}`);
+  if (topic) bits.push(topic);
+  if (tools) bits.push(`${tools} tools${runningTools ? ` · ${runningTools} กำลังรัน` : ''}`);
+  if (planSteps) bits.push(`plan ${planDone}/${planSteps}`);
+  if (agentsTotal) bits.push(`agents ${agentsRunning}/${agentsTotal}`);
+  if (!bits.length) return running ? 'กำลังทำ…' : 'เทิร์นนี้';
+  return bits.join(' · ');
+}
