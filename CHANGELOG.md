@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.23 — 2026-10-07
+
+ChatGPT-desktop-like result stack: assistant turns render as sections
+going down with a quiet divider line between each block (activity group,
+answer, cards). One CSS rule covers live + history (same DOM order).
+Full note: [docs/releases/v1.1.23-result-stack.md](docs/releases/v1.1.23-result-stack.md).
+
 ## 1.1.22 — 2026-10-07
 
 Inline child activity in transcript agent rows (ChatGPT-desktop-like nested

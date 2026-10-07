@@ -1669,6 +1669,15 @@ button.search-hit:hover {
   width: 100%;
 }
 
+/* ChatGPT-desktop-like result stack: the assistant turn reads as sections
+   going down — activity group, answer, cards — with a quiet divider line
+   between each block. Live and history paints share the same DOM order
+   (BUG-031), so one rule covers both; single-block turns stay clean. */
+.turn > * + * {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 0.5rem;
+}
+
 .msg-user {
   align-self: flex-end;
   max-width: min(78%, 36rem);
