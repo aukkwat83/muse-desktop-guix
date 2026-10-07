@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.24 — 2026-10-07
+
+Result-stack dividers use the standard `--line` separator token —
+`--line-soft` proved nearly invisible on the paper theme (verified by
+window screenshot on Guix).
+
 ## 1.1.23 — 2026-10-07
 
 ChatGPT-desktop-like result stack: assistant turns render as sections

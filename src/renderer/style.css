@@ -1674,7 +1674,7 @@ button.search-hit:hover {
    between each block. Live and history paints share the same DOM order
    (BUG-031), so one rule covers both; single-block turns stay clean. */
 .turn > * + * {
-  border-top: 1px solid var(--line-soft);
+  border-top: 1px solid var(--line);
   padding-top: 0.5rem;
 }
 
