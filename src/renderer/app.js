@@ -20,6 +20,7 @@ import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
 import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.4.2';
 import { createMcpPanel } from './mcp-panel.js?v=1.0.0';
 import { createRightbar, goalControlFor } from './rightbar.js?v=1.1.3';
+import { createChildActivity } from './child-activity.js?v=1.0.0';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
 import { formatCtxMeter } from './ctx-meter.js?v=1.0.0';
 import { computePin } from './scroll-pin.js?v=0.4.0';
@@ -340,6 +341,8 @@ const mcpPanel = createMcpPanel({ api, onSnapshot: paintMcpButton });
 // Hidden by default; the ☰ button and the head-bar chips open it. It replaces
 // the old floating subagents/tasks popovers — one rail, no stacked popups.
 const rightbar = createRightbar({ api, aside: el.rightbar, toggleBtn: el.rightbarToggle });
+// Inline child activity inside transcript agent rows (nested delegate view).
+const childActivity = createChildActivity({ api, onOpenRail: () => rightbar.reveal('agents') });
 
 // ------------------------------------------------------------ turn view
 
@@ -565,6 +568,10 @@ function toolNode(tool, existing = null, onUserToggle = null) {
       // the user left them. The live turn also records expands so a
       // re-paint re-opens rows the user explicitly opened.
       onUserToggle?.(tool.id, !collapsed);
+      if (!collapsed) {
+        const act = row.querySelector(':scope > .child-activity');
+        if (act) childActivity.ensureLoaded(act);
+      }
     };
     toggle.addEventListener('click', flip);
     // "explain" reveals this console only — progress hides by default and
@@ -580,6 +587,13 @@ function toolNode(tool, existing = null, onUserToggle = null) {
     const body = document.createElement('div');
     body.className = 'tool-body';
     row.append(head, body);
+    // Agent rows that name a durable child grow an inline activity block
+    // above the console. It loads on first expand — this only reserves
+    // the slot, so mounting is free while collapsed.
+    if (agent && tool.agentLink) {
+      const act = childActivity.mountRow(state.activeId, tool);
+      if (act) row.insertBefore(act, body);
+    }
   }
   row.classList.toggle('agent', !!agent);
   row.dataset.status = tool.status || 'pending';
@@ -605,6 +619,13 @@ function toolNode(tool, existing = null, onUserToggle = null) {
   const body = row.querySelector('.tool-body');
   const out = tool.output || '';
   if (body.textContent !== out) body.textContent = out;
+  // The link can land after the row (a spawn row gains its id when the
+  // output arrives) — mount the slot then. A mounted block is never
+  // touched here: repaints must not wipe a loaded activity view.
+  if (existing && agent && tool.agentLink && !row.querySelector(':scope > .child-activity')) {
+    const act = childActivity.mountRow(state.activeId, tool);
+    if (act) row.insertBefore(act, body);
+  }
   return row;
 }
 
@@ -908,7 +929,11 @@ function paintLiveTurn(rebuild = false) {
     // Progress hides by default — a row opens only when the user explicitly
     // opened it (head click or "explain"); streaming never pops rows open.
     // A fresh row is born collapsed, so only the explicit-open path unhides.
-    if (shouldAutoExpandTool(tv, tool)) setToolRowCollapsed(node, false);
+    if (shouldAutoExpandTool(tv, tool)) {
+      setToolRowCollapsed(node, false);
+      const act = node.querySelector(':scope > .child-activity');
+      if (act) childActivity.ensureLoaded(act);
+    }
     liveChildren.set(key, node);
   }
 
@@ -1447,6 +1472,7 @@ function onEvent(type, data) {
         wireSubagents.get(chatId).set(rec.itemId, rec);
         if (chatId === state.activeId) updateRunningChrome(); // chip fallback
         rightbar.applyAgents(chatId, wireSubagents.get(chatId));
+        childActivity.noteSubagent(chatId, rec);
       }
       return;
     }
@@ -1457,6 +1483,7 @@ function onEvent(type, data) {
       const live = wireSubagents.get(chatId)?.get(String(data.itemId));
       if (live && typeof data.text === 'string') live.liveText = data.text;
       rightbar.applyAgentDelta(chatId, String(data.itemId), String(data.text || ''));
+      childActivity.noteSubagentDelta(chatId, String(data.itemId), String(data.text || ''));
       return;
     }
 

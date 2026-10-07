@@ -2436,6 +2436,46 @@ button.search-hit:hover {
   display: none;
 }
 
+/* --------------------------------- child activity (agent rows) ----
+   Inline nested delegate view above the row console. Colours only from
+   tokens (see top of file); rows reuse .drill-row etc. so no new trap
+   surface for Thai clipping (no nowrap+hidden one-liners here). */
+.child-activity {
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel);
+  padding: 0.3rem 0.45rem 0.35rem;
+}
+
+.tool-row.collapsed .child-activity {
+  display: none;
+}
+
+.ca-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.1rem 0 0.25rem;
+}
+
+.ca-title {
+  flex: 1 1 auto;
+  color: var(--ink-dim);
+  font-size: var(--fs-caption-1);
+}
+
+.ca-open {
+  flex: none;
+}
+
+.ca-list {
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.child-activity .ca-note {
+  margin: 0.15rem 0;
+}
+
 /* --------------------------------------------------------------- plan */
 
 .plan-card {

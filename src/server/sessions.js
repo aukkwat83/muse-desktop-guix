@@ -302,6 +302,37 @@ export function nativeSubagentPatch({ toolCallId, kind, rawInput, output, status
 }
 
 /**
+ * Registry key behind one transcript tool row, or null. Native subagent
+ * verbs (subagent_spawn/wait/…) name their child via `subagent_id` in args
+ * or output — the same id the registry fold keys on — so an agent row can
+ * inline the child's activity through the drill endpoint. Shapes are mixed
+ * on the wire (object or JSON string), so both are probed. Model-side
+ * `Agent` rows carry only a type, no durable child id — they stay
+ * unlinked; the row's own output is all the wire offers. Pure.
+ */
+export function agentRowLink(tool) {
+  if (!tool || typeof tool !== 'object') return null;
+  const kind = String(tool.kind || '');
+  const probe = (v) => {
+    if (!v) return null;
+    if (typeof v === 'object') return v;
+    return tryJson(v);
+  };
+  const args = probe(tool.rawInput);
+  const obj = (tool.rawInput && typeof tool.rawInput === 'object')
+    ? tool.rawInput
+    : args;
+  const isAgentRow = NATIVE_SUBAGENT_TOOLS.has(kind)
+    || !!(obj && (obj.subagent_type || obj.prompt_template));
+  if (!isAgentRow) return null;
+  const out = probe(tool.output);
+  const id = (out && typeof out.subagent_id === 'string' && out.subagent_id)
+    || (args && typeof args.subagent_id === 'string' && args.subagent_id)
+    || null;
+  return id ? `native:${id}` : null;
+}
+
+/**
  * Small projection of one child-session item for the drill-down view. Keeps
  * identity + state + the readable text, capped; nested children keep their
  * drill keys so the panel can recurse one level deeper.
@@ -1840,6 +1871,12 @@ export class SessionManager extends EventEmitter {
           output: extractToolOutput(update) || prev.output || '',
           rawInput: update.rawInput ?? prev.rawInput ?? null,
         };
+        // Inline child activity: an agent row that names a durable child
+        // links to its registry record, so the transcript can inline the
+        // child's activity without a second lookup. Re-resolved on every
+        // update — a spawn row gains its id when the output lands.
+        const agentLink = agentRowLink(record);
+        if (agentLink) record.agentLink = agentLink;
         if (t) t.toolCalls.set(id, record);
         this.wire.emit(chatId, kind === 'tool_call' ? 'tool_call' : 'tool_call_update', {
           turnId,

@@ -16,6 +16,7 @@ const SUITES = [
   ['notify', 'unit-test-notify.mjs'],
   ['goal-tasks', 'unit-test-goal-tasks.mjs'],
   ['subagents', 'unit-test-subagents.mjs'],
+  ['child-activity', 'unit-test-child-activity.mjs'],
   ['text', 'unit-test-text.mjs'],
   ['usage-cache', 'unit-test-usage-cache.mjs'],
   ['theme-contrast', 'unit-test-theme-contrast.mjs'],

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.22 — 2026-10-07
+
+Inline child activity in transcript agent rows (ChatGPT-desktop-like nested
+delegate view): an agent tool row that names a durable child inlines the
+child's status + step rows above its console, live while it runs, via the
+existing drill endpoint. Server resolves `tool.agentLink` per row; rows
+without a child id keep the old console-only body. Full note:
+[docs/releases/v1.1.22-child-activity.md](docs/releases/v1.1.22-child-activity.md).
+
 ## 1.1.21-guix-sync — 2026-10-07
 
 Forward-port of mac `muse-desktop` v1.1.1–v1.1.21 (`8541024`→`83f5e73`)

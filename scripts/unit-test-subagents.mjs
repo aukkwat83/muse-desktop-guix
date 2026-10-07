@@ -16,7 +16,7 @@ process.env.MUSE_DESKTOP_CREATE_WARM = '0';
 
 import { sanitizeChildItem } from '../src/server/msp-client.js';
 import { SessionStore, SUBAGENT_STORE_CAP, normalizeSubagents } from '../src/server/session-store.js';
-import { SUBAGENT_COMMANDS, extractReminderDecision, nativeSubagentPatch, reminderDecisionLine, sanitizeDrillItem, SessionManager } from '../src/server/sessions.js';
+import { SUBAGENT_COMMANDS, agentRowLink, extractReminderDecision, nativeSubagentPatch, reminderDecisionLine, sanitizeDrillItem, SessionManager } from '../src/server/sessions.js';
 import {
   SUBAGENT_ACTION_LABEL,
   childWindowUrl,
@@ -233,6 +233,67 @@ test('nativeSubagentPatch degrades clean on partial garbage', () => {
   assert.equal(nativeSubagentPatch({ toolCallId: 't', kind: 'subagent_status', status: 'completed' }), null);
   assert.equal(nativeSubagentPatch({ toolCallId: 't', kind: 'subagent_wait', status: 'completed' }), null);
   assert.equal(nativeSubagentPatch({ toolCallId: 't', kind: 'subagent_spawn', status: 'in_progress' }), null);
+});
+
+test('agentRowLink keys transcript rows to their registry record', () => {
+  // Spawn names the child in its output; wait in its args; both shapes
+  // (object or JSON string) link — the wire mixes them.
+  assert.equal(agentRowLink({
+    id: 'tc-1', kind: 'subagent_spawn', status: 'completed',
+    rawInput: JSON.stringify({ task_name: 'alpha' }),
+    output: JSON.stringify({ status: 'accepted', subagent_id: 'sub-a' }),
+  }), 'native:sub-a');
+  assert.equal(agentRowLink({
+    id: 'tc-2', kind: 'subagent_wait', status: 'in_progress',
+    rawInput: JSON.stringify({ subagent_id: 'sub-a' }),
+    output: '',
+  }), 'native:sub-a');
+  assert.equal(agentRowLink({
+    id: 'tc-3', kind: 'subagent_wait', status: 'completed',
+    rawInput: { subagent_id: 'sub-b' },
+    output: { status: 'ready', subagent_id: 'sub-b' },
+  }), 'native:sub-b');
+  // A spawn row gains its link when the output lands — null before that.
+  assert.equal(agentRowLink({
+    id: 'tc-4', kind: 'subagent_spawn', status: 'in_progress',
+    rawInput: JSON.stringify({ task_name: 'alpha' }),
+    output: '',
+  }), null);
+  // Plain tools never link, even when their payload mentions an id.
+  assert.equal(agentRowLink({
+    id: 'tc-5', kind: 'Bash', status: 'completed',
+    rawInput: null, output: JSON.stringify({ subagent_id: 'sub-x' }),
+  }), null);
+  // Model-side Agent rows carry a type but no durable child id — the
+  // row's own output is all the wire offers, so they stay unlinked.
+  assert.equal(agentRowLink({
+    id: 'tc-6', kind: 'other', status: 'completed',
+    rawInput: { subagent_type: 'researcher', prompt: 'dig' },
+    output: 'found it',
+  }), null);
+  assert.equal(agentRowLink(null), null);
+  assert.equal(agentRowLink({}), null);
+});
+
+test('tool_call updates carry agentLink once the child id lands', () => {
+  const { wire, mgr } = manager();
+  const chat = mgr.createChat({ title: 'linkwire' });
+  mgr.slots.set(chat.id, { client: null, turn: null, subagents: new Map() });
+  mgr._onUpdate(chat.id, {
+    sessionUpdate: 'tool_call', turnId: 'turn-1', toolCallId: 'tc-1',
+    kind: 'subagent_spawn', title: 'spawn alpha', status: 'in_progress',
+    rawInput: JSON.stringify({ task_name: 'alpha' }),
+  });
+  mgr._onUpdate(chat.id, {
+    sessionUpdate: 'tool_call_update', turnId: 'turn-1', toolCallId: 'tc-1',
+    kind: 'subagent_spawn', title: 'spawn alpha', status: 'completed',
+    rawInput: JSON.stringify({ task_name: 'alpha' }),
+    rawOutput: JSON.stringify({ status: 'accepted', subagent_id: 'sub-a' }),
+  });
+  const first = wire.of('tool_call').at(-1)?.tool || {};
+  const second = wire.of('tool_call_update').at(-1)?.tool || {};
+  assert.equal(first.agentLink, undefined, 'no id yet — no link');
+  assert.equal(second.agentLink, 'native:sub-a', 'output lands the link');
 });
 
 test('tracker merges results and never lets nulls wipe topics', async () => {
