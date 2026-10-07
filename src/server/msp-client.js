@@ -139,6 +139,28 @@ export function isAuthRequiredError(err) {
   );
 }
 
+/**
+ * MSP surfaces a poisoned serve host as a turn failure, not a dedicated
+ * code (BUG-082). Production wording, verbatim from the session log:
+ * `invalid run configuration: MCP startup audit failed; MCP is disabled
+ * for this runtime`. The host stays alive but every later turn on it dies
+ * the same way — the only recovery is a fresh agent (see sessions.js).
+ */
+export function isMcpAuditFailedError(err) {
+  const blob = [
+    err?.message,
+    err?.rpc?.message,
+    typeof err?.rpc?.data === 'string' ? err.rpc.data : JSON.stringify(err?.rpc?.data ?? ''),
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase();
+  return (
+    blob.includes('mcp startup audit failed') ||
+    blob.includes('mcp is disabled for this runtime')
+  );
+}
+
 /** UUIDv7 — every MSP commandId must be one or the host rejects it. */
 export function uuidv7() {
   const b = randomBytes(16);
@@ -251,6 +273,29 @@ export function sanitizeChildItem(item) {
 }
 
 /**
+ * Wire-true todo entries onto the codebase's snake_case plan vocabulary.
+ * The MSP schema (TodoItem) sends `{ text, status, activeForm? }` with
+ * camelCase statuses (`pending|inProgress|completed|cancelled`) — tools
+ * already normalize `inProgress`→`in_progress` at this same boundary
+ * (mapItemStatus), and every renderer (rail, chips, turn-view) reads snake,
+ * so todos do the same. Passing camelCase through painted every running
+ * todo as "waiting" (97 real stored entries confirm the wire is camel).
+ */
+export function normalizeTodoItems(items) {
+  return (Array.isArray(items) ? items : []).map((t) => {
+    const raw = String(t?.status ?? 'pending');
+    const entry = {
+      content: String(t?.content ?? t?.text ?? t?.title ?? ''),
+      status: raw === 'inProgress' ? 'in_progress' : raw,
+    };
+    if (t?.activeForm != null && String(t.activeForm).trim() !== '') {
+      entry.activeForm = String(t.activeForm);
+    }
+    return entry;
+  });
+}
+
+/**
  * UI-safe projection of a session goal block. `null` passes through as the
  * clear; over-long model text is capped — the panel shows the objective in
  * full up to 4k, past that the transcript has it.
@@ -301,27 +346,64 @@ export function sanitizeSubscriptionUsage(u) {
   };
 }
 
-function toolTitle(tool, argsText) {
+/** Args keys that carry a human topic, in preference order — the agent's
+ * own one-line summary of the call. These win over the raw command/path
+ * so tool rows read as headings, not debug dumps. */
+const TOOL_TOPIC_KEYS = [
+  'description', 'summary', 'topic', 'title', 'prompt', 'objective', 'task_name', 'label',
+];
+/** Technical args keys used only when no human topic exists. */
+const TOOL_TECH_KEYS = ['command', 'cmd', 'path', 'file', 'file_path', 'pattern', 'url'];
+const TOOL_PATH_KEYS = new Set(['path', 'file', 'file_path']);
+
+function oneLineText(value, max) {
+  if (value == null) return '';
+  const s = String(typeof value === 'string' ? value : JSON.stringify(value))
+    .replace(/\s+/g, ' ')
+    .trim();
+  return s.slice(0, max);
+}
+
+/**
+ * Display title for a toolCall row: the human topic when the agent gave
+ * one (`description`, `objective`, `task_name`, …), else a SHORT technical
+ * label — basename for paths, first line for commands — never a raw JSON
+ * dump. A topic stands alone without the tool-name prefix: the row's kind
+ * chip and the status verb already say which tool ran, and prefixing both
+ * reads "กำลังรัน Bash ls …".
+ */
+export function toolTitle(tool, args) {
   const name = String(tool || 'tool');
-  if (!argsText) return name;
-  try {
-    const parsed = JSON.parse(argsText);
-    if (parsed && typeof parsed === 'object') {
-      const pick =
-        parsed.command ?? parsed.cmd ?? parsed.path ?? parsed.file ??
-        parsed.file_path ?? parsed.pattern ?? parsed.url ?? null;
-      if (pick != null && pick !== '') {
-        const s = String(typeof pick === 'string' ? pick : JSON.stringify(pick))
-          .replace(/\s+/g, ' ')
-          .trim()
-          .slice(0, 120);
-        if (s) return `${name} ${s}`;
-      }
+  let parsed = null;
+  if (args && typeof args === 'object') {
+    parsed = args;
+  } else if (typeof args === 'string' && args.trim() !== '') {
+    try {
+      const p = JSON.parse(args);
+      if (p && typeof p === 'object') parsed = p;
+    } catch {
+      /* verbatim-almost-JSON — fall through to the raw slice */
     }
-  } catch {
-    /* verbatim-almost-JSON — fall through to the raw slice */
   }
-  const flat = String(argsText).replace(/\s+/g, ' ').trim().slice(0, 120);
+  if (parsed) {
+    for (const key of TOOL_TOPIC_KEYS) {
+      const topic = oneLineText(parsed[key], 120);
+      if (topic) return topic;
+    }
+    for (const key of TOOL_TECH_KEYS) {
+      if (parsed[key] == null || parsed[key] === '') continue;
+      let s = oneLineText(parsed[key], TOOL_PATH_KEYS.has(key) ? 120 : 80);
+      if (TOOL_PATH_KEYS.has(key)) {
+        // Deep paths collapse to the file the user recognizes.
+        const segs = s.split(/[\\/]/).filter(Boolean);
+        if (segs.length) s = segs[segs.length - 1].slice(0, 80);
+      }
+      if (s) return `${name} ${s}`;
+    }
+    return name;
+  }
+  if (!args) return name;
+  const flat = oneLineText(args, 80);
   return flat ? `${name} ${flat}` : name;
 }
 
@@ -380,6 +462,8 @@ export class MspClient extends EventEmitter {
     this._closing = false;
     this._cancelRequested = false;
     this._sessionReady = false;
+    /** True once view/subscribe is confirmed — prompt() refuses to run deaf. */
+    this.subscribed = false;
   }
 
   resolvePermission(id, optionId) {
@@ -422,9 +506,14 @@ export class MspClient extends EventEmitter {
           commandId: uuidv7(),
           answers: [{ questionId: wait.questionId, selectedLabel: String(optionId) }],
         }).then(
-          () => wait.resolve(optionId),
+          () => {
+            this.emit('diag', `[msp] userInput/answer ok id=${wait.userInputId}\n`);
+            wait.resolve(optionId);
+          },
           (err) => {
-            this._emitError( err instanceof Error ? err : new Error(String(err)));
+            // Loud, never swallowed: a rejected answer leaves the agent
+            // parked on the question while the card looks resolved (BUG-084).
+            this.emit('stderr', `[msp] userInput/answer FAILED id=${wait.userInputId}: ${err?.message || err}\n`);
             wait.resolve(optionId);
           },
         );
@@ -434,7 +523,11 @@ export class MspClient extends EventEmitter {
           userInputId: wait.userInputId,
           sessionId: this.sessionId,
           commandId: uuidv7(),
-        }).catch(() => {});
+          reason: 'unknown option picked; cancelled rather than answer wrong',
+        }).then(
+          () => this.emit('diag', `[msp] userInput/cancel ok id=${wait.userInputId} (unknown pick)\n`),
+          (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${wait.userInputId}: ${err?.message || err}\n`),
+        );
         wait.resolve(optionId);
       }
       return true;
@@ -792,11 +885,11 @@ export class MspClient extends EventEmitter {
     }
 
     this.authRequired = false;
-    try {
-      await this.request('view/subscribe', { sessionId: this.sessionId });
-    } catch (err) {
-      this.emit('stderr', `view/subscribe failed: ${err?.message || err}\n`);
-    }
+    // Load-bearing, not advisory: without a subscription the server never
+    // pushes view events and every turn hangs deaf (chat 81442763 held two
+    // already-completed runs open forever). Fail the whole spawn LOUD — a
+    // client that cannot hear the agent must never look healthy.
+    await this.ensureSubscribed();
     try {
       const catalog = await this.request('model/list', { sessionId: this.sessionId });
       if (Array.isArray(catalog?.models)) this.modelCatalog = catalog.models;
@@ -812,6 +905,33 @@ export class MspClient extends EventEmitter {
     } catch { /* model/effort are advisory too — never sink the session */ }
 
     this._sessionReady = true;
+  }
+
+  /**
+   * Subscribe to the session's view events, retrying transient failures.
+   * Throws when the channel cannot be established: the handshake treats this
+   * as a fatal spawn failure (a client that cannot hear the agent must never
+   * serve prompts). Every failed attempt emits on 'stderr' so it stays
+   * visible in the UI + host log instead of dying silently.
+   */
+  async ensureSubscribed({ attempts = 3, delayMs = 500 } = {}) {
+    let lastErr = null;
+    for (let i = 1; i <= attempts; i++) {
+      try {
+        await this.request('view/subscribe', { sessionId: this.sessionId });
+        this.subscribed = true;
+        return true;
+      } catch (err) {
+        lastErr = err;
+        this.emit('stderr', `view/subscribe attempt ${i}/${attempts} failed: ${err?.message || err}\n`);
+        if (i < attempts) await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+    const e = new Error(
+      `view/subscribe failed after ${attempts} attempts (${lastErr?.message || lastErr}) — the agent would run deaf: no stream, no completion`,
+    );
+    e.code = 'SUBSCRIBE_FAILED';
+    throw e;
   }
 
   _send(msg) {
@@ -984,6 +1104,7 @@ export class MspClient extends EventEmitter {
       case 'userInput/settled': {
         const id = String(params?.userInputId || '');
         this._permWaiters.delete(id);
+        this._cancelledIds?.delete(id);
         this.emit('permission', { id, resolved: true, optionId: 'answered' });
         return;
       }
@@ -992,10 +1113,7 @@ export class MspClient extends EventEmitter {
         if (Array.isArray(items)) {
           this.emit('update', {
             sessionUpdate: 'plan',
-            entries: items.map((t) => ({
-              content: String(t?.content ?? t?.text ?? t?.title ?? ''),
-              status: String(t?.status ?? 'pending'),
-            })),
+            entries: normalizeTodoItems(items),
           });
         } else {
           this.emit('update', { sessionUpdate: 'msp:session/todoListChanged', ...params });
@@ -1195,7 +1313,11 @@ export class MspClient extends EventEmitter {
       const rec = this._trackItem(item);
       const kind = rec?.kind || '';
       if (kind === 'toolCall') {
-        const output = rec.output || String(item.fallbackText || '');
+        // Instant tools (subagent_spawn/wait, reads) never stream deltas —
+        // their whole output arrives here as visibleOutput. Streamed tools
+        // already filled rec.output from deltas and keep winning, so live
+        // rows never shrink to the bounded transcript text.
+        const output = rec.output || String(item.visibleOutput || item.fallbackText || '');
         this.emit('update', {
           sessionUpdate: 'tool_call_update',
           toolCallId: itemId,
@@ -1240,6 +1362,7 @@ export class MspClient extends EventEmitter {
   }
 
   _onApprovalFrame(params, { forceEmit = true } = {}) {
+    this.emit('diag', `[msp] rx approval frame id=${params?.approvalId || '?'}\n`);
     const card = mspApprovalCard(params);
     if (!card) {
       this.emit('update', { sessionUpdate: 'msp:approval/unknown', ...params });
@@ -1257,9 +1380,10 @@ export class MspClient extends EventEmitter {
           choiceId: String(auto.choiceId),
           requirementId: card.requirementId,
           commandId: uuidv7(),
-        }).catch((err) => {
-          this._emitError( err instanceof Error ? err : new Error(String(err)));
-        });
+        }).then(
+          () => this.emit('diag', `[msp] approval/decide ok id=${card.approvalId} (auto-approve)\n`),
+          (err) => this.emit('stderr', `[msp] approval/decide FAILED id=${card.approvalId}: ${err?.message || err}\n`),
+        );
         return;
       }
       // No approve choice on offer — fall through to a card rather than
@@ -1291,7 +1415,10 @@ export class MspClient extends EventEmitter {
             choiceId: String(deny.choiceId),
             requirementId: waiter.requirementId,
             commandId: uuidv7(),
-          }).catch(() => {});
+          }).then(
+            () => this.emit('diag', `[msp] approval/decide ok id=${card.approvalId} (card timeout)\n`),
+            (err) => this.emit('stderr', `[msp] approval/decide FAILED id=${card.approvalId}: ${err?.message || err}\n`),
+          );
         }
         this.emit('permission', {
           id: card.id,
@@ -1319,28 +1446,55 @@ export class MspClient extends EventEmitter {
   }
 
   _onUserInputFrame(params) {
+    this.emit('diag', `[msp] rx userInput frame id=${params?.userInputId || '?'} q=${Array.isArray(params?.questions) ? params.questions.length : '?'}\n`);
+    this.recoverUserInput(params, 'live');
+  }
+
+  /**
+   * Mount-or-cancel for one userInput prompt — shared by the live
+   * `userInput/request(ed)` frames and the watchdog's listPending recovery
+   * poll (BUG-084), so a missed frame and a live frame end identically.
+   * Returns 'card' | 'cancelled' | 'duplicate' | null (no id).
+   */
+  recoverUserInput(params, source = 'live') {
     const userInputId = String(params?.userInputId || '');
     if (!userInputId) {
       this.emit('update', { sessionUpdate: 'msp:userInput/unknown', ...params });
-      return;
+      return null;
     }
-    if (this._permWaiters.has(userInputId)) return; // request + notification dedupe
+    // Request + notification dedupe covers BOTH paths: the cancel path
+    // creates no waiter, so without _cancelledIds the pair would double
+    // the cancel RPC and the transcript notice.
+    if (this._permWaiters.has(userInputId)) return 'duplicate';
+    if (this._cancelledIds?.has(userInputId)) return 'duplicate';
     const card = mspUserInputCard(params);
     if (!card) {
       // Multi-question / multi-select / free-text shapes do not fit the
       // single-optionId card. Cancelling (with a visible trace) beats
       // stranding the turn on a prompt nobody can answer.
+      const qCount = Array.isArray(params?.questions) ? params.questions.length : 0;
+      if (!this._cancelledIds) this._cancelledIds = new Set();
+      this._cancelledIds.add(userInputId);
       this.emit('update', {
         sessionUpdate: 'msp:user_input_unsupported',
         userInputId,
         questions: params?.questions || [],
       });
+      this.emit('diag', `[msp] userInput/cancel → id=${userInputId} q=${qCount} (${source})\n`);
       this.request('userInput/cancel', {
         userInputId,
         sessionId: this.sessionId,
         commandId: uuidv7(),
-      }).catch(() => {});
-      return;
+        // Load-bearing: the schema marks reason optional but binary 1.4.2
+        // rejects the cancel without it (`missing field 'reason'`) — the
+        // actual f381a7e1 wedge. The model sees the cancelled result, so
+        // say why and what to do.
+        reason: `desktop shows one single-select question at a time (this prompt has ${qCount}); proceeding without an answer`,
+      }).then(
+        () => this.emit('diag', `[msp] userInput/cancel ok id=${userInputId}\n`),
+        (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${userInputId}: ${err?.message || err}\n`),
+      );
+      return 'cancelled';
     }
     // Questions always surface — even an always-approve session cannot know
     // the answers, and cancelling them would silently change the outcome.
@@ -1365,7 +1519,11 @@ export class MspClient extends EventEmitter {
         userInputId: card.userInputId,
         sessionId: this.sessionId,
         commandId: uuidv7(),
-      }).catch(() => {});
+        reason: 'question unanswered for 5 minutes',
+      }).then(
+        () => this.emit('diag', `[msp] userInput/cancel ok id=${card.userInputId} (card timeout)\n`),
+        (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${card.userInputId}: ${err?.message || err}\n`),
+      );
       this.emit('permission', { id: card.id, resolved: true, optionId: 'cancel', reason: 'timeout' });
     }, 5 * 60 * 1000).unref?.();
     this.emit('permission', {
@@ -1378,12 +1536,76 @@ export class MspClient extends EventEmitter {
       params,
       options: card.options,
     });
+    return 'card';
+  }
+
+  /**
+   * Mount a pending approval the live frames never delivered (BUG-084 poll).
+   * forceEmit=false: a repeat only refreshes choices, exactly one card goes
+   * up. Returns true when a waiter exists for the approval afterwards.
+   */
+  recoverApproval(params) {
+    this._onApprovalFrame(params, { forceEmit: false });
+    const id = String(params?.approvalId || '');
+    return !!id && this._permWaiters.has(id);
+  }
+
+  /** True when a card/waiter already covers this interactive id. */
+  hasInteractiveWaiter(id) {
+    return this._permWaiters.has(String(id || ''));
+  }
+
+  /** Mounted interactive ids — the poll's "already handled" set. */
+  interactiveWaiterIds() {
+    return new Set(this._permWaiters.keys());
+  }
+
+  /**
+   * Point-in-time pending approvals + userInput prompts (the pull dual of
+   * the push frames). A log-fold read — safe to call on a running turn.
+   */
+  async listPending() {
+    if (!this.sessionId) throw new Error('session not ready');
+    const res = await this.request('approval/listPending', { sessionId: this.sessionId });
+    return {
+      approvals: Array.isArray(res?.approvals) ? res.approvals : [],
+      userInputs: Array.isArray(res?.userInputs) ? res.userInputs : [],
+    };
+  }
+
+  /**
+   * Best-effort run interrupt WITHOUT touching the local turn waiter —
+   * the escalation path settles the turn itself with its own error, and a
+   * local reject here would race it into a plain 'cancelled' (BUG-084).
+   */
+  async interrupt() {
+    if (!this.sessionId) return false;
+    const turnId = this._activeTurn?.mspTurnId || null;
+    try {
+      await Promise.race([
+        this.request('turn/interrupt', {
+          commandId: uuidv7(),
+          sessionId: this.sessionId,
+          ...(turnId ? { turnId } : {}),
+        }).catch(() => null),
+        new Promise((resolve) => setTimeout(resolve, 1200)),
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   _onTurnCompleted(params) {
     const t = this._activeTurn;
-    if (!t) return;
-    if (t.mspTurnId && params?.turnId && params.turnId !== t.mspTurnId) return;
+    if (!t) {
+      this.emit('stderr', `[msp] dropped turn/completed (no active turn) turnId=${params?.turnId || 'none'} terminal=${params?.terminal || 'none'}\n`);
+      return;
+    }
+    if (t.mspTurnId && params?.turnId && params.turnId !== t.mspTurnId) {
+      this.emit('stderr', `[msp] dropped turn/completed for a superseded turn (got ${params.turnId}, live is ${t.mspTurnId})\n`);
+      return;
+    }
     this._activeTurn = null;
     const terminal = String(params?.terminal || '');
     if (this._cancelRequested || terminal === 'cancelled') {
@@ -1414,6 +1636,11 @@ export class MspClient extends EventEmitter {
    */
   async prompt(text, parts = {}) {
     if (!this.sessionId) throw new Error('session not ready');
+    if (!this.subscribed) {
+      const err = new Error('session not subscribed to view events — refusing a turn the agent could never complete back');
+      err.code = 'NOT_SUBSCRIBED';
+      throw err;
+    }
     if (this._activeTurn) {
       const err = new Error('a turn is already running for this session');
       err.code = 'TURN_IN_FLIGHT';

@@ -31,6 +31,8 @@ const appSwift = fs.readFileSync(
 );
 const macLaunch = fs.readFileSync(path.join(ROOT, 'scripts/mac-launch.sh'), 'utf8');
 const indexJs = fs.readFileSync(path.join(ROOT, 'src/server/index.js'), 'utf8');
+const appJs = fs.readFileSync(path.join(ROOT, 'src/renderer/app.js'), 'utf8');
+const childJs = fs.readFileSync(path.join(ROOT, 'src/renderer/child.js'), 'utf8');
 const deploySh = fs.readFileSync(path.join(ROOT, 'scripts/deploy.sh'), 'utf8');
 const pkgJson = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 
@@ -84,6 +86,32 @@ ok(
 ok(
   'toolbar still uses /api/memory meter',
   /\/api\/memory/.test(contentView),
+);
+// ── ⧉ pop-out: same-origin window.open must land in a real window ──
+// Without createWebViewWith, WKWebView silently drops the rail's "open in
+// new window" popup; off-origin targets still belong in the real browser.
+ok(
+  'UIDelegate opens same-origin popups as real windows',
+  /createWebViewWith/.test(contentView) &&
+    /127\.0\.0\.1.*localhost|localhost.*127\.0\.0\.1/.test(contentView) &&
+    /NSWorkspace\.shared\.open\(url\)/.test(contentView),
+);
+
+// ── BUG-081: Host menu is raw AppKit with NSString titles ──────────
+// A Swift-native non-ASCII title traps in NSMenuItem._description on every
+// highlight (SIGTRAP) — the Host menu must stay AppKit-built with every
+// title routed through the NSString helper. probe-menu-titles.swift
+// re-proves the mechanism against the real AppKit call.
+ok(
+  'Host menu is AppKit-built, not SwiftUI CommandMenu (non-ASCII trap)',
+  !/CommandMenu\("Host"\)/.test(appSwift) && /installHostMenu/.test(appSwift),
+);
+ok(
+  'every Host menu title routes through the NSString helper',
+  /func nsTitle/.test(appSwift) &&
+    /NSString\(string:/.test(appSwift) &&
+    (appSwift.match(/NSMenuItem\(title: nsTitle\(/g) || []).length >= 5,
+  'menu + 4 items',
 );
 
 // ── mac-launch.sh LSEnvironment proxy vars ───────────────────────
@@ -169,6 +197,20 @@ ok(
 ok(
   'host writes host.pid on listen',
   /writeFileSync\(PID_FILE, String\(process\.pid\)/.test(indexJs),
+);
+
+// ── Renderer chat-open prefetch (1.1.21) ─────────────────────────
+ok(
+  'chat open prefetches the subagent registry (fresh load lists children)',
+  /if \(!wireSubagents\.has\(chatId\)\)/.test(appJs) &&
+    /\/api\/chats\/.*\/subagents/.test(appJs) &&
+    /wireSubagents\.set\(chatId, new Map\(/.test(appJs),
+  'same seed-on-open as goal/ctx',
+);
+ok(
+  'child page shows the verdict once (server items[0], no second card)',
+  !/reminderDecision/.test(childJs),
+  'rail parity — a second copy reads like a bug',
 );
 
 // ── Live probes (never POST shutdown) ────────────────────────────

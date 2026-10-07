@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, messageChildOrder, shouldAutoExpandTool, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from '../src/renderer/turn-view.js';
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from '../src/renderer/turn-view.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -77,6 +77,7 @@ test('bind keeps the original startedAt (elapsed time stays truthful)', () => {
 test('interruptedMarkerText labels a user stop and a watchdog stop differently', () => {
   assert.equal(interruptedMarkerText('cancelled'), '⏹ หยุดโดยผู้ใช้');
   assert.equal(interruptedMarkerText('watchdog'), '⚠︎ ระบบหยุดให้ (เงียบเกินเพดาน watchdog)');
+  assert.equal(interruptedMarkerText('interrupted'), '⏹ host หยุดระหว่างเทิร์น — prompt ใหม่เพื่อทำต่อ');
   // Anything else that reads as a manual interruption gets the user label.
   assert.equal(interruptedMarkerText(undefined), '⏹ หยุดโดยผู้ใช้');
 });
@@ -303,6 +304,24 @@ test('ixKeyToOptionId: digits pick by position, Esc picks the reject-kind option
   assert.equal(ixKeyToOptionId(undefined, '1'), null);
 });
 
+test('escStopAction: ESC asks before stopping, and only while a turn runs', () => {
+  assert.equal(escStopAction({ key: 'Escape', running: true }), 'confirm');
+  assert.equal(escStopAction({ key: 'Escape', running: false }), 'none');
+  assert.equal(escStopAction({ key: 'Escape', running: undefined }), 'none');
+  assert.equal(escStopAction({ key: 'Enter', running: true }), 'none');
+  assert.equal(escStopAction({ key: 'a', running: true }), 'none');
+});
+
+test('confirmedStopProceeds: a stale yes stops nothing', () => {
+  assert.equal(confirmedStopProceeds({ escChatId: 'c1', activeChatId: 'c1', running: true }), true);
+  // The turn settled behind the open popover.
+  assert.equal(confirmedStopProceeds({ escChatId: 'c1', activeChatId: 'c1', running: false }), false);
+  // The user switched chats behind the open popover.
+  assert.equal(confirmedStopProceeds({ escChatId: 'c1', activeChatId: 'c2', running: true }), false);
+  assert.equal(confirmedStopProceeds({ escChatId: 'c1', activeChatId: null, running: true }), false);
+  assert.equal(confirmedStopProceeds({ escChatId: null, activeChatId: 'c1', running: true }), false);
+});
+
 test('messageChildOrder mirrors liveChildOrder for the settled transcript (BUG-031)', () => {
   const msg = {
     role: 'assistant',
@@ -329,24 +348,57 @@ test('messageChildOrder mirrors liveChildOrder for the settled transcript (BUG-0
   assert.deepEqual(messageChildOrder({ role: 'notice', text: 'x' }), ['notice']);
 });
 
-test('shouldAutoExpandTool opens running/execute rows unless the user toggled them (BUG-033)', () => {
+test('shouldAutoExpandTool hides by default — only an explicit open expands (hide-defaults)', () => {
   const tv = createTurnView();
-  assert.equal(shouldAutoExpandTool(tv, { id: 't1', status: 'in_progress' }), true);
-  assert.equal(shouldAutoExpandTool(tv, { id: 't2', status: 'running' }), true);
-  assert.equal(shouldAutoExpandTool(tv, { id: 't3', status: 'pending', kind: 'execute' }), true);
-  assert.equal(shouldAutoExpandTool(tv, { id: 't4', status: 'pending', kind: 'bash' }), true);
-  // A quiet read still queued stays collapsed.
-  assert.equal(shouldAutoExpandTool(tv, { id: 't5', status: 'pending', kind: 'read' }), false);
-  // Terminal states do not re-open finished rows on their own.
-  assert.equal(shouldAutoExpandTool(tv, { id: 't6', status: 'completed', kind: 'read' }), false);
-  assert.equal(shouldAutoExpandTool(tv, { id: 't7', status: 'failed' }), false);
-  // The guard: a manual collapse wins over every rule above for this turn.
-  tv.userToggledTools.add('t1');
+  // Streaming never pops rows open — not even running bash rows (the old
+  // grok behaviour this replaced).
   assert.equal(shouldAutoExpandTool(tv, { id: 't1', status: 'in_progress' }), false);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't2', status: 'running' }), false);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't3', status: 'pending', kind: 'execute' }), false);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't4', status: 'pending', kind: 'bash' }), false);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't5', status: 'pending', kind: 'read' }), false);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't6', status: 'completed', kind: 'read' }), false);
+  // A head click / "explain" records the row — repaints keep it open.
+  tv.userToggledTools.add('t1');
+  tv.userExpandedTools.add('t1');
+  assert.equal(shouldAutoExpandTool(tv, { id: 't1', status: 'in_progress' }), true);
   // …but never leaks to other rows or next turn's fresh view.
-  assert.equal(shouldAutoExpandTool(tv, { id: 't2', status: 'running' }), true);
-  assert.equal(shouldAutoExpandTool(createTurnView(), { id: 't1', status: 'in_progress' }), true);
+  assert.equal(shouldAutoExpandTool(tv, { id: 't2', status: 'running' }), false);
+  assert.equal(shouldAutoExpandTool(createTurnView(), { id: 't1', status: 'in_progress' }), false);
+  // A manual collapse removes the row from the expanded set — the BUG-033
+  // guard (toggled but not expanded) keeps it shut.
+  tv.userExpandedTools.delete('t1');
+  assert.equal(shouldAutoExpandTool(tv, { id: 't1', status: 'in_progress' }), false);
   assert.equal(shouldAutoExpandTool(tv, null), false);
+});
+
+test('toggleProgressOpen flips the group and bumps the structural rev', () => {
+  const tv = createTurnView();
+  assert.equal(tv.progressOpen, false);
+  assert.equal(toggleProgressOpen(tv), true);
+  assert.equal(tv.progressOpen, true);
+  assert.equal(tv.rev, 1);
+  assert.equal(toggleProgressOpen(tv), false);
+  assert.equal(toggleProgressOpen(null), false);
+});
+
+test('progressSummary counts tools, running rows and plan steps', () => {
+  const tv = createTurnView();
+  tv.tools.set('a', { id: 'a', status: 'in_progress' });
+  tv.tools.set('b', { id: 'b', status: 'completed' });
+  tv.plan = [{ status: 'completed' }, { status: 'in_progress' }, { status: 'pending' }];
+  assert.deepEqual(progressSummary(tv), { tools: 2, running: 1, planSteps: 3, planDone: 1 });
+  assert.deepEqual(progressSummary(null), { tools: 0, running: 0, planSteps: 0, planDone: 0 });
+});
+
+test('seedTurnView resets progress-open state when the turn is replaced', () => {
+  const tv = createTurnView();
+  tv.turnId = 'old';
+  tv.userExpandedTools.add('t1');
+  tv.progressOpen = true;
+  seedTurnView(tv, { turnId: 'new', partial: 'x' });
+  assert.equal(tv.progressOpen, false);
+  assert.equal(tv.userExpandedTools.size, 0);
 });
 
 test('resolveStatusVerb says preparing-tools while a fresh agent is silent', () => {
@@ -460,6 +512,67 @@ test('resolveStatusVerb shows thinking only after a thought chunk arrived', () =
   // …but a running tool still outranks the thought stream.
   tv.tools.set('tc-1', { id: 'tc-1', title: 'npm test', kind: 'execute', status: 'in_progress' });
   assert.equal(resolveStatusVerb(tv), 'กำลังรัน npm test…');
+});
+
+test('toolTopic strips the old tool-name prefix, keeps bare topics', () => {
+  assert.equal(toolTopic({ title: 'Bash ls /tmp/mock', kind: 'Bash' }), 'ls /tmp/mock');
+  assert.equal(toolTopic({ title: 'bash ls /tmp/mock', kind: 'Bash' }), 'ls /tmp/mock', 'case-insensitive');
+  assert.equal(toolTopic({ title: 'Read: src/app.js', kind: 'read' }), 'src/app.js');
+  assert.equal(toolTopic({ title: 'ตรวจไฟล์ชั่วคราว', kind: 'Bash' }), 'ตรวจไฟล์ชั่วคราว', 'bare topic passes through');
+  assert.equal(toolTopic({ title: 'Bash', kind: 'Bash' }), '', 'bare kind is not a topic');
+  assert.equal(toolTopic({ title: '', kind: 'Bash' }), '');
+  assert.equal(toolTopic({ kind: 'Bash' }), '');
+  assert.equal(toolTopic(null), '');
+});
+
+test('resolveStatusVerb never repeats the tool name', () => {
+  // Wire-true kinds are tool names (`Bash`), which take the default verb —
+  // the point here is the stripped topic, not the kind mapping.
+  const tv = createTurnView();
+  tv.tools.set('t', { id: 't', title: 'Bash ls /tmp/mock', kind: 'Bash', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(tv), 'กำลังใช้ ls /tmp/mock…');
+  const bare = createTurnView();
+  bare.tools.set('t', { id: 't', title: 'Bash', kind: 'Bash', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(bare), 'กำลังใช้เครื่องมือ…', 'nothing left after the strip → kind fallback');
+  const topic = createTurnView();
+  topic.tools.set('t', { id: 't', title: 'ตรวจไฟล์ชั่วคราว', kind: 'Bash', status: 'in_progress' });
+  assert.equal(resolveStatusVerb(topic), 'กำลังใช้ ตรวจไฟล์ชั่วคราว…');
+});
+
+test('inProgressPlanStep normalizes the running step once for both callers', () => {
+  const tv = createTurnView();
+  assert.equal(inProgressPlanStep(tv), '');
+  assert.equal(inProgressPlanStep(null), '');
+  tv.plan = [
+    { content: 'อ่านโจทย์', status: 'completed' },
+    { content: '  ลงมือ\nทำ  ', status: 'in_progress' },
+  ];
+  assert.equal(inProgressPlanStep(tv), 'ลงมือ ทำ');
+});
+
+test('progressTopic names the plan step, else the running tool, else agents', () => {
+  assert.equal(progressTopic(null), '');
+  assert.equal(progressTopic(createTurnView()), '', 'idle → caller falls back to Progress Bar');
+  const tv = createTurnView();
+  tv.tools.set('t', { id: 't', title: 'ตรวจไฟล์ชั่วคราว', kind: 'Bash', status: 'in_progress' });
+  tv.tools.set('a', { id: 'a', title: 'explore', kind: 'other', status: 'in_progress', rawInput: { subagent_type: 'explore' } });
+  assert.equal(progressTopic(tv), 'ตรวจไฟล์ชั่วคราว', 'plain tool beats agents');
+  tv.plan = [{ content: 'ลงมือทำ', status: 'in_progress' }];
+  assert.equal(progressTopic(tv), 'ลงมือทำ', 'plan step beats tools');
+  tv.tools.get('t').status = 'completed';
+  tv.plan = [{ content: 'done', status: 'completed' }];
+  assert.equal(progressTopic(tv), '1 agent', 'only agents left → count');
+  tv.tools.get('a').status = 'completed';
+  assert.equal(progressTopic(tv), '', 'settled turn → no topic');
+});
+
+test('progressTopic strips old prefixes and caps at 48 chars', () => {
+  const tv = createTurnView();
+  tv.tools.set('t', { id: 't', title: 'Bash ls /tmp/mock', kind: 'Bash', status: 'in_progress' });
+  assert.equal(progressTopic(tv), 'ls /tmp/mock');
+  const long = createTurnView();
+  long.plan = [{ content: 'x'.repeat(80), status: 'in_progress' }];
+  assert.equal(progressTopic(long).length, 48);
 });
 
 test('configSelectsFromOptions normalizes the advertised selects (BUG-075)', () => {

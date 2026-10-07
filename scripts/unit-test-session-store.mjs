@@ -8,6 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { SessionStore, deriveTitle } from '../src/server/session-store.js';
+import { hasLoneSurrogate } from '../src/server/text.js';
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -94,6 +95,14 @@ test('deriveTitle strips code fences and truncates', () => {
   assert.equal(deriveTitle(''), 'New chat');
   assert.equal(deriveTitle('```js\nconst a=1\n```  hello'), 'hello');
   assert.ok(deriveTitle('x'.repeat(200)).endsWith('…'));
+});
+
+test('deriveTitle never splits an emoji at the cut', () => {
+  // 'x' + emoji run: UTF-16 offset 60 lands mid-emoji — slice() would orphan
+  // a lone surrogate (� in the sidebar).
+  const t = deriveTitle(`x${'🎉'.repeat(100)}`);
+  assert.equal(hasLoneSurrogate(t), false);
+  assert.ok(t.endsWith('…'));
 });
 
 test('reload from disk preserves chats and messages', () => {

@@ -24,14 +24,17 @@ function pickPort() {
   return 3900 + Math.floor(Math.random() * 400);
 }
 
-async function startHost({ authWall = false, museBin = MOCK } = {}) {
+async function startHost({ authWall = false, museBin = MOCK, stateHome = null, configHome = null } = {}) {
   const port = pickPort();
-  const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-e2e-'));
+  // stateHome/configHome reuse is the restart seam: the persistence step
+  // boots a second host over the first host's dirs to prove the registry
+  // survives a process exit.
+  const stateDir = stateHome || fs.mkdtempSync(path.join(os.tmpdir(), 'muse-e2e-'));
   // Hermetic MCP catalog: the host must never touch the developer's real
   // ~/.config/muse/settings.json (the toggle e2e writes to it).
-  const configHome = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-e2e-cfg-'));
-  fs.mkdirSync(path.join(configHome, 'muse'), { recursive: true });
-  const settingsFile = path.join(configHome, 'muse', 'settings.json');
+  const configDir = configHome || fs.mkdtempSync(path.join(os.tmpdir(), 'muse-e2e-cfg-'));
+  fs.mkdirSync(path.join(configDir, 'muse'), { recursive: true });
+  const settingsFile = path.join(configDir, 'muse', 'settings.json');
   fs.writeFileSync(settingsFile, JSON.stringify({
     schema_version: 1,
     mcpServers: {
@@ -45,8 +48,8 @@ async function startHost({ authWall = false, museBin = MOCK } = {}) {
       ...process.env,
       MUSE_DESKTOP_PORT: String(port),
       MUSE_DESKTOP_HOST: '127.0.0.1',
-      XDG_STATE_HOME: stateHome,
-      XDG_CONFIG_HOME: configHome,
+      XDG_STATE_HOME: stateDir,
+      XDG_CONFIG_HOME: configDir,
       NO_OPEN: '1',
       MUSE_BIN: museBin,
       MUSE_DESKTOP_MODEL: 'mock-model-1',
@@ -55,12 +58,21 @@ async function startHost({ authWall = false, museBin = MOCK } = {}) {
       // seconds instead of minutes (production defaults: 180s / 15s).
       MUSE_DESKTOP_NO_ACTIVITY_MS: '1500',
       MUSE_DESKTOP_WATCHDOG_TICK_MS: '400',
+      // BUG-084 recovery poll clocks (production defaults: 45s / 30s).
+      MUSE_DESKTOP_PENDING_POLL_MS: '300',
+      MUSE_DESKTOP_CANCEL_GRACE_MS: '600',
       // 2ms delta flush: the mock's 10ms-spaced chunks still arrive per-frame,
       // while the 120-chunk "long" burst lands inside one window (BUG-009).
       MUSE_DESKTOP_DELTA_FLUSH_MS: '2',
-      MOCK_MSP_CONFIG_LOG: path.join(stateHome, 'config-calls.log'),
-      MOCK_MSP_HISTFAIL_MARKER: path.join(stateHome, 'histfail.marker'),
-      MOCK_MSP_PROMPT_LOG: path.join(stateHome, 'prompts.log'),
+      MOCK_MSP_CONFIG_LOG: path.join(stateDir, 'config-calls.log'),
+      MOCK_MSP_HISTFAIL_MARKER: path.join(stateDir, 'histfail.marker'),
+      MOCK_MSP_AUDITFAIL_MARKER: path.join(stateDir, 'auditfail.marker'),
+      MOCK_MSP_PROMPT_LOG: path.join(stateDir, 'prompts.log'),
+      MOCK_MSP_SESSION_LOG: path.join(stateDir, 'sessions.log'),
+      MOCK_MSP_SUBAGENT_LOG: path.join(stateDir, 'subagents.log'),
+      // Distinct session id per mock boot — without this every agent mints
+      // mock-session-1 and the BUG-082 freshness assertion cannot pass.
+      MOCK_MSP_ID_FILE: path.join(stateDir, 'mock-sid.counter'),
       ...(authWall ? { MOCK_MSP_MODE: 'authwall' } : {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -73,7 +85,7 @@ async function startHost({ authWall = false, museBin = MOCK } = {}) {
   for (let i = 0; i < 100; i++) {
     try {
       const r = await req(base, 'GET', '/api/state');
-      if (r.ok) return { proc, base, port, stateHome, configHome, settingsFile, logs };
+      if (r.ok) return { proc, base, port, stateHome: stateDir, configHome: configDir, settingsFile, logs };
     } catch {
       /* not up yet */
     }
@@ -371,6 +383,17 @@ await step('AskUserQuestion tunnels as a subtyped ask card with the question bod
   assert.match(done.data.content, /ask → SQLite in-memory/, 'the picked answer must reach the agent');
 });
 
+await step('agent-question banner route answers (empty body delivers nothing, pops nothing)', async () => {
+  // The renderer posts here on every fresh ask/plan/approval card; the v1.0.0
+  // outage was this route not existing at all (404 → silent catch → no
+  // banner). An empty body must 200 with delivered:false and spawn nothing —
+  // a suite that pops real banners would be rude. Payload/escaping/gate live
+  // in unit-test-notify.mjs; real delivery was verified live on the host.
+  const r = await req(host.base, 'POST', '/api/notify', {});
+  assert.equal(r.ok, true);
+  assert.equal(r.delivered, false);
+});
+
 await step('a multi-question prompt auto-cancels with a visible trace instead of stranding the turn', async () => {
   // MSP has no plan-review channel (the ACP ExitPlanMode card has no
   // counterpart); what the card UI cannot answer — multi-question,
@@ -392,13 +415,62 @@ await step('a multi-question prompt auto-cancels with a visible trace instead of
   assert.ok(trace, 'the auto-cancel left no visible trace');
 });
 
+await step('a ghost prompt the live frames never delivered is recovered by the poll (BUG-084)', async () => {
+  // The agent holds a multi-question prompt but announces nothing — the
+  // production wedge (chat f381a7e1). The watchdog's listPending poll must
+  // discover it, auto-cancel, and the turn must complete. A hang here fails
+  // the wait below.
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'ghostquiz run' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'ghostquiz turn_done' },
+  );
+  assert.match(done.data.content, /Recovered without an answer/, 'the poll cancel must unblock the turn');
+  const freshCards = stream.of('interaction').filter((e) => !knownIx.has(e.data.id));
+  assert.equal(freshCards.length, 0, 'no card can answer a multi-question prompt');
+  const chat = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  const notice = chat.chat.messages.find(
+    (m) => m.role === 'notice' && m.meta?.turnId === r.turnId && m.meta?.userInputId,
+  );
+  assert.ok(notice, 'the poll auto-cancel left no persisted notice');
+  assert.match(notice.text, /2 คำถาม/, 'the notice must name the question count');
+});
+
+await step('a cancel the agent ignores escalates to interrupt + loud settle + recovery (BUG-084)', async () => {
+  // Same ghost, but the agent swallows the cancel — the poll must interrupt
+  // the run and settle with the cause after grace, never hold forever. Then
+  // the next prompt boots a fresh agent and completes normally.
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'stubbornquiz run' });
+  assert.equal(r.status, 202);
+  const errEv = await stream.waitFor(
+    (e) => e.event === 'turn_error' && e.data.turnId === r.turnId,
+    { label: 'stubbornquiz turn_error' },
+  );
+  assert.match(errEv.data.error, /request_user_input/, 'the settle must name the cause');
+  await stream.waitFor(
+    (e) => e.event === 'agent_released' && e.data.chatId === chatId,
+    { label: 'stubborn agent released' },
+  );
+  const p2 = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'hi again' });
+  assert.equal(p2.status, 202);
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === p2.turnId,
+    { label: 'post-escalation recovery turn_done' },
+  );
+});
+
 await step('a long streamed answer batches deltas but ends in exactly one turn_done', async () => {
   const deltasBefore = stream.of('message_delta').length;
-  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'give me a long answer' });
+  const donesBefore = stream.of('turn_done').length;
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'give me a long answer' });
+  assert.equal(r.status, 202);
   const done = await stream.waitFor(
-    (e) => e.event === 'turn_done' && stream.of('turn_done').length === 7,
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
     { label: 'long-answer turn_done' },
   );
+  assert.equal(stream.of('turn_done').length, donesBefore + 1, 'exactly one turn_done for the long answer');
   // The mock fired 120 chunks in one burst; batching must collapse them into
   // far fewer SSE frames without losing a single character.
   const deltas = stream.of('message_delta').slice(deltasBefore);
@@ -444,6 +516,52 @@ await step('history-incompatible prompt error rotates the agent and retries once
   );
   const stored = raw.chats.find((c) => c.id === chatId);
   assert.ok(String(stored.mspSessionId || '').startsWith('mock-session-'), 'rotation did not persist a fresh mspSessionId');
+});
+
+await step('mcp-audit failure rotates the agent, keeps the session, and retries once (BUG-082)', async () => {
+  const chatsFile = path.join(host.stateHome, 'muse-desktop/chats.json');
+  const sessionsFile = path.join(host.stateHome, 'sessions.log');
+  const idBefore = JSON.parse(fs.readFileSync(chatsFile, 'utf8')).chats.find((c) => c.id === chatId).mspSessionId;
+  let verbLinesBefore = 0;
+  try { verbLinesBefore = fs.readFileSync(sessionsFile, 'utf8').trim().split('\n').filter(Boolean).length; } catch { /* first boot */ }
+  const donesBefore = stream.of('turn_done').length;
+  const errsBefore = stream.of('turn_error').length;
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'auditfail please' });
+  assert.equal(r.status, 202, `prompt must still return 202: ${JSON.stringify(r)}`);
+  // Turn 1 settles as rotated; the retry on a fresh agent settles again —
+  // exactly two new terminal events, the second carrying the real answer.
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && stream.of('turn_done').length === donesBefore + 2,
+    { label: 'audit-rotated retry turn_done' },
+  );
+  const settled = stream.of('turn_done').slice(donesBefore);
+  assert.equal(settled.length, 2, 'turn 1 (rotated) + turn 2 (retry) must each settle once');
+  assert.notEqual(settled[0].data.turnId, settled[1].data.turnId);
+  assert.equal(settled[0].data.reason, 'rotated');
+  assert.match(settled[1].data.content || '', /สวัสดีจาก mock agent \(audit-retry final\)/, 'retry must land the answer');
+  assert.equal(stream.of('turn_error').length, errsBefore, 'rotation must not surface as turn_error');
+
+  const chat = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  assert.equal(
+    chat.chat.messages.filter((m) => m.role === 'user' && m.text.includes('auditfail')).length,
+    1,
+    'the retry must not duplicate the stored user message',
+  );
+  const notice = chat.chat.messages.find((m) => m.role === 'notice' && m.text.includes('MCP startup audit failed'));
+  assert.ok(notice, 'the transcript should carry the audit rotation notice');
+
+  // Unlike history-incompatible, the session is KEPT: the stored id must
+  // be untouched, and the fresh agent must have resumed it (not started).
+  const stored = JSON.parse(fs.readFileSync(chatsFile, 'utf8')).chats.find((c) => c.id === chatId);
+  assert.equal(stored.mspSessionId, idBefore, 'audit rotation must keep the agent-session id');
+  const newVerbs = fs.readFileSync(sessionsFile, 'utf8').trim().split('\n').filter(Boolean).slice(verbLinesBefore)
+    .map((l) => JSON.parse(l));
+  assert.ok(newVerbs.length >= 1, 'the retry must boot at least one fresh agent');
+  for (const v of newVerbs) {
+    assert.equal(v.verb, 'resume', `fresh agent must resume, got ${v.verb}`);
+    assert.equal(v.requested, idBefore, 'fresh agent must resume the kept session id');
+  }
+  assert.ok(newVerbs.some((v) => v.minted !== idBefore), 'the retry must run on a fresh agent process');
 });
 
 await step('mid-turn GET /turn exposes the open turn, then 404s after settle', async () => {
@@ -732,6 +850,31 @@ await step('watchdog leaves a silent turn alone while the turn is in flight', as
   });
 });
 
+await step('watchdog settles a deaf turn and the next prompt recovers (BUG-080)', async () => {
+  const r = await req(host.base, 'POST', '/api/chats', { title: 'deaf', cwd: os.tmpdir() });
+  assert.equal(r.status, 201);
+  const deafId = r.chat.id;
+  const p = await req(host.base, 'POST', `/api/chats/${deafId}/prompt`, { text: 'stay-deaf please' });
+  assert.equal(p.status, 202, `deaf prompt must open a turn: ${JSON.stringify(p)}`);
+  // Test-only clocks: 1.5s no-activity window, 400ms tick.
+  const errEv = await stream.waitFor(
+    (e) => e.event === 'turn_error' && e.data.turnId === p.turnId,
+    { label: 'deaf turn_error' },
+  );
+  assert.match(errEv.data.error, /ไม่ได้ยิน/);
+  await stream.waitFor(
+    (e) => e.event === 'agent_released' && e.data.chatId === deafId,
+    { label: 'deaf agent released' },
+  );
+  // Recovery: the next prompt boots a fresh agent and completes normally.
+  const p2 = await req(host.base, 'POST', `/api/chats/${deafId}/prompt`, { text: 'hi again' });
+  assert.equal(p2.status, 202);
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === p2.turnId,
+    { label: 'recovery turn_done' },
+  );
+});
+
 await step('mode change is applied and echoed', async () => {
   const r = await req(host.base, 'POST', `/api/chats/${chatId}/mode`, { mode: 'always' });
   assert.equal(r.mode, 'always');
@@ -826,7 +969,9 @@ await step('groups: a new chat lands in the group it was asked for', async () =>
 
 await step('groups: moving a chat updates both sides', async () => {
   const groups = (await req(host.base, 'GET', '/api/groups')).groups;
-  const [first, second] = [groups[0], groups.find((g) => g.name === 'งานที่สอง')];
+  // A new group lands on TOP, so position says nothing — find by identity.
+  const second = groups.find((g) => g.name === 'งานที่สอง');
+  const first = groups.find((g) => g.id !== second.id);
   const chat = (await req(host.base, `GET`, `/api/chats?groupId=${second.id}`)).chats[0];
 
   const moved = await req(host.base, 'POST', `/api/chats/${chat.id}/move`, { groupId: first.id });
@@ -914,7 +1059,9 @@ await step('subagents: the registry lists both children with drill keys', async 
   const r = await req(host.base, 'GET', `/api/chats/${chatId}/subagents`);
   assert.equal(r.status, 200);
   const ids = r.subagents.map((s) => s.itemId).sort();
-  assert.deepEqual(ids, ['sub-1', 'wf-1']);
+  // Includes, not exact: the boot backfill legitimately adds the parent's
+  // historical native child (mock-nat-old) to every fresh registry.
+  assert.ok(ids.includes('sub-1') && ids.includes('wf-1'), `kids missing from [${ids}]`);
   const sub = r.subagents.find((s) => s.itemId === 'sub-1');
   assert.equal(sub.status, 'completed');
   assert.equal(sub.childSessionId, 'mock-child-1');
@@ -942,6 +1089,270 @@ await step('subagents: unknown child and unknown chat fail clean', async () => {
   assert.equal(r.status, 404);
   const c = await req(host.base, 'GET', '/api/chats/nope/subagents');
   assert.equal(c.status, 404);
+});
+
+// Fresh-slice waiter: resume re-emits an inProgress frame for sub-1, but the
+// stream already holds an older inProgress for it from the kids turn —
+// stream.waitFor would match the stale frame and prove nothing.
+async function waitFresh(mark, match, label) {
+  const deadline = Date.now() + 15_000;
+  for (;;) {
+    const hit = stream.events.slice(mark).find(match);
+    if (hit) return hit;
+    if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`);
+    await sleep(50);
+  }
+}
+
+const UUIDV7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+function subagentLog() {
+  const file = path.join(host.stateHome, 'subagents.log');
+  try {
+    return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  } catch {
+    return [];
+  }
+}
+
+let holdDonesBefore = 0;
+
+await step('subagents: kidshold streams a child that stays running', async () => {
+  holdDonesBefore = stream.of('turn_done').length;
+  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'kidshold please' });
+  const open = await stream.waitFor(
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'sub-hold',
+    { label: 'subagent sub-hold' },
+  );
+  assert.equal(open.data.subagent.status, 'inProgress');
+  assert.equal(open.data.subagent.subagentId, 'mock-sub-hold');
+  await stream.waitFor((e) => e.event === 'subagent_delta' && e.data.itemId === 'sub-hold', {
+    label: 'sub-hold delta',
+  });
+});
+
+await step('popout: the drill of a running child carries live state', async () => {
+  // The ⧉ window polls this same endpoint — it must show a live record
+  // while the child runs (the stop step below lands it right after).
+  const d = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/sub-hold`);
+  assert.equal(d.status, 200);
+  assert.equal(d.record.status, 'inProgress');
+  assert.ok((d.items || []).length > 0, 'running drill must still list child items');
+});
+
+await step('subagents: send reaches the running child over the exact wire contract', async () => {
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/sub-hold/command`, {
+    action: 'send',
+    body: ' take the left corridor ',
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.action, 'send');
+  assert.equal(r.subagentId, 'mock-sub-hold');
+  const lines = subagentLog();
+  const last = lines.at(-1);
+  assert.equal(last.method, 'subagent/sendMessage');
+  assert.equal(last.subagentId, 'mock-sub-hold');
+  assert.equal(last.body, 'take the left corridor', 'body must arrive trimmed');
+  assert.match(last.commandId, UUIDV7_RE, 'commandId must be UUIDv7');
+  const chat = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  assert.equal(last.sessionId, chat.chat.mspSessionId, 'verb must target the parent session');
+});
+
+await step('subagents: stop ends the held child and the turn settles', async () => {
+  const mark = stream.events.length;
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/sub-hold/command`, {
+    action: 'stop',
+    reason: 'e2e owns this child',
+  });
+  assert.equal(r.status, 200);
+  const last = subagentLog().at(-1);
+  assert.equal(last.method, 'subagent/stop');
+  assert.equal(last.reason, 'e2e owns this child');
+  assert.match(last.commandId, UUIDV7_RE, 'commandId must be UUIDv7');
+  // The repaint rides the item frame, never the POST reply.
+  const end = await waitFresh(
+    mark,
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'sub-hold' && e.data.subagent?.status === 'cancelled',
+    'sub-hold cancelled',
+  );
+  assert.equal(end.data.subagent.result.summary, 'stopped by owner');
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && stream.of('turn_done').length === holdDonesBefore + 1,
+    { label: 'hold turn_done' },
+  );
+});
+
+await step('subagents: resume re-runs a finished child with a fresh terminal', async () => {
+  const mark = stream.events.length;
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/sub-1/command`, { action: 'resume' });
+  assert.equal(r.status, 200);
+  assert.equal(subagentLog().at(-1).method, 'subagent/resume');
+  await waitFresh(
+    mark,
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'sub-1' && e.data.subagent?.status === 'inProgress',
+    'sub-1 running again',
+  );
+  const end = await waitFresh(
+    mark,
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'sub-1' && e.data.subagent?.result?.summary === 'resumed done',
+    'sub-1 resumed terminal',
+  );
+  assert.equal(end.data.subagent.status, 'completed');
+});
+
+await step('subagents: command guards fail clean (404/400/409)', async () => {
+  const unknownItem = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/nope/command`, { action: 'stop' });
+  assert.equal(unknownItem.status, 404);
+  const unknownChat = await req(host.base, 'POST', '/api/chats/nope/subagents/sub-1/command', { action: 'stop' });
+  assert.equal(unknownChat.status, 404);
+  const badAction = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/sub-1/command`, { action: 'explode' });
+  assert.equal(badAction.status, 400);
+  const missingAction = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/sub-1/command`, {});
+  assert.equal(missingAction.status, 400);
+  const emptyBody = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/sub-1/command`, { action: 'send', body: '   ' });
+  assert.equal(emptyBody.status, 400);
+  // A workflow fold is not an addressable child.
+  const kind = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/wf-1/command`, { action: 'stop' });
+  assert.equal(kind.status, 409);
+  assert.equal(kind.code, 'UNSUPPORTED');
+});
+
+await step('native: spawn+wait tools fold into per-topic rows', async () => {
+  const before = stream.of('turn_done').length;
+  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'nativespawn turn' });
+  // The instant outputs arrive as visibleOutput with zero deltas — the
+  // transcript row must still carry them (the mapping fix).
+  const upd = await stream.waitFor(
+    (e) => e.event === 'tool_call_update' && e.data.tool?.kind === 'subagent_spawn'
+      && (e.data.tool?.output || '').includes('mock-nat-alpha'),
+    { label: 'spawn output on the row' },
+  );
+  assert.match(upd.data.tool.output, /agent_path/);
+  const alpha = await stream.waitFor(
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'native:mock-nat-alpha'
+      && e.data.subagent?.status === 'completed',
+    { label: 'alpha completed' },
+  );
+  assert.equal(alpha.data.subagent.taskName, 'alpha-probe');
+  assert.equal(alpha.data.subagent.objective, 'answer alpha');
+  assert.equal(alpha.data.subagent.result.summary, 'alpha did the thing');
+  const beta = await stream.waitFor(
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'native:mock-nat-beta',
+    { label: 'beta running' },
+  );
+  assert.equal(beta.data.subagent.status, 'inProgress');
+  assert.equal(beta.data.subagent.taskName, 'beta-probe');
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && stream.of('turn_done').length === before + 1,
+    { label: 'nativespawn turn_done' },
+  );
+});
+
+await step('native: drill shows the folded detail, verbs stay off', async () => {
+  const d = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/${encodeURIComponent('native:mock-nat-alpha')}`);
+  assert.equal(d.status, 200);
+  assert.equal(d.mode, 'native');
+  const texts = d.items.map((it) => it.text || it.fallbackText || '').join('\n');
+  assert.match(texts, /alpha-probe/, 'spawn brief names the task');
+  assert.match(texts, /alpha did the thing/, 'wait result lands in the drill');
+  assert.match(texts, /session\.jsonl/, 'evidence refs are listed');
+  const running = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/${encodeURIComponent('native:mock-nat-beta')}`);
+  assert.equal(running.status, 200);
+  assert.ok(running.items.some((it) => it.status === 'inProgress'), 'running child shows a live row');
+  // Native ids are not proven against the SS3.16 verbs — the server refuses
+  // rather than firing an unprobed RPC at a live child.
+  const cmd = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/${encodeURIComponent('native:mock-nat-beta')}/command`, { action: 'stop' });
+  assert.equal(cmd.status, 409);
+  assert.equal(cmd.code, 'UNSUPPORTED');
+});
+
+await step('reminders: system children keep agent identity and drill reads', async () => {
+  const before = stream.of('turn_done').length;
+  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'reminders turn' });
+  await stream.waitFor(
+    (e) => e.event === 'subagent' && e.data.subagent?.itemId === 'rem-1',
+    { label: 'reminder rem-1' },
+  );
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && stream.of('turn_done').length === before + 1,
+    { label: 'reminders turn_done' },
+  );
+  const r = await req(host.base, 'GET', `/api/chats/${chatId}/subagents`);
+  const byId = Object.fromEntries(r.subagents.map((s) => [s.itemId, s]));
+  assert.equal(byId['rem-1'].reminderAgentId, 'memory-reminder');
+  assert.equal(byId['rem-1'].generationId, '3', 'the sanitizer stringifies scalar ids');
+  assert.equal(byId['rem-2'].reminderAgentId, 'skill-reminder');
+  assert.equal(byId['rem-2'].status, 'inProgress');
+  const drill = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/rem-1`);
+  assert.equal(drill.status, 200);
+  assert.ok(drill.items.some((it) => (it.text || '').includes('reminder noted')));
+});
+
+await step('reminders: a landed verdict folds into the row without drilling', async () => {
+  // The live fold (item/completed → one child read) lands the topic on the
+  // row by itself — poll, because it races this assertion by design.
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const r = await req(host.base, 'GET', `/api/chats/${chatId}/subagents`);
+    const rem1 = (r.subagents || []).find((s) => s.itemId === 'rem-1');
+    if (rem1?.result?.summary) {
+      assert.equal(rem1.result.summary, 'remind: memory: capture the Redis choice');
+      break;
+    }
+    assert.ok(Date.now() < deadline, 'live-fold never landed the verdict');
+    await sleep(100);
+  }
+  // The running sibling decided nothing — its row stays bare.
+  const r = await req(host.base, 'GET', `/api/chats/${chatId}/subagents`);
+  assert.equal(r.subagents.find((s) => s.itemId === 'rem-2').result, undefined);
+});
+
+await step('reminders: the drill leads with the verdict card', async () => {
+  const drill = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/rem-1`);
+  assert.equal(drill.status, 200);
+  assert.deepEqual(drill.reminderDecision, { decision: 'remind', reason: 'memory: capture the Redis choice' });
+  assert.match(drill.items[0].text, /^สรุป: remind: memory:/);
+  const dec = drill.items.find((it) => it.tool === 'submit_reminder_decision');
+  assert.ok(dec, 'decision call stays visible as a tool row');
+  assert.equal(dec.args, undefined, 'raw tool args never leave the server');
+});
+
+await step('popout: the live child page serves with its data contract', async () => {
+  const page = await req(host.base, 'GET', '/child.html?chat=x&item=y');
+  assert.equal(page.status, 200);
+  assert.match(page.raw, /data-page="child-live"/);
+  assert.match(page.raw, /child\.js\?v=/, 'page pins its script like the main bundle');
+});
+
+await step('drill: a pruned child session falls back to record detail', async () => {
+  const d = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/rem-3`);
+  assert.equal(d.status, 200, 'gone sessions drill into detail, never a 502 page');
+  assert.equal(d.mode, 'gone');
+  assert.match(d.readError || '', /was not found/);
+  const text = d.items.map((it) => it.text || '').join('\n');
+  assert.match(text, /todo-reminder/, 'agent identity survives');
+  assert.match(text, /generation: 2/);
+  assert.match(text, /cancelled/);
+});
+
+await step('subagents: the registry mirrors to disk without the live buffer', async () => {
+  const file = path.join(host.stateHome, 'muse-desktop', 'chats.json');
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      const chats = JSON.parse(fs.readFileSync(file, 'utf8')).chats || [];
+      const mine = chats.find((c) => c.id === chatId);
+      const ids = (mine?.subagents || []).map((s) => s.itemId);
+      if (ids.includes('sub-1') && ids.includes('sub-hold') && ids.includes('wf-1')) {
+        assert.ok(!(mine.subagents.some((s) => 'liveText' in s)), 'liveText must never touch disk');
+        const sub = mine.subagents.find((s) => s.itemId === 'sub-1');
+        assert.equal(sub.subagentId, 'mock-sub-1');
+        assert.equal(sub.result.summary, 'resumed done');
+        return;
+      }
+    } catch { /* not flushed yet */ }
+    if (Date.now() > deadline) throw new Error('timed out waiting for the registry mirror on disk');
+    await sleep(100);
+  }
 });
 
 await step('mcp: the catalog lists fixture servers as unknown, with no secrets', async () => {
@@ -1053,7 +1464,7 @@ await step('goal: a goal turn broadcasts the block and the endpoint serves it', 
   });
   assert.equal(ev.data.chatId, chatId);
   assert.equal(ev.data.goal.percentComplete, 45);
-  assert.equal(ev.data.goal.status, 'running');
+  assert.equal(ev.data.goal.status, 'active');
   await stream.waitFor((e) => e.event === 'turn_done' && stream.of('turn_done').length === before + 1, {
     label: 'goal turn_done',
   });
@@ -1076,6 +1487,51 @@ await step('goal: an explicit null clears, and unknown chats 404', async () => {
   assert.equal(c.status, 404);
 });
 
+await step('goal: pause/resume round-trips, repaints ride the event', async () => {
+  const before = stream.of('turn_done').length;
+  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'set a goal now' });
+  await stream.waitFor((e) => e.event === 'goal' && e.data.goal?.status === 'active', { label: 'goal active' });
+  await stream.waitFor((e) => e.event === 'turn_done' && stream.of('turn_done').length === before + 1, {
+    label: 'goal turn_done',
+  });
+  const p = await req(host.base, 'POST', `/api/chats/${chatId}/goal`, { action: 'pause' });
+  assert.equal(p.status, 200);
+  assert.equal(p.action, 'pause');
+  const paused = await stream.waitFor((e) => e.event === 'goal' && e.data.goal?.status === 'paused', {
+    label: 'goal paused event',
+  });
+  assert.equal(paused.data.goal.objective, 'Ship the tasks panel');
+  const g = await req(host.base, 'GET', `/api/chats/${chatId}/goal`);
+  assert.equal(g.goal.status, 'paused');
+  const rs = await req(host.base, 'POST', `/api/chats/${chatId}/goal`, { action: 'resume' });
+  assert.equal(rs.status, 200);
+  await stream.waitFor((e) => e.event === 'goal' && e.data.goal?.status === 'active', {
+    label: 'goal resumed event',
+  });
+  const bad = await req(host.base, 'POST', `/api/chats/${chatId}/goal`, { action: 'explode' });
+  assert.equal(bad.status, 400);
+  const nope = await req(host.base, 'POST', '/api/chats/nope/goal', { action: 'pause' });
+  assert.equal(nope.status, 404);
+});
+
+await step('plan: wire-true todos normalize onto the snake vocabulary', async () => {
+  const before = stream.of('turn_done').length;
+  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'show me the plan' });
+  const ev = await stream.waitFor((e) => e.event === 'plan' && e.data.entries?.length === 3, {
+    label: 'plan',
+  });
+  assert.equal(ev.data.chatId, chatId);
+  assert.deepEqual(
+    ev.data.entries.map((e) => e.status),
+    ['pending', 'in_progress', 'completed'],
+  );
+  assert.equal(ev.data.entries[1].content, 'Wire the mock provider');
+  assert.equal(ev.data.entries[1].activeForm, 'Wiring the mock provider');
+  await stream.waitFor((e) => e.event === 'turn_done' && stream.of('turn_done').length === before + 1, {
+    label: 'plan turn_done',
+  });
+});
+
 await step('mcp: an MCP tool call marks the server used', async () => {
   const before = stream.of('turn_done').length;
   await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'run mcptool now' });
@@ -1086,6 +1542,40 @@ await step('mcp: an MCP tool call marks the server used', async () => {
   const github = r.servers.find((s) => s.name === 'github');
   assert.ok(github.lastUsedAt && github.lastUsedAt > 0, 'github usage not learned');
 });
+
+await step('tool rows carry topic titles, not raw commands (1.1.19)', async () => {
+  const tc = await req(host.base, 'POST', '/api/chats', { title: 'topictitles', cwd: os.tmpdir() });
+  assert.equal(tc.status, 201);
+  const topicChatId = tc.chat.id;
+  const t = await req(host.base, 'POST', `/api/chats/${topicChatId}/prompt`, { text: 'check topic titles please' });
+  assert.equal(t.status, 202);
+  const first = await stream.waitFor(
+    (e) => e.event === 'tool_call' && e.data.chatId === topicChatId && e.data.tool?.id === 'tc-topic-1',
+    { label: 'topic tool_call 1' },
+  );
+  assert.equal(first.data.tool.title, 'ตรวจไฟล์ชั่วคราว');
+  assert.ok(
+    !first.data.tool.title.includes('ls /tmp/mock'),
+    'the raw command leaked into the streamed title',
+  );
+  const second = await stream.waitFor(
+    (e) => e.event === 'tool_call' && e.data.chatId === topicChatId && e.data.tool?.id === 'tc-topic-2',
+    { label: 'topic tool_call 2' },
+  );
+  assert.equal(second.data.tool.title, 'Read auth.js');
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.chatId === topicChatId,
+    { label: 'topic turn_done' },
+  );
+  // The persisted transcript keeps the same topic titles.
+  const r = await req(host.base, 'GET', `/api/chats/${topicChatId}`);
+  const last = r.chat.messages.at(-1);
+  assert.deepEqual(
+    (last.meta?.toolCalls || []).map((t) => t.title),
+    ['ตรวจไฟล์ชั่วคราว', 'Read auth.js'],
+  );
+});
+
 
 stream.close();
 await req(host.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
@@ -1129,7 +1619,10 @@ await step('a spawn failure surfaces as agent_error over SSE (BUG-023)', async (
   // Do not await the prompt's HTTP response: the handshake with the dead
   // binary hangs until its own timeout — the agent_error frame (which a
   // second window / post-reload view relies on) is the contract under test.
-  void req(badBin.base, 'POST', `/api/chats/${created.chat.id}/prompt`, { text: 'hi' });
+  // Caught, not void: the teardown below kills the socket mid-flight, and
+  // any step running afterwards (the restart persistence step does) gives
+  // the rejection time to surface as an uncaught crash.
+  void req(badBin.base, 'POST', `/api/chats/${created.chat.id}/prompt`, { text: 'hi' }).catch(() => {});
   const ev = await badStream.waitFor((e) => e.event === 'agent_error', { label: 'agent_error' });
   assert.ok(ev.data.message, 'agent_error must carry a message');
   assert.equal(ev.data.chatId, created.chat.id, 'agent_error must be chat-scoped');
@@ -1139,6 +1632,74 @@ badStream.close();
 await req(badBin.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
 await sleep(300);
 try { badBin.proc.kill('SIGKILL'); } catch { /* already gone */ }
+
+// -------------------------------------------------- restart persistence
+// The main host's registry must survive a process exit: list + drill work
+// on the rebooted host with no prompt, and commands warm the agent cleanly.
+
+await step('subagents: the registry survives a host restart with no prompt', async () => {
+  const promptsFile = path.join(host.stateHome, 'prompts.log');
+  const promptsBefore = fs.readFileSync(promptsFile, 'utf8').trim().split('\n').filter(Boolean).length;
+  const subsBefore = subagentLog().length;
+  stream.close();
+  await req(host.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
+  await sleep(300);
+  try { host.proc.kill('SIGKILL'); } catch { /* already gone */ }
+
+  const host2 = await startHost({ stateHome: host.stateHome, configHome: host.configHome });
+  try {
+    // No prompt was sent on this host — the rows come from disk alone.
+    const r = await req(host2.base, 'GET', `/api/chats/${chatId}/subagents`);
+    assert.equal(r.status, 200);
+    const ids = r.subagents.map((s) => s.itemId).sort();
+    assert.deepEqual(ids, [
+      'native:mock-nat-alpha',
+      'native:mock-nat-beta',
+      'native:mock-nat-old',
+      'rem-1',
+      'rem-2',
+      'rem-3',
+      'sub-1',
+      'sub-hold',
+      'wf-1',
+    ]);
+    assert.equal(r.subagents.find((s) => s.itemId === 'sub-1').result.summary, 'resumed done');
+    // Drill-down warms the agent (resume, not a prompt) and reads through.
+    const drill = await req(host2.base, 'GET', `/api/chats/${chatId}/subagents/sub-1`);
+    assert.equal(drill.status, 200);
+    assert.ok(drill.items.some((it) => it.itemId === 'c-msg-1'));
+    // And a command on the cold chat warms + round-trips as well.
+    const cmd = await req(host2.base, 'POST', `/api/chats/${chatId}/subagents/sub-1/command`, { action: 'stop' });
+    assert.equal(cmd.status, 200);
+    const promptsAfter = fs.readFileSync(promptsFile, 'utf8').trim().split('\n').filter(Boolean).length;
+    assert.equal(promptsAfter, promptsBefore, 'restart probes must never send a prompt');
+    const subsAfter = subagentLog();
+    assert.equal(subsAfter.length, subsBefore + 1, 'the post-restart stop must reach the agent');
+    assert.equal(subsAfter.at(-1).method, 'subagent/stop');
+    // Backfill proof: a chat that never spawned anything still recovers its
+    // historical native child from the parent history on first boot — the
+    // turns the live tracker never saw come back as rows.
+    const c2 = await req(host2.base, 'POST', '/api/chats', { title: 'backfill', cwd: os.tmpdir() });
+    assert.equal(c2.status, 201);
+    await req(host2.base, 'POST', `/api/chats/${c2.chat.id}/prompt`, { text: 'hi' });
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const l = await req(host2.base, 'GET', `/api/chats/${c2.chat.id}/subagents`);
+      const row = (l.subagents || []).find((s) => s.itemId === 'native:mock-nat-old');
+      if (row) {
+        assert.equal(row.taskName, 'old-probe');
+        assert.equal(row.result.summary, 'old did it');
+        break;
+      }
+      if (Date.now() > deadline) throw new Error('boot backfill never recovered the historical child');
+      await sleep(100);
+    }
+  } finally {
+    await req(host2.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
+    await sleep(300);
+    try { host2.proc.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+});
 
 const failed = results.filter(([ok]) => !ok).length;
 console.log(`e2e: ${results.length - failed}/${results.length} passed`);

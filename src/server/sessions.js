@@ -19,13 +19,16 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { MspClient, formatRpcError, isAuthRequiredError, isClientAlive, isHistoryIncompatibleError, sanitizeSubscriptionUsage, terminalAuthCommand } from './msp-client.js';
+import { MspClient, formatRpcError, isAuthRequiredError, isClientAlive, isHistoryIncompatibleError, isMcpAuditFailedError, sanitizeSubscriptionUsage, terminalAuthCommand, uuidv7 } from './msp-client.js';
 import { ConfigCatalog } from './config-catalog.js';
-import { formatDiffPreview } from './hosts.js';
+import { classifyPendingUserInputs, formatDiffPreview } from './hosts.js';
 import { normalizeSessionMode } from './session-mode.js';
 import { SearchIndex, turnForMessageIndex } from './search-index.js';
 import { stateDir } from './session-store.js';
+import { cutEllipsis } from './text.js';
 import { normalizeAttachmentInput, resolveAttachments } from './attachments.js';
+import { applyApPrefixToTitle } from './ap-title.js';
+import { usageCacheFile, writeUsageCache } from './usage-cache.js';
 
 const DEFAULT_MAX_HOT = Number(process.env.MUSE_DESKTOP_MAX_HOT_AGENTS || 6);
 const DEFAULT_IDLE_DEMOTE_MS = Number(process.env.MUSE_DESKTOP_IDLE_DEMOTE_MS || 30 * 60 * 1000);
@@ -34,13 +37,47 @@ const NO_ACTIVITY_MS = Number(process.env.MUSE_DESKTOP_NO_ACTIVITY_MS || 180_000
 /** Streaming stalled this long ⇒ settle rather than spin forever. */
 const STALL_MS = Number(process.env.MUSE_DESKTOP_STALL_MS || 900_000);
 /**
- * Backstop while a *live* agent still holds the turn open: silence is
- * tolerated up to this long, then the turn is settled anyway. Above the
- * CLI's own inference idle backstop, like grok-desktop's 65 min hard cap.
+ * Opt-in ceiling while a *live* agent still holds the turn open. Default is
+ * 0 = hold forever, like `muse` CLI (the user stops a wedged turn with the
+ * stop button, exactly like Ctrl-C): chat 74f04882 ran 3h09m with 22 tools
+ * done and the agent silent, and the old 65 min default cut it — the user
+ * wanted it alive. Set MUSE_DESKTOP_WATCHDOG_HARD_MS to a finite value
+ * >= 60000 to restore an auto-settle ceiling. Resolved per tick (not a
+ * frozen const) so tests can pin clocks without re-importing the module.
  */
-const WATCHDOG_HARD_MS = Number(process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS || 65 * 60 * 1000);
+export function resolveWatchdogHardMs() {
+  const raw = process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+  if (raw == null || String(raw).trim() === '' || raw === '0' || raw === 'false') return 0;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n >= 60_000) return Math.floor(n);
+  return 0;
+}
 /** Watchdog tick interval — env-overridable so tests can use short clocks. */
 const WATCHDOG_TICK_MS = Number(process.env.MUSE_DESKTOP_WATCHDOG_TICK_MS || 15_000);
+/**
+ * Silence past this on a lively turn triggers a point-in-time
+ * `approval/listPending` read (BUG-084): a live userInput/request(ed) frame
+ * can go missing and the agent then waits forever on a question nobody was
+ * shown. Resolved per call so tests can pin short clocks.
+ */
+export function resolvePendingPollMs() {
+  const raw = process.env.MUSE_DESKTOP_PENDING_POLL_MS;
+  if (raw == null || String(raw).trim() === '') return 45_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 45_000;
+}
+/**
+ * How long an auto-cancelled prompt may stay pending before the watchdog
+ * concludes the agent ignored the cancel and interrupts the run (BUG-084).
+ * Net effect with defaults: one missed frame + one ignored cancel ⇒ loud
+ * recovery in ~75s, never a silent multi-hour wedge.
+ */
+export function resolveCancelGraceMs() {
+  const raw = process.env.MUSE_DESKTOP_CANCEL_GRACE_MS;
+  if (raw == null || String(raw).trim() === '') return 30_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 30_000;
+}
 /**
  * Delta batching (grok-desktop: 16ms / 768 chars; we run 8ms). The agent
  * streams one RPC frame per token; forwarding each as its own SSE frame
@@ -56,6 +93,11 @@ const RECOVERY_MAX_CHARS = 4_000;
  * and config-change path share the one wording). */
 const HISTORY_INCOMPATIBLE_NOTICE =
   'ประวัติเดิมของ agent ใช้ต่อไม่ได้ — เปิดเซสชันใหม่แล้วลองส่งต่ออีกครั้ง';
+/** Transcript notice for an MCP-audit rotation (BUG-082). Unlike the
+ * history case the session itself is kept — only the serve host is
+ * poisoned, so the retry resumes the same session on a fresh agent. */
+const MCP_AUDIT_FAILED_NOTICE =
+  'agent สตาร์ท MCP ไม่ผ่าน (MCP startup audit failed) — เปิด agent ใหม่แล้วลองส่งต่ออีกครั้ง เซสชันเดิมยังอยู่ครบ';
 
 export function extractText(content) {
   if (content == null) return '';
@@ -98,7 +140,7 @@ export function previewOf(chat, max = 90) {
     .replace(/```[\s\S]*?```/g, ' ⌗ ')
     .replace(/\s+/g, ' ')
     .trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+  return cutEllipsis(flat, max);
 }
 
 /** `mcp__<server>.<tool>` → `<server>`; null for built-in tools. */
@@ -111,6 +153,153 @@ export function mcpServerOfToolKind(kind) {
 const DRILL_TEXT_MAX = 2_000;
 /** Cap live-streamed child text kept per subagent record. */
 const SUBAGENT_LIVE_MAX = 4_000;
+
+/**
+ * Rail actions onto the MSP verbs (SS3.16). Deliberately the small honest
+ * set: interrupt/close/reopen/followupTask stay unwired until their exact
+ * semantics are probed against the real binary — two buttons whose
+ * difference nobody can explain is worse than one.
+ */
+export const SUBAGENT_COMMANDS = {
+  stop: 'subagent/stop',
+  resume: 'subagent/resume',
+  send: 'subagent/sendMessage',
+};
+
+/**
+ * Model-side native subagent tools — the CLI's parallel children. Unlike
+ * SS4.5.7 `subagent` items, these surface as plain toolCalls: spawn args
+ * carry the topic (task_name/objective/role), spawn/wait outputs (which
+ * arrive as `visibleOutput`, never deltas) carry the durable id + result.
+ * Shapes probed against the real binary, 2026-10-02.
+ */
+const NATIVE_SUBAGENT_TOOLS = new Set([
+  'subagent_spawn',
+  'subagent_wait',
+  'subagent_send_message',
+  'subagent_read_result',
+  'subagent_cancel',
+  'subagent_status',
+]);
+
+function tryJson(text) {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === 'object' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fold one native-subagent tool row into a registry-record patch. Pure —
+ * the tracker applies the patch, the unit suite covers the matrix.
+ * Returns null for other tools, mid-flight rows without identity, and
+ * verbs with nothing to fold (send/status are fire-and-forget reads).
+ */
+export function nativeSubagentPatch({ toolCallId, kind, rawInput, output, status }) {
+  if (!NATIVE_SUBAGENT_TOOLS.has(String(kind || ''))) return null;
+  const args = tryJson(rawInput);
+  const out = tryJson(output);
+  const id = (out && typeof out.subagent_id === 'string' && out.subagent_id)
+    || (args && typeof args.subagent_id === 'string' && args.subagent_id)
+    || null;
+  const st = String(status || '');
+  const fail = (rec) => {
+    if (st !== 'failed' && st !== 'cancelled') return null;
+    return { key: id ? `native:${id}` : `native:tool:${toolCallId}`, rec };
+  };
+  switch (String(kind)) {
+    case 'subagent_spawn': {
+      if (st === 'failed') {
+        return fail({
+          status: 'failed',
+          subagentId: id,
+          role: args?.role ?? null,
+          objective: args?.objective ?? null,
+          taskName: args?.task_name ?? null,
+        });
+      }
+      if (st !== 'completed') return null;
+      if (out && out.status && out.status !== 'accepted') {
+        return {
+          key: id ? `native:${id}` : `native:tool:${toolCallId}`,
+          rec: { status: 'failed', subagentId: id, failureReason: String(out.status).slice(0, 200) },
+        };
+      }
+      return {
+        key: id ? `native:${id}` : `native:tool:${toolCallId}`,
+        rec: {
+          status: 'inProgress',
+          subagentId: id,
+          agentPath: typeof out?.agent_path === 'string' ? out.agent_path : null,
+          role: args?.role ?? null,
+          objective: args?.objective ?? null,
+          taskName: args?.task_name ?? null,
+          taskRef: typeof out?.task_ref === 'string' ? out.task_ref : null,
+        },
+      };
+    }
+    case 'subagent_wait': {
+      if (!id) return null;
+      if (st === 'failed') return fail({ status: 'failed', subagentId: id });
+      if (st === 'completed' && out) {
+        if (out.status === 'ready') {
+          return {
+            key: `native:${id}`,
+            rec: {
+              status: 'completed',
+              subagentId: id,
+              result: {
+                summary: typeof out.summary === 'string' ? out.summary.slice(0, 2000) : null,
+                evidenceRefs: Array.isArray(out.evidence_refs)
+                  ? out.evidence_refs.filter((e) => typeof e === 'string').slice(0, 10)
+                  : [],
+              },
+            },
+          };
+        }
+        // A timed-out wait gave up waiting — the child itself is alive.
+        if (out.status === 'timeout') return { key: `native:${id}`, rec: { status: 'inProgress', subagentId: id } };
+        if (out.error || out.errorKind || out.status === 'error') {
+          return {
+            key: `native:${id}`,
+            rec: {
+              status: 'failed',
+              subagentId: id,
+              failureReason: String(out.error || out.errorKind || out.status).slice(0, 500),
+            },
+          };
+        }
+      }
+      // Started, or a completed row with no parseable output: the child the
+      // wait names is (still) running. Skeletons cover a missed spawn.
+      return { key: `native:${id}`, rec: { status: 'inProgress', subagentId: id } };
+    }
+    case 'subagent_cancel': {
+      if (!id || st !== 'completed') return null;
+      return { key: `native:${id}`, rec: { status: 'cancelled', subagentId: id } };
+    }
+    case 'subagent_read_result': {
+      if (!id || st !== 'completed') return null;
+      const text = typeof out?.text === 'string' ? out.text
+        : typeof output === 'string' && output ? output : '';
+      return {
+        key: `native:${id}`,
+        rec: {
+          subagentId: id,
+          result: {
+            summary: typeof out?.summary === 'string' ? out.summary.slice(0, 2000) : null,
+            text: text.slice(0, 4000) || null,
+          },
+        },
+      };
+    }
+    default:
+      return null;
+  }
+}
 
 /**
  * Small projection of one child-session item for the drill-down view. Keeps
@@ -159,6 +348,37 @@ export function sanitizeDrillItem(item) {
   return out;
 }
 
+/**
+ * A reminder child does exactly one thing: call `submit_reminder_decision`
+ * once with `{decision, reason}`. The parent wire never carries it — the
+ * only copy lives in the child's own session — so the drill/live-fold reads
+ * the raw child items (pre-sanitize: the args never leave the server) and
+ * the registry keeps it as the row's topic line. Pure — the unit suite
+ * covers the matrix. Returns null when the child has not decided yet.
+ */
+export function extractReminderDecision(rawItems) {
+  if (!Array.isArray(rawItems)) return null;
+  for (const it of rawItems) {
+    if (!it || it.kind !== 'toolCall' || it.tool !== 'submit_reminder_decision') continue;
+    const args = tryJson(it.args ?? it.rawInput);
+    if (!args || typeof args !== 'object') continue;
+    const decision = args.decision != null ? String(args.decision).slice(0, 80) : null;
+    const reason = args.reason != null ? String(args.reason).slice(0, 500) : null;
+    if (!decision && !reason) continue;
+    return { decision, reason };
+  }
+  return null;
+}
+
+/** One line the rail shows for a reminder that already decided. */
+export function reminderDecisionLine(dec) {
+  if (!dec || typeof dec !== 'object') return null;
+  const d = dec.decision ? String(dec.decision) : null;
+  const r = dec.reason ? String(dec.reason) : null;
+  if (d && r) return `${d}: ${r}`;
+  return d || r || null;
+}
+
 /** The client wraps the discriminator in `params.update.sessionUpdate`; be tolerant. */
 export function readUpdate(params) {
   const update = params?.update && typeof params.update === 'object' ? params.update : params || {};
@@ -167,7 +387,7 @@ export function readUpdate(params) {
 }
 
 export class SessionManager extends EventEmitter {
-  constructor({ store, wire, defaults = {}, catalog = null }) {
+  constructor({ store, wire, defaults = {}, catalog = null, searchDbPath = null }) {
     super();
     this.store = store;
     this.wire = wire;
@@ -213,7 +433,11 @@ export class SessionManager extends EventEmitter {
     // Cross-chat full-text search (SQLite FTS5 trigram, grok-desktop parity).
     // Loud by design: the constructor throws when the binding is missing and
     // self-heals a corrupt db — FTS is never silently disabled.
-    this.searchIndex = new SearchIndex();
+    // searchDbPath is the test seam: suites MUST pass a temp path, otherwise
+    // the boot rebuild below wipes the developer's real index and re-sources
+    // it from the suite's fixture store (2026-09-30: npm test rebuilt the
+    // live 85-session index down to 15 fixture sessions).
+    this.searchIndex = new SearchIndex({ dbPath: searchDbPath || undefined });
     this.store.onWrite = (type, payload) => this._onStoreWrite(type, payload);
     // Rebuild from restored chats + groups (next tick — boot stays snappy).
     setImmediate(() => {
@@ -238,7 +462,13 @@ export class SessionManager extends EventEmitter {
   // ---------------------------------------------------------------- chats
 
   listChats() {
-    return this.store.list().map((c) => this.chatSummary(c));
+    // Queue order: most recent conversation activity first. Only a real
+    // message moves a chat — a prompt sent, a run settled — while opening a
+    // session to look at it never reorders (the sidebar keeps this order
+    // within each group block).
+    return [...this.store.list()]
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
+      .map((c) => this.chatSummary(c));
   }
 
   chatSummary(chat) {
@@ -259,6 +489,10 @@ export class SessionManager extends EventEmitter {
       status: slot?.client?.status || 'cold',
       running: !!slot?.turn && !slot.turn.settled,
       turnId: slot?.turn && !slot.turn.settled ? slot.turn.turnId : null,
+      // Agent-side session id for the rail's identity rows (usable with
+      // `muse export`/`trace`/`resume`). Live client first — the stored
+      // copy lags during rotation — stored copy once the agent is cold.
+      mspSessionId: slot?.client?.sessionId ?? chat.mspSessionId ?? null,
       pendingInteractions: [...this.pendingInteractions.values()]
         .filter((p) => p.chatId === chat.id)
         .map((p) => p.payload),
@@ -612,8 +846,15 @@ export class SessionManager extends EventEmitter {
     if (slot?.starting) return slot.starting;
 
     if (!slot) {
-      slot = { client: null, turn: null, lastUsed: Date.now(), starting: null, subagents: new Map() };
+      // cancelledPrompts: userInputId → cancel-timestamp ms, for the BUG-084
+      // recovery poll (a cancel the agent still holds past grace escalates).
+      slot = { client: null, turn: null, lastUsed: Date.now(), starting: null, subagents: new Map(), cancelledPrompts: new Map() };
       this.slots.set(chatId, slot);
+      // A restart wipes slots but not the store — reseed the registry so the
+      // rail and drill-downs work without waiting for the next turn.
+      for (const rec of chat.subagents || []) {
+        if (rec?.itemId && !slot.subagents.has(rec.itemId)) slot.subagents.set(rec.itemId, { ...rec });
+      }
     }
     if (!slot.subagents) slot.subagents = new Map();
 
@@ -633,6 +874,7 @@ export class SessionManager extends EventEmitter {
       try {
         await client.start({ resumeSessionId: chat.mspSessionId });
       } catch (err) {
+        console.warn(`[sessions ${new Date().toISOString()}] agent boot failed for ${String(chatId).slice(0, 8)}…: ${err?.message || err}`);
         slot.client = null;
         try {
           await client.shutdown();
@@ -654,6 +896,15 @@ export class SessionManager extends EventEmitter {
         modeId: client.currentModeId,
         agent: client.agentInfo,
       });
+      // New hot agent: refresh the account snapshot right away so the
+      // on-disk usage cache (read by Übersicht) is fresh from the first
+      // run — not whenever the next usage/changed happens to arrive.
+      // Fire-and-forget: usage/read needs no model call but must never
+      // delay the prompt that just booted this agent.
+      this.getUsage().catch(() => {});
+      // Same deal for pre-tracker children: rebuild native rows from the
+      // parent history without blocking the turn that booted this agent.
+      this._backfillNativeSubagents(chatId, slot, client).catch(() => {});
       return client;
     })();
 
@@ -669,7 +920,21 @@ export class SessionManager extends EventEmitter {
     const wire = this.wire;
 
     client.on('status', (s) => wire.emit(chatId, 'agent_status', s));
-    client.on('stderr', (text) => wire.emit(chatId, 'agent_stderr', { text: String(text).slice(0, 4000) }));
+    client.on('stderr', (text) => {
+      // Dropped completions + subscribe failures travel here — they diagnosed
+      // chat 81442763, so they belong in host.log too, not just the SSE wire.
+      const firstLine = String(text).split('\n')[0].slice(0, 300);
+      console.warn(`[sessions ${new Date().toISOString()}] agent_stderr ${String(chatId).slice(0, 8)}… ${firstLine}`);
+      wire.emit(chatId, 'agent_stderr', { text: String(text).slice(0, 4000) });
+    });
+
+    // 'diag' is stderr's quiet sibling: host.log only, never the SSE wire —
+    // one line per interactive frame / answer / cancel would spam the UI's
+    // transient notices, but the log needs them (BUG-084 was invisible).
+    client.on('diag', (text) => {
+      const firstLine = String(text).split('\n')[0].slice(0, 300);
+      console.log(`[sessions ${new Date().toISOString()}] agent_diag ${String(chatId).slice(0, 8)}… ${firstLine}`);
+    });
 
     client.on('handshake', (h) => wire.emit(chatId, 'agent_handshake', h));
 
@@ -846,6 +1111,13 @@ export class SessionManager extends EventEmitter {
     if (!body && resolved.meta.length && (!chat.title || chat.title === 'New chat')) {
       this.store.update(chatId, { title: `ไฟล์แนบ ${resolved.meta.length} รายการ` });
     }
+    // A prompt that mentions APxxxx tags the session title with [APxxxx]
+    // (grok-desktop sessions.js:2989) — the sidebar and right bar read the
+    // same tags to show which SCB project this session is about.
+    if (body && !opts.skipUserMessage) {
+      const apTitle = applyApPrefixToTitle(this.store.get(chatId)?.title || 'New chat', body);
+      if (apTitle.changed) this.store.update(chatId, { title: apTitle.title });
+    }
     const wireText = this._buildRecoveryWireText(chatId, body, userMsg?.id);
 
     live.turn = {
@@ -920,6 +1192,35 @@ export class SessionManager extends EventEmitter {
             // the retry sees the same turn (normalized {path} shape re-validates).
             await this.prompt(chatId, body, {
               _historyRetried: true,
+              skipUserMessage: true,
+              attachments: userMsg?.meta?.attachments || rawAtts,
+            });
+          } catch (retryErr) {
+            // The retry surfaces its own turn events; only an early throw
+            // (e.g. the fresh agent refused to start) needs a signal here.
+            this.wire.emit(chatId, 'agent_error', { message: formatRpcError(retryErr) });
+          }
+          return;
+        }
+        // The serve host poisoned its own MCP runtime (BUG-082): it stays
+        // alive but every turn on it dies with `MCP startup audit failed`.
+        // Retrying on the same host would fail forever, so rotate to a
+        // fresh agent and retry exactly once — same shape as the
+        // history-incompatible branch above, except the session is KEPT
+        // (the audit failure is host-local; the session log is intact, so
+        // no recovery recap is prepended).
+        if (isMcpAuditFailedError(err) && !opts._mcpAuditRetried) {
+          this.settleTurn(chatId, turnId, { reason: 'rotated' });
+          this.store.addMessage(chatId, {
+            role: 'notice',
+            text: MCP_AUDIT_FAILED_NOTICE,
+          });
+          await this.releaseClient(chatId, 'mcp-audit-failed');
+          try {
+            // Same turn, fresh host: attachments re-send so the retry sees
+            // the identical input (mirrors the history branch above).
+            await this.prompt(chatId, body, {
+              _mcpAuditRetried: true,
               skipUserMessage: true,
               attachments: userMsg?.meta?.attachments || rawAtts,
             });
@@ -1011,6 +1312,20 @@ export class SessionManager extends EventEmitter {
           text: `เทิร์นจบแบบไม่สำเร็จ: ${error}`,
           meta: { turnId, reason },
         });
+      } else if (!turn.toolCalls.size && reason !== 'rotated') {
+        // Never blank a turn, period: no text + no tools + no error used to
+        // persist NOTHING — the spinner just died and the user could not tell
+        // "ran and said nothing" from "never ran" (chat bcb3975b collected
+        // two orphan user messages this way and the user re-sent). 'rotated'
+        // is exempt: its own recovery notice already narrates the handoff.
+        this.store.addMessage(chatId, {
+          role: 'notice',
+          text:
+            reason === 'cancelled'
+              ? 'ยกเลิกเทิร์นแล้ว (ไม่มีข้อความตอบกลับ)'
+              : 'agent จบเทิร์นโดยไม่มีข้อความตอบกลับ — ลอง prompt ใหม่อีกครั้ง',
+          meta: { turnId, reason },
+        });
       }
     }
     this.store.trimMessages(chatId);
@@ -1068,6 +1383,111 @@ export class SessionManager extends EventEmitter {
     return false;
   }
 
+  /** One line per minute per held turn — a held turn with zero log reads as
+   *  a dead watchdog (grok-desktop _tickStickyRunning logs the same way). */
+  _logStickyHold(chatId, turn, now, why) {
+    if (now - (turn._holdLogAt || 0) < 60_000) return;
+    turn._holdLogAt = now;
+    const silentFor = now - (turn.sawActivity ? turn.lastActivity : turn.startedAt);
+    console.log(
+      `[sessions ${new Date(now).toISOString()}] sticky-hold ${String(chatId).slice(0, 8)}… silenceMs=${silentFor} lively=true why=${why}`,
+    );
+  }
+
+  /**
+   * Re-read pending approvals + userInput prompts point-in-time and act on
+   * what the live frames never delivered (BUG-084): mount cards the UI can
+   * answer, auto-cancel the shapes it cannot, and escalate cancels the agent
+   * ignored past grace. Single-flight per chat via slot._pollInFlight; the
+   * turn is re-validated after every await. Never settles directly — the
+   * only settle path is _escalateIgnoredPrompt, which still funnels through
+   * settleTurn.
+   */
+  async _pollPendingPrompts(chatId, turnId) {
+    const slot = this.slots.get(chatId);
+    const turn = slot?.turn;
+    if (!turn || turn.turnId !== turnId || turn.settled) return;
+    const client = slot?.client;
+    if (!client || !isClientAlive(client)) return;
+    let snap;
+    try {
+      snap = await client.listPending();
+      slot._pollFailed = false;
+    } catch (err) {
+      // Throttled: a failing poll must not spam one line per tick.
+      if (!slot._pollFailed) {
+        slot._pollFailed = true;
+        console.warn(`[sessions ${new Date().toISOString()}] pending-poll ${String(chatId).slice(0, 8)}… failed: ${err?.message || err}`);
+      }
+      return;
+    }
+    // Re-validate after the await — the turn may have settled mid-poll.
+    const turnNow = this.slots.get(chatId)?.turn;
+    if (!turnNow || turnNow.turnId !== turnId || turnNow.settled) return;
+    const now = Date.now();
+    if (!slot.cancelledPrompts) slot.cancelledPrompts = new Map();
+
+    // Approvals first: a missed approval frame wedges the same way a missed
+    // question does — the run waits, the user sees nothing.
+    for (const a of snap.approvals) {
+      const id = String(a?.approvalId || '').trim();
+      if (!id || client.hasInteractiveWaiter(id)) continue;
+      console.log(`[sessions ${new Date().toISOString()}] pending-poll ${String(chatId).slice(0, 8)}… mount approval ${id}`);
+      try { client.recoverApproval(a); } catch { /* a bad frame must not kill the poll */ }
+    }
+
+    // Drop cancels whose prompts are gone — settled answers must not linger.
+    const liveIds = new Set(snap.userInputs.map((p) => String(p?.userInputId || '')));
+    for (const id of [...slot.cancelledPrompts.keys()]) {
+      if (!liveIds.has(id)) slot.cancelledPrompts.delete(id);
+    }
+
+    const { mount, cancel, escalate } = classifyPendingUserInputs({
+      pending: snap.userInputs,
+      knownIds: client.interactiveWaiterIds(),
+      cancelledAt: slot.cancelledPrompts,
+      now,
+      graceMs: resolveCancelGraceMs(),
+    });
+    for (const p of mount) {
+      console.log(`[sessions ${new Date().toISOString()}] pending-poll ${String(chatId).slice(0, 8)}… mount question ${p.userInputId}`);
+      try { client.recoverUserInput(p, 'poll'); } catch { /* keep polling the rest */ }
+    }
+    for (const p of cancel) {
+      let action = null;
+      try { action = client.recoverUserInput(p, 'poll'); } catch { /* recorded below anyway */ }
+      // A failed cancel re-escalates on evidence (still pending past grace),
+      // never on a local guess — so record every attempt, not just acks.
+      if (action !== 'duplicate') slot.cancelledPrompts.set(String(p.userInputId), now);
+      console.log(`[sessions ${new Date().toISOString()}] pending-poll ${String(chatId).slice(0, 8)}… auto-cancel ${p.userInputId} (${action || 'failed'})`);
+    }
+    if (escalate.length) {
+      await this._escalateIgnoredPrompt(chatId, turnId, escalate[0]);
+    }
+  }
+
+  /**
+   * Last resort for a prompt the agent still holds past cancel grace
+   * (BUG-084): interrupt the run, settle loud with the cause, and release
+   * the host so the next prompt boots fresh. This is what makes "stuck on
+   * request_user_input" impossible to hold forever.
+   */
+  async _escalateIgnoredPrompt(chatId, turnId, stuck) {
+    const slot = this.slots.get(chatId);
+    const turn = slot?.turn;
+    if (!turn || turn.turnId !== turnId || turn.settled) return;
+    const n = Array.isArray(stuck?.questions) ? stuck.questions.length : 0;
+    console.warn(`[sessions ${new Date().toISOString()}] pending-poll ${String(chatId).slice(0, 8)}… ESCALATE ${stuck?.userInputId} still pending ${Math.round((stuck?.waitedMs || 0) / 1000)}s after cancel — interrupting run`);
+    try {
+      await slot.client?.interrupt();
+    } catch { /* the interrupt is best-effort; the settle below is the guarantee */ }
+    this.settleTurn(chatId, turnId, {
+      reason: 'watchdog',
+      error: `agent ค้างที่คำถาม request_user_input (${n} คำถาม) — ยกเลิกแล้วแต่ agent ไม่ขยับ จึงตัดเทิร์นทิ้ง ลอง prompt ใหม่อีกครั้ง`,
+    });
+    void this.releaseClient(chatId, 'ignored userInput cancel: run interrupted, host released').catch(() => {});
+  }
+
   _checkWatchdog(chatId, turnId) {
     const slot = this.slots.get(chatId);
     const turn = slot?.turn;
@@ -1089,11 +1509,58 @@ export class SessionManager extends EventEmitter {
     // would reject it) and let a second prompt run concurrently on the same
     // MSP session. The hard cap is the backstop for a genuinely wedged turn.
     if (this._clientLively(slot)) {
+      // Deaf-client backstop (chat 81442763): a turn that never received a
+      // single frame is NOT "a quiet build" — turn/started + item/started
+      // always precede any work, so zero activity past NO_ACTIVITY_MS means
+      // the channel is deaf or the agent never started. Settle loudly and
+      // release the useless client so the next prompt boots a fresh one.
+      // Turns that HAD activity still hold forever (74f04882).
+      if (!turn.sawActivity && now - turn.startedAt > NO_ACTIVITY_MS) {
+        this.settleTurn(chatId, turnId, {
+          reason: 'watchdog',
+          error: `agent ไม่ส่งอะไรกลับมาเลยภายใน ${Math.round(NO_ACTIVITY_MS / 1000)}s — ไม่ได้ยิน agent (ตัดการเชื่อมต่อแล้ว ลอง prompt ใหม่อีกครั้ง)`,
+        });
+        void this.releaseClient(chatId, 'deaf client: zero frames past no-activity window').catch(() => {});
+        return;
+      }
+      // Pending-prompt recovery (BUG-084): the agent can sit parked on a
+      // question nobody can answer — a missed live frame, or an auto-cancel
+      // the host rejected — while silence grows forever under lively-hold.
+      // Past the poll threshold, re-read the pending set point-in-time
+      // (mount / cancel / escalate). Fire-and-forget; the hold below
+      // stands either way.
+      const pendingSilentMs = now - (turn.sawActivity ? turn.lastActivity : turn.startedAt);
+      if (pendingSilentMs > resolvePendingPollMs() && !slot._pollInFlight) {
+        slot._pollInFlight = true;
+        void this._pollPendingPrompts(chatId, turnId).finally(() => {
+          if (this.slots.get(chatId) === slot) slot._pollInFlight = false;
+        });
+      }
+      // CLI parity: a live agent holding the turn open is never auto-settled
+      // by default — not for silence, not for elapsed time. A ceiling exists
+      // only as an explicit opt-in (MUSE_DESKTOP_WATCHDOG_HARD_MS), and even
+      // then a tool still marked live (long shell / MCP call) holds it:
+      // chat 74f04882 proved a silent stretch is deliberation, not death.
+      const hardMs = resolveWatchdogHardMs();
+      if (!hardMs) {
+        this._logStickyHold(chatId, turn, now, 'lively-hold');
+        return;
+      }
+      const anyLiveTool = [...(turn.toolCalls?.values?.() || [])].some((t) =>
+        /pending|in_progress|running/i.test(String(t?.status || '')),
+      );
+      if (anyLiveTool) {
+        this._logStickyHold(chatId, turn, now, 'live-tool');
+        return;
+      }
       const silentFor = now - (turn.sawActivity ? turn.lastActivity : turn.startedAt);
-      if (silentFor <= WATCHDOG_HARD_MS) return;
+      if (silentFor <= hardMs) {
+        this._logStickyHold(chatId, turn, now, 'lively');
+        return;
+      }
       this.settleTurn(chatId, turnId, {
         reason: 'watchdog',
-        error: `agent ค้างเกิน ${Math.round(WATCHDOG_HARD_MS / 60000)} นาทีทั้งที่ยังเชื่อมต่ออยู่ — ตัดเทิร์นตาม hard cap`,
+        error: `agent ค้างเกิน ${Math.round(hardMs / 60000)} นาทีทั้งที่ยังเชื่อมต่ออยู่ — ตัดเทิร์นตาม hard cap`,
       });
       return;
     }
@@ -1323,6 +1790,29 @@ export class SessionManager extends EventEmitter {
         };
         slot.subagents.set(id, record);
         this.wire.emit(chatId, 'subagent', { turnId, subagent: record });
+        this._persistSubagents(chatId, slot);
+        // A landed reminder already decided — fold the verdict now so the
+        // row carries its topic without waiting for a drill. Fire-and-forget
+        // over the live client only: a background read must never warm an
+        // agent (the drill path folds on demand when this is skipped).
+        if (kind === 'msp:reminder_child'
+          && record.childSessionId && !record.result?.summary
+          && ['completed', 'failed', 'cancelled'].includes(String(record.status || ''))) {
+          const live = slot.client && slot.client.proc?.exitCode == null ? slot.client : null;
+          if (live) {
+            live.request('session/read', {
+              sessionId: record.childSessionId,
+              excludeItems: false,
+            }, { timeoutMs: 15_000 }).then((res) => {
+              const dec = extractReminderDecision(res?.history?.items);
+              const line = dec && reminderDecisionLine(dec);
+              if (!line) return;
+              const cur = slot.subagents.get(id);
+              if (!cur || cur.result?.summary) return;
+              this._foldReminderVerdict(chatId, cur, line);
+            }).catch(() => { /* a pruned child just keeps its bare row */ });
+          }
+        }
         return;
       }
       case 'msp:subagent_delta': {
@@ -1355,6 +1845,9 @@ export class SessionManager extends EventEmitter {
           turnId,
           tool: record,
         });
+        // Native subagent tools double as the parallel-children feed — the
+        // same row paints the transcript AND folds into the rail registry.
+        if (slot) this._trackNativeSubagent(chatId, turnId, slot, record);
         return;
       }
       case 'plan': {
@@ -1384,7 +1877,7 @@ export class SessionManager extends EventEmitter {
       case 'msp:usage': {
         // Subscription usage is account-level, not per chat — cache it and
         // broadcast globally so every window's pill moves together.
-        this._usageCache = { usage: update.usage, at: Date.now() };
+        this.setUsageCache(update.usage);
         this.wire.emit(null, 'usage', { usage: update.usage });
         return;
       }
@@ -1405,6 +1898,27 @@ export class SessionManager extends EventEmitter {
           this._learnConfig(slotClient); // the push refreshes the catalog too (BUG-079)
         }
         this.wire.emit(chatId, 'config_option_update', { update });
+        return;
+      }
+      case 'msp:user_input_unsupported': {
+        // Persist, not just broadcast: the SSE trace alone vanishes on
+        // reload, and the turn that follows ("continuing without an answer")
+        // reads as a non sequitur without it (BUG-084).
+        const qs = Array.isArray(update.questions) ? update.questions : [];
+        // Record the live-path cancel too: without this a live auto-cancel
+        // the agent ignores would re-cancel every poll tick and never
+        // escalate, because cancelledAt only tracked poll-path cancels.
+        if (slot && update.userInputId) {
+          if (!slot.cancelledPrompts) slot.cancelledPrompts = new Map();
+          slot.cancelledPrompts.set(String(update.userInputId), Date.now());
+        }
+        const heads = qs.map((q) => String(q?.header || q?.id || '').trim()).filter(Boolean);
+        this.store.addMessage(chatId, {
+          role: 'notice',
+          text: `agent ถาม ${qs.length} คำถามพร้อมกัน${heads.length ? ` (${heads.slice(0, 4).join(' / ')})` : ''} — เดสก์ท็อปแสดงได้ทีละคำถาม จึงยกเลิกให้ agent ตอบต่อเอง`,
+          meta: { ...(turnId ? { turnId } : {}), userInputId: update.userInputId || null },
+        });
+        this.wire.emit(chatId, 'agent_update_other', { kind: kind || 'unknown', update });
         return;
       }
       default: {
@@ -1467,10 +1981,129 @@ export class SessionManager extends EventEmitter {
 
   // ------------------------------------------------------------ subagents
 
+  /**
+   * One child's record, live slot first, persisted mirror second. The store
+   * fallback is what keeps the rail and drill-downs working on a cold chat
+   * after a restart — without warming an agent just to list rows.
+   */
+  subagentRecord(chatId, itemId) {
+    const key = String(itemId);
+    return this.slots.get(chatId)?.subagents?.get(key)
+      || (this.store.get(chatId)?.subagents || []).find((r) => r?.itemId === key)
+      || null;
+  }
+
   listSubagents(chatId) {
     const slot = this.slots.get(chatId);
-    if (!slot?.subagents) return [];
-    return [...slot.subagents.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    if (slot?.subagents) {
+      return [...slot.subagents.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    }
+    const stored = this.store.get(chatId)?.subagents || [];
+    return [...stored].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  }
+
+  /** Mirror the registry to disk (debounced, liveText stripped). Item frames
+   * and tool completions are low-frequency state transitions, unlike
+   * per-chunk deltas — safe to persist on every one. */
+  _persistSubagents(chatId, slot) {
+    try {
+      this.store.saveSubagents(chatId, [...(slot?.subagents?.values() || [])]
+        .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
+    } catch { /* a persist hiccup must never break the turn path */ }
+  }
+
+  /**
+   * Fold a native-subagent tool row (spawn/wait/cancel/read_result) into a
+   * `kind: 'native'` registry record. Native children have no MSP session,
+   * so the registry row IS the child view — topic from spawn args, result
+   * from the wait output, drill-down from the folded I/O (see readSubagent).
+   */
+  _trackNativeSubagent(chatId, turnId, slot, toolRow) {
+    let folded;
+    try {
+      folded = nativeSubagentPatch({
+        toolCallId: toolRow.id,
+        kind: toolRow.kind,
+        rawInput: toolRow.rawInput,
+        output: toolRow.output,
+        status: toolRow.status,
+      });
+    } catch {
+      return;
+    }
+    if (!folded) return;
+    this._applyNativePatch(chatId, turnId, slot, folded);
+  }
+
+  /** Merge one folded patch into the registry + mirror. Shared by the live
+   * tracker and the boot backfill, so a re-read never duplicates a row. */
+  _applyNativePatch(chatId, turnId, slot, folded) {
+    if (!slot.subagents) slot.subagents = new Map();
+    const prev = slot.subagents.get(folded.key) || {};
+    // Patches use null for "unknown" — strip them so a skeleton never wipes
+    // a topic the spawn already recorded (same rule as the result merge).
+    const patch = Object.fromEntries(
+      Object.entries(folded.rec).filter(([, v]) => v != null),
+    );
+    const record = {
+      ...prev,
+      ...patch,
+      itemId: folded.key,
+      kind: 'native',
+      chatId,
+      turnId: turnId || prev.turnId || null,
+      startedAt: prev.startedAt || Date.now(),
+      updatedAt: Date.now(),
+    };
+    // Merge results instead of replacing: a read_result attaches text to the
+    // summary the wait already recorded. Nulls never wipe: a patch that
+    // carries no summary must not erase the one already stored.
+    if (prev.result || folded.rec.result) {
+      const incoming = Object.fromEntries(
+        Object.entries(folded.rec.result || {}).filter(([, v]) => v != null),
+      );
+      record.result = { ...(prev.result || {}), ...incoming };
+    }
+    if (record.status && record.status !== 'inProgress' && record.startedAt) {
+      record.durationMs = Math.max(0, record.updatedAt - record.startedAt);
+    }
+    slot.subagents.set(folded.key, record);
+    this.wire.emit(chatId, 'subagent', { turnId, subagent: record });
+    this._persistSubagents(chatId, slot);
+  }
+
+  /**
+   * Recover native children from turns the live tracker never saw (older
+   * than the tracker, or spawned while the host was down). The agent-side
+   * history still carries the full spawn/wait outputs the old client
+   * dropped, so one boot-time parent read rebuilds every row. Once per slot,
+   * fire-and-forget, best-effort — a failure just means live-tracking only.
+   */
+  async _backfillNativeSubagents(chatId, slot, client) {
+    if (!slot || slot.backfilled) return;
+    slot.backfilled = true;
+    try {
+      const data = await client.request(
+        'session/read',
+        { sessionId: client.sessionId, excludeItems: false },
+        { timeoutMs: 30_000 },
+      );
+      const items = data?.history?.items || [];
+      for (const it of items) {
+        if (!it || it.kind !== 'toolCall' || !NATIVE_SUBAGENT_TOOLS.has(it.tool)) continue;
+        let folded = null;
+        try {
+          folded = nativeSubagentPatch({
+            toolCallId: it.itemId,
+            kind: it.tool,
+            rawInput: it.args ?? it.rawInput ?? null,
+            output: it.visibleOutput || it.output || '',
+            status: it.status,
+          });
+        } catch { /* one bad row must not poison the rest */ }
+        if (folded) this._applyNativePatch(chatId, it.turnId || null, slot, folded);
+      }
+    } catch { /* best-effort by design */ }
   }
 
   /**
@@ -1479,19 +2112,175 @@ export class SessionManager extends EventEmitter {
    * Throws NOT_FOUND / NO_SESSION / Error (RPC failure) for the route.
    */
   async readSubagent(chatId, itemId) {
-    const rec = this.slots.get(chatId)?.subagents?.get(String(itemId));
+    const rec = this.subagentRecord(chatId, itemId);
     if (!rec) {
       const e = new Error(`unknown subagent ${itemId}`);
       e.code = 'NOT_FOUND';
       throw e;
+    }
+    // Native children have no MSP session (session/read rejects their id) —
+    // the drill is a detail view synthesized from the folded tool I/O: the
+    // spawn brief, the wait result, and the evidence refs. Same item shape
+    // as a session drill so the rail renders both identically.
+    if (rec.kind === 'native') {
+      const items = [];
+      const brief = [
+        rec.taskName ? `task: ${rec.taskName}` : null,
+        rec.role ? `role: ${rec.role}` : null,
+        rec.objective ? `objective: ${rec.objective}` : null,
+        rec.agentPath ? `path: ${rec.agentPath}` : null,
+        rec.subagentId ? `id: ${rec.subagentId}` : null,
+      ].filter(Boolean).join('\n');
+      items.push(sanitizeDrillItem({
+        itemId: `${rec.itemId}:spawn`,
+        kind: 'toolCall',
+        status: 'completed',
+        tool: 'subagent_spawn',
+        fallbackText: brief || 'spawned',
+      }));
+      if (rec.result?.summary || rec.result?.text) {
+        items.push(sanitizeDrillItem({
+          itemId: `${rec.itemId}:result`,
+          kind: 'agentMessage',
+          status: 'completed',
+          text: rec.result.text || rec.result.summary,
+        }));
+      } else if (rec.status === 'inProgress') {
+        // A running native child has no session to read — the state summary
+        // is elapsed time plus the live stream tail when the parent relays it.
+        const elapsed = rec.startedAt
+          ? `${(Math.max(0, Date.now() - rec.startedAt) / 1000).toFixed(1)}s`
+          : null;
+        const live = typeof rec.liveText === 'string' && rec.liveText
+          ? rec.liveText.slice(-240)
+          : null;
+        items.push(sanitizeDrillItem({
+          itemId: `${rec.itemId}:running`,
+          kind: 'agentMessage',
+          status: 'inProgress',
+          text: [
+            `กำลังรัน${elapsed ? ` ${elapsed}` : ''} — ผลจะมาตอน subagent_wait จบ`,
+            live ? `ล่าสุด: ${live}` : null,
+          ].filter(Boolean).join('\n'),
+        }));
+      }
+      for (const [i, ref] of (rec.result?.evidenceRefs || []).entries()) {
+        items.push(sanitizeDrillItem({
+          itemId: `${rec.itemId}:evidence:${i}`,
+          kind: 'toolCall',
+          status: 'completed',
+          tool: 'evidence',
+          fallbackText: String(ref),
+        }));
+      }
+      if (rec.failureReason) {
+        items.push(sanitizeDrillItem({
+          itemId: `${rec.itemId}:failure`,
+          kind: 'agentMessage',
+          status: 'failed',
+          text: rec.failureReason,
+        }));
+      }
+      return {
+        record: rec,
+        session: null,
+        sessionId: rec.subagentId || null,
+        mode: 'native',
+        items,
+        droppedFromHead: 0,
+        readAt: Date.now(),
+      };
     }
     if (!rec.childSessionId) {
       const e = new Error('child has no readable session yet');
       e.code = 'NO_SESSION';
       throw e;
     }
-    const drill = await this.readChildSession(chatId, rec.childSessionId);
-    return { record: rec, ...drill };
+    let drill = null;
+    let readError = null;
+    try {
+      drill = await this.readChildSession(chatId, rec.childSessionId);
+    } catch (err) {
+      readError = err?.message || String(err);
+    }
+    // A gone session (pruned/transient child, e.g. a cancelled reminder)
+    // must not drill into a bare error page — fall back to the record
+    // detail the registry already holds, with the read failure attached.
+    if (!drill) {
+      const lines = [
+        `kind: ${rec.kind}`,
+        rec.reminderAgentId ? `agent: ${rec.reminderAgentId}` : null,
+        rec.generationId != null ? `generation: ${rec.generationId}` : null,
+        rec.taskId ? `task: ${rec.taskId}` : null,
+        rec.role ? `role: ${rec.role}` : null,
+        rec.objective ? `objective: ${rec.objective}` : null,
+        `status: ${rec.status || '—'}`,
+        rec.durationMs != null ? `duration: ${(rec.durationMs / 1000).toFixed(1)}s` : null,
+        rec.result?.summary ? `result: ${rec.result.summary}` : null,
+        rec.fallbackText ? `note: ${rec.fallbackText}` : null,
+      ].filter(Boolean).join('\n');
+      return {
+        record: rec,
+        session: null,
+        sessionId: rec.childSessionId,
+        mode: 'gone',
+        readError,
+        items: [sanitizeDrillItem({
+          itemId: `${rec.itemId}:detail`,
+          kind: 'agentMessage',
+          status: rec.status || 'completed',
+          text: lines || 'ไม่มีรายละเอียด',
+        })],
+        droppedFromHead: 0,
+        readAt: Date.now(),
+      };
+    }
+    // A reminder that already decided gets its verdict folded into the
+    // registry (the row's topic line) plus a summary card on top of the
+    // drill — the raw tool args never leave the server, only this line.
+    if (rec.kind === 'reminderChild' && drill.reminderDecision) {
+      const line = reminderDecisionLine(drill.reminderDecision);
+      if (line) {
+        drill.items.unshift(sanitizeDrillItem({
+          itemId: `${rec.itemId}:verdict`,
+          kind: 'agentMessage',
+          status: rec.status || 'completed',
+          text: `สรุป: ${line}`,
+        }));
+        this._foldReminderVerdict(chatId, rec, line);
+      }
+    }
+    return { record: this.subagentRecord(chatId, itemId) || rec, ...drill };
+  }
+
+  /**
+   * Merge one reminder verdict line into the registry row + mirror. Shared
+   * by the drill path (reads on demand) and the live fold (a completion the
+   * tracker sees), so whichever lands first wins and the second is a no-op.
+   */
+  _foldReminderVerdict(chatId, rec, line) {
+    if (!rec || rec.result?.summary) return;
+    const slot = this.slots.get(chatId);
+    const next = {
+      ...rec,
+      result: { ...(rec.result || {}), summary: line },
+      updatedAt: Date.now(),
+    };
+    if (slot?.subagents) slot.subagents.set(String(rec.itemId), next);
+    else if (slot) slot.subagents = new Map([[String(rec.itemId), next]]);
+    if (slot) {
+      this.wire.emit(chatId, 'subagent', { turnId: rec.turnId || null, subagent: next });
+      this._persistSubagents(chatId, slot);
+    } else {
+      // Cold chat (a drill served straight from disk): mirror the verdict
+      // through the store so the next list carries it.
+      try {
+        const stored = this.store.get(chatId)?.subagents || [];
+        this.store.saveSubagents(chatId, stored.map((r) => (
+          r?.itemId === rec.itemId ? next : r
+        )));
+      } catch { /* best-effort by design */ }
+    }
   }
 
   /**
@@ -1508,6 +2297,10 @@ export class SessionManager extends EventEmitter {
     const history = res?.history && typeof res.history === 'object' ? res.history : {};
     const mode = typeof history.mode === 'string' ? history.mode : 'unknown';
     const rawItems = Array.isArray(history.items) ? history.items : [];
+    // Reminder verdicts live only in the child session (see
+    // extractReminderDecision) — read the raw items before sanitize drops
+    // the tool args. Null for every other child kind.
+    const reminderDecision = extractReminderDecision(rawItems);
     const items = rawItems.map(sanitizeDrillItem).filter(Boolean);
     const CAP = 200;
     const droppedFromHead = items.length > CAP ? items.length - CAP : 0;
@@ -1520,19 +2313,131 @@ export class SessionManager extends EventEmitter {
       } : { sessionId: childSessionId, status: '', turnCount: null, title: null },
       mode,
       ...(mode === 'none' && history.noneReason ? { noneReason: String(history.noneReason) } : {}),
+      ...(reminderDecision ? { reminderDecision } : {}),
       items: droppedFromHead ? items.slice(droppedFromHead) : items,
       droppedFromHead,
       readAt: Date.now(),
     };
   }
 
+  /**
+   * Drive one child (POST …/subagents/:itemId/command) — the rail's per-row
+   * stop / resume / send-message buttons. Only kind `subagent` is
+   * addressable: workflow folds and reminder children carry no subagentId.
+   * Warms the chat's agent like the drill path (an explicit user command,
+   * not a background read). The repaint rides the item frames the verb
+   * triggers, never this reply — same contract as goalCommand.
+   * 404 unknown chat/item · 400 bad action/empty body · 409 cold-kind child.
+   */
+  async subagentCommand(chatId, itemId, action, opts = {}) {
+    if (!this.store.get(chatId)) {
+      const err = new Error('chat not found');
+      err.status = 404;
+      throw err;
+    }
+    const method = SUBAGENT_COMMANDS[action];
+    if (!method) {
+      const err = new Error(`unknown subagent action ${action || '(missing)'} — expected stop|resume|send`);
+      err.status = 400;
+      throw err;
+    }
+    const rec = this.subagentRecord(chatId, itemId);
+    if (!rec) {
+      const err = new Error(`unknown subagent ${itemId}`);
+      err.status = 404;
+      err.code = 'NOT_FOUND';
+      throw err;
+    }
+    if (rec.kind !== 'subagent') {
+      const err = new Error(`subagent commands need a subagent child, got ${rec.kind}`);
+      err.status = 409;
+      err.code = 'UNSUPPORTED';
+      throw err;
+    }
+    if (!rec.subagentId) {
+      const err = new Error('child has no addressable subagent id yet');
+      err.status = 409;
+      err.code = 'NO_SUBAGENT';
+      throw err;
+    }
+    const params = {
+      sessionId: null, // filled from the live client below
+      subagentId: String(rec.subagentId),
+      commandId: uuidv7(),
+    };
+    if (action === 'send') {
+      const body = String(opts.body ?? '').trim();
+      if (!body) {
+        const err = new Error('send needs a non-empty body');
+        err.status = 400;
+        throw err;
+      }
+      params.body = body;
+    } else if (opts.reason != null && String(opts.reason).trim() !== '') {
+      params.reason = String(opts.reason).trim().slice(0, 500);
+    }
+    const client = await this.ensureClient(chatId);
+    params.sessionId = client.sessionId;
+    await client.request(method, params, { timeoutMs: 30_000 });
+    return { action, subagentId: params.subagentId };
+  }
+
   getGoal(chatId) {
     return this.slots.get(chatId)?.goal ?? null;
+  }
+
+  /**
+   * Drive the session goal verb (POST /api/chats/:id/goal) — the rail's
+   * pause/resume button, Mcode ConversationStatusPanel parity. Only
+   * pause|resume: set/edit/clear stay agent-side. 404 unknown chat ·
+   * 400 bad action · 409 cold chat (nothing to command — the button
+   * disables itself when cold, this is the backstop). The repaint rides
+   * the goalChanged SSE the verb triggers, never this reply.
+   */
+  async goalCommand(chatId, action) {
+    if (!this.store.get(chatId)) {
+      const err = new Error('chat not found');
+      err.status = 404;
+      throw err;
+    }
+    if (action !== 'pause' && action !== 'resume') {
+      const err = new Error(`unknown goal action ${action || '(missing)'} — expected pause|resume`);
+      err.status = 400;
+      throw err;
+    }
+    const slot = this.slots.get(chatId);
+    const client = slot?.client && isClientAlive(slot.client) ? slot.client : null;
+    if (!client?.sessionId) {
+      const err = new Error('no live agent for this chat — prompt once to spawn it');
+      err.status = 409;
+      err.code = 'NO_SESSION';
+      throw err;
+    }
+    await client.request(`goal/${action}`, { sessionId: client.sessionId, commandId: uuidv7() });
+    return { action };
   }
 
   getCtx(chatId) {
     const slot = this.slots.get(chatId);
     return { ctx: slot?.ctx ?? null, tokens: slot?.tokens ?? null };
+  }
+
+  _usageCachePath() {
+    if (!this._usageCacheFile) {
+      const dir = this.store?.file ? path.dirname(this.store.file) : null;
+      this._usageCacheFile = dir ? usageCacheFile(dir) : null;
+    }
+    return this._usageCacheFile;
+  }
+
+  /** Single funnel for usage updates: memory cache + on-disk snapshot for
+   * external readers (Übersicht). The file write is best-effort and never
+   * throws — a quota peek must not break a turn. */
+  setUsageCache(usage) {
+    if (!usage) return;
+    this._usageCache = { usage, at: Date.now() };
+    const file = this._usageCachePath();
+    if (file) writeUsageCache(file, usage);
   }
 
   /**
@@ -1548,7 +2453,7 @@ export class SessionManager extends EventEmitter {
     try {
       const res = await slot.client.request('usage/read', {}, { timeoutMs: 15_000 });
       const usage = sanitizeSubscriptionUsage(res?.usage);
-      if (usage) this._usageCache = { usage, at: Date.now() };
+      if (usage) this.setUsageCache(usage);
       return usage ?? cached?.usage ?? null;
     } catch {
       return cached?.usage ?? null;
@@ -1635,6 +2540,20 @@ export class SessionManager extends EventEmitter {
     if (this._demoteTimer) clearInterval(this._demoteTimer);
     if (killAgents) {
       await Promise.all([...this.slots.keys()].map((id) => this.releaseClient(id, 'host shutdown')));
+    } else {
+      // Agents outlive the host (deploy/restart) but the live-turn state does
+      // not — settle every open turn with a trace instead of letting it
+      // evaporate silently (a restart mid-turn used to leave the user message
+      // with no reply and no error). The stored mspSessionId is kept, so the
+      // next prompt resumes the same agent session where it left off.
+      for (const [id, slot] of [...this.slots.entries()]) {
+        if (slot?.turn && !slot.turn.settled) {
+          this.settleTurn(id, slot.turn.turnId, {
+            reason: 'interrupted',
+            error: 'host หยุดทำงานระหว่างเทิร์น (deploy/restart) — prompt ใหม่อีกครั้งเพื่อทำต่อ',
+          });
+        }
+      }
     }
     this.store.flushNow();
   }

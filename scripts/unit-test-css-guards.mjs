@@ -211,13 +211,33 @@ test('package.json version matches the shared ?v= token (BUG-078)', () => {
 // Blocks that scroll via an explicit max-height cap (tool output, ix bodies)
 // use a different mechanism and are deliberately NOT in this list.
 test('flex/grid scroll containers declare min-height: 0 (BUG-073)', () => {
-  const mustShrink = ['#main', '.transcript', '#sidebar', '.sidebar-nav'];
+  const mustShrink = ['#main', '.transcript', '#sidebar', '.sidebar-nav', '#rightbar', '.rb-scroll'];
   for (const sel of mustShrink) {
     const re = new RegExp(`${sel.replace(/[.]/g, '\\$&')}\\s*\\{([^}]*)\\}`);
     const m = styleCss.match(re);
     assert.ok(m, `${sel} rule not found in style.css`);
     assert.ok(/min-height:\s*0\s*;/.test(m[1]), `${sel} is missing min-height: 0`);
   }
+});
+
+// ------------------------------------------------------- console type
+// Console output reads at 3:4 of the answer text: the .tool-body rule must
+// ride the caption token, and that token must resolve to exactly 3/4 of the
+// body token — a quiet px edit on either side breaks the ratio silently.
+test('console text is 3:4 of the result text', () => {
+  const bodyRule = styleCss.match(/\.tool-body\s*\{([^}]*)\}/);
+  assert.ok(bodyRule, '.tool-body rule not found in style.css');
+  assert.ok(
+    /font-size:\s*var\(--fs-caption-1\)\s*;/.test(bodyRule[1]),
+    '.tool-body must use font-size: var(--fs-caption-1)',
+  );
+  const px = (name) => {
+    const m = styleCss.match(new RegExp(`${name}:\\s*([\\d.]+)px`));
+    assert.ok(m, `${name} token not found`);
+    return Number(m[1]);
+  };
+  const ratio = px('--fs-caption-1') / px('--fs-body');
+  assert.equal(ratio, 0.75, `console/result ratio is ${ratio}, want 0.75`);
 });
 
 // ------------------------------------------------------- reduced motion

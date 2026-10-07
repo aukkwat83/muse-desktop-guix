@@ -7,13 +7,16 @@
 // Two structural rules worth keeping:
 //   - only the ⋮⋮ handle drags a group; chat rows drag independently, so
 //     picking up a chat can never accidentally reorder its group
-//   - the group owning the active chat is always expanded and cannot be
-//     collapsed, so the thing you are looking at can never be hidden from you
+//   - any group collapses, including the one holding the active chat —
+//     the ▸/▾ button is never disabled. Switching sessions re-expands
+//     the incoming chat's group (app.js), but a same-chat refetch
+//     leaves a deliberate collapse alone.
 //
 // Rename and "new group" happen inline, and their in-progress text is kept
 // across re-renders — a stream event landing mid-typing must not wipe the box.
 
 import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.4.0';
+import { paintApTitle } from './ap-tags.js?v=1.0.0';
 
 /**
  * Commit an inline editor only when the user really left it.
@@ -44,6 +47,8 @@ export class Sidebar {
     this.renameValue = '';
     this.draftOpen = false;
     this.draftValue = '';
+    /** Where the open draft sits and lands: 'top' (header ▤) or 'bottom' (＋ group tab). */
+    this.draftAt = 'top';
     this.dragGroupId = null;
     this.dragChatId = null;
     /** Suppresses the click that is really the first half of a double-click. */
@@ -53,13 +58,8 @@ export class Sidebar {
 
   // ------------------------------------------------------------ expansion
 
-  groupOfActiveChat() {
-    return this.view.chats.find((c) => c.id === this.view.activeChatId)?.groupId ?? null;
-  }
-
   isExpanded(groupId) {
     if (!groupId) return false;
-    if (groupId === this.groupOfActiveChat()) return true;
     if (this.collapsed.has(groupId)) return false;
     if (groupId === this.view.activeGroupId) return true;
     return this.expanded.has(groupId);
@@ -72,7 +72,7 @@ export class Sidebar {
   }
 
   toggleExpanded(groupId) {
-    if (!groupId || groupId === this.groupOfActiveChat()) return;
+    if (!groupId) return;
     if (this.isExpanded(groupId)) {
       this.expanded.delete(groupId);
       this.collapsed.add(groupId);
@@ -83,7 +83,13 @@ export class Sidebar {
   }
 
   chatsIn(groupId) {
-    return this.view.chats.filter((c) => c.groupId === groupId);
+    // Queue order within the group: most recent conversation activity
+    // first. The server already sorts this way, but the sidebar must not
+    // depend on it — any SSE merge or second-window state could hand us
+    // another order.
+    return this.view.chats
+      .filter((c) => c.groupId === groupId)
+      .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   }
 
   // --------------------------------------------------------------- render
@@ -100,9 +106,14 @@ export class Sidebar {
       this.mount.append(empty);
     }
 
+    // The new-group draft sits where its button sits: the header ▤ drafts
+    // at the top and lands on top; the bottom tab drafts at the bottom and
+    // lands at the bottom.
+    if (this.draftOpen && this.draftAt === 'top') this.mount.append(this.draftRow());
+
     for (const group of groups) this.mount.append(this.groupBlock(group));
 
-    if (this.draftOpen) this.mount.append(this.draftRow());
+    if (this.draftOpen && this.draftAt !== 'top') this.mount.append(this.draftRow());
     this.mount.append(this.addGroupRow());
   }
 
@@ -139,7 +150,6 @@ export class Sidebar {
     expand.className = 'group-expand';
     expand.textContent = expanded ? '▾' : '▸';
     expand.title = expanded ? 'ยุบ' : 'ขยาย';
-    expand.disabled = group.id === this.groupOfActiveChat();
     expand.addEventListener('click', (ev) => {
       ev.stopPropagation();
       this.toggleExpanded(group.id);
@@ -288,7 +298,8 @@ export class Sidebar {
 
     const title = document.createElement('span');
     title.className = 's-title';
-    title.textContent = chat.title;
+    // [APxxxx] prefixes paint as project chips, same as the chat title.
+    paintApTitle(title, chat.title);
     main.append(title);
 
     const meta = document.createElement('span');
@@ -449,7 +460,6 @@ export class Sidebar {
       {
         label: this.isExpanded(group.id) ? 'ยุบ sessions' : 'ขยาย sessions',
         icon: this.isExpanded(group.id) ? '▴' : '▾',
-        disabled: group.id === this.groupOfActiveChat(),
         action: () => this.toggleExpanded(group.id),
       },
       { type: 'sep' },
@@ -597,14 +607,17 @@ export class Sidebar {
 
     const commit = () => {
       const name = input.value.trim();
+      const at = this.draftAt === 'bottom' ? 'bottom' : 'top';
       this.draftOpen = false;
       this.draftValue = '';
-      if (name) this.actions.createGroup(name);
+      this.draftAt = 'top';
+      if (name) this.actions.createGroup(name, at);
       else this.render(this.view);
     };
     const cancel = () => {
       this.draftOpen = false;
       this.draftValue = '';
+      this.draftAt = 'top';
       this.render(this.view);
     };
 
@@ -643,6 +656,7 @@ export class Sidebar {
       ev.stopPropagation();
       closePopover();
       this.draftOpen = true;
+      this.draftAt = 'bottom';
       this.draftValue = this.draftValue || `Group ${this.view.groups.length + 1}`;
       this.render(this.view);
     });

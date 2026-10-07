@@ -28,6 +28,8 @@ import {
   isPickerCancel,
   noDialogMessage,
 } from './file-picker.js';
+import { priceTable, thbPerUsd } from './pricing.js';
+import { buildNotifyPayload, notifyArgs, shouldDeliver } from './notify.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '../..');
@@ -479,7 +481,7 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === '/api/groups' && method === 'POST') {
       const body = await readJson(req);
-      const group = sessions.createGroup({ name: body.name });
+      const group = sessions.createGroup({ name: body.name, position: body.position });
       return send(res, 201, { ok: true, group, ...sessions.groupsState() });
     }
 
@@ -694,6 +696,31 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, usage: await sessions.getUsage() });
     }
 
+    // ---- cost ------------------------------------------------------
+    // Static model rate table for the right-bar calculator (USD per 1M
+    // tokens + the THB rate). The renderer multiplies session tokens by it.
+    if (pathname === '/api/pricing' && method === 'GET') {
+      return send(res, 200, { ok: true, pricing: priceTable(), thbPerUsd: thbPerUsd() });
+    }
+
+    // ---- mac notification ------------------------------------------
+    // The WKWebView shell does not deliver Web Notifications reliably, so an
+    // agent question also fans out through here: osascript posts a real macOS
+    // banner even when the window is behind something else. Fire-and-forget —
+    // a notification failure must never fail the turn it announces.
+    if (pathname === '/api/notify' && method === 'POST') {
+      const payload = buildNotifyPayload(await readJson(req).catch(() => ({})));
+      if (shouldDeliver(payload)) {
+        const p = spawn('/usr/bin/osascript', notifyArgs(payload), {
+          detached: true,
+          stdio: 'ignore',
+        });
+        p.unref();
+        return send(res, 200, { ok: true, delivered: true });
+      }
+      return send(res, 200, { ok: true, delivered: false });
+    }
+
     if (pathname === '/api/mcp/servers' && method === 'GET') {
       return send(res, 200, mcpSnapshot());
     }
@@ -750,6 +777,23 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    const subagentCmdMatch = pathname.match(/^\/api\/chats\/([^/]+)\/subagents\/([^/]+)\/command$/);
+    if (subagentCmdMatch && method === 'POST') {
+      const chatId = decodeURIComponent(subagentCmdMatch[1]);
+      const itemId = decodeURIComponent(subagentCmdMatch[2]);
+      const body = await readJson(req).catch(() => ({}));
+      try {
+        const result = await sessions.subagentCommand(chatId, itemId, String(body?.action || ''), {
+          body: body?.body,
+          reason: body?.reason,
+        });
+        return send(res, 200, { ok: true, chatId, itemId, ...result });
+      } catch (err) {
+        if (err?.status) return fail(res, err.status, err.message, err.code ? { code: err.code } : {});
+        return fail(res, 502, err?.message || 'subagent command failed');
+      }
+    }
+
     const childSessionMatch = pathname.match(/^\/api\/chats\/([^/]+)\/child-session\/([^/]+)$/);
     if (childSessionMatch && method === 'GET') {
       const chatId = decodeURIComponent(childSessionMatch[1]);
@@ -784,6 +828,16 @@ const server = http.createServer(async (req, res) => {
       if (action === 'goal' && method === 'GET') {
         if (!sessions.store.get(chatId)) return fail(res, 404, 'chat not found');
         return send(res, 200, { ok: true, chatId, goal: sessions.getGoal(chatId) });
+      }
+
+      if (action === 'goal' && method === 'POST') {
+        const body = await readJson(req);
+        try {
+          const result = await sessions.goalCommand(chatId, String(body.action || ''));
+          return send(res, 200, { ok: true, chatId, ...result });
+        } catch (err) {
+          return fail(res, err?.status || 500, err?.message || 'goal command failed', err?.code ? { code: err.code } : {});
+        }
       }
 
       if (action === 'ctx' && method === 'GET') {
@@ -906,6 +960,7 @@ const server = http.createServer(async (req, res) => {
           ? send(res, 200, { ok: true, chat: sessions.chatSummary(chat), ...sessions.groupsState() })
           : fail(res, 404, 'chat or group not found');
       }
+
     }
 
     // ---- diagram download ------------------------------------------

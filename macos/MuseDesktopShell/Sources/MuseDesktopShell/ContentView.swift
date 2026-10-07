@@ -224,6 +224,37 @@ struct WebView: NSViewRepresentable {
             decisionHandler(.allow)
         }
 
+        /// ⧉ pop-out: the rail's "open in new window" button (window.open to
+        /// a same-origin child page) lands here — without this delegate,
+        /// WKWebView silently drops the popup. Same-origin only, like the
+        /// navigation policy above; anything else goes to the real browser.
+        func webView(
+            _ webView: WKWebView,
+            createWebViewWith configuration: WKWebViewConfiguration,
+            for navigationAction: WKNavigationAction,
+            windowFeatures: WKWindowFeatures
+        ) -> WKWebView? {
+            guard let url = navigationAction.request.url else { return nil }
+            if let host = url.host, host != "127.0.0.1", host != "localhost" {
+                NSWorkspace.shared.open(url)
+                return nil
+            }
+            let popup = WKWebView(frame: .zero, configuration: configuration)
+            popup.navigationDelegate = self
+            popup.uiDelegate = self
+            let win = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 560, height: 700),
+                styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            win.contentView = popup
+            win.title = "Muse Desktop — child session"
+            win.makeKeyAndOrderFront(nil)
+            popup.load(URLRequest(url: url))
+            return popup
+        }
+
         // Without these, window.confirm/prompt return instantly — the "change
         // working directory" and "delete chat" flows would silently do nothing.
         func webView(

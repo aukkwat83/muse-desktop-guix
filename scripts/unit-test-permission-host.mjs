@@ -6,6 +6,7 @@
 
 import assert from 'node:assert/strict';
 import {
+  classifyPendingUserInputs,
   formatDiffPreview,
   mspApprovalBody,
   mspApprovalCard,
@@ -210,6 +211,80 @@ test('multi-question, multi-select and option-less prompts return null', () => {
     null,
   );
   assert.equal(mspUserInputCard({ questions: [] }), null);
+});
+
+test('pending poll mounts single cards and cancels the rest (BUG-084)', () => {
+  const single = {
+    userInputId: 'u-single',
+    questions: [{ id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] }],
+  };
+  const multi = {
+    userInputId: 'u-multi',
+    questions: [
+      { id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] },
+      { id: 'b', question: 'B?', selection: { mode: 'single' }, options: [{ label: 'z' }] },
+    ],
+  };
+  const out = classifyPendingUserInputs({ pending: [single, multi] });
+  assert.deepEqual(out.mount.map((p) => p.userInputId), ['u-single']);
+  assert.deepEqual(out.cancel.map((p) => p.userInputId), ['u-multi']);
+  assert.deepEqual(out.escalate, []);
+});
+
+test('pending poll skips mounted cards and in-grace cancels (BUG-084)', () => {
+  const mounted = {
+    userInputId: 'u-mounted',
+    questions: [{ id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] }],
+  };
+  const fresh = {
+    userInputId: 'u-fresh',
+    questions: [
+      { id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] },
+      { id: 'b', question: 'B?', selection: { mode: 'single' }, options: [{ label: 'z' }] },
+    ],
+  };
+  const out = classifyPendingUserInputs({
+    pending: [mounted, fresh],
+    knownIds: new Set(['u-mounted']),
+    cancelledAt: new Map([['u-fresh', 10_000]]),
+    now: 20_000,
+    graceMs: 30_000,
+  });
+  assert.deepEqual(out.mount, []);
+  assert.deepEqual(out.cancel, []);
+  assert.deepEqual(out.escalate, []);
+});
+
+test('a cancel the agent ignored past grace escalates (BUG-084)', () => {
+  const stuck = {
+    userInputId: 'u-stuck',
+    questions: [{ id: 'a', question: 'A?', selection: { mode: 'single' }, options: [] }],
+  };
+  const out = classifyPendingUserInputs({
+    pending: [stuck],
+    cancelledAt: new Map([['u-stuck', 10_000]]),
+    now: 41_000,
+    graceMs: 30_000,
+  });
+  assert.deepEqual(out.mount, []);
+  assert.deepEqual(out.cancel, []);
+  assert.equal(out.escalate.length, 1);
+  assert.equal(out.escalate[0].userInputId, 'u-stuck');
+  assert.equal(out.escalate[0].waitedMs, 31_000);
+});
+
+test('pending poll dedupes repeats and drops id-less entries (BUG-084)', () => {
+  const dup = {
+    userInputId: 'u-dup',
+    questions: [
+      { id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] },
+      { id: 'b', question: 'B?', selection: { mode: 'single' }, options: [{ label: 'z' }] },
+    ],
+  };
+  const out = classifyPendingUserInputs({ pending: [dup, dup, { questions: [] }, null] });
+  assert.deepEqual(out.cancel.map((p) => p.userInputId), ['u-dup']);
+  assert.deepEqual(out.mount, []);
+  assert.deepEqual(out.escalate, []);
 });
 
 let failed = 0;

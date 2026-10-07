@@ -86,6 +86,15 @@ has never worked.
 - Approvals arrive as **both** a server-initiated `approval/request` (answer `{}` receipt
   immediately; the decision travels separately as `approval/decide`) **and** an
   `approval/requested` notification. The client mounts exactly one card for the pair.
+- `userInput/cancel` MUST carry `reason`: binary 1.4.2 rejects a reason-less
+  cancel (`missing field 'reason'`) even though the exported schema marks it
+  optional — that silent rejection wedged chat f381a7e1 for 2h (BUG-084).
+  The mock enforces it so the e2e fails if the field is ever dropped.
+- Belt and suspenders for the same wedge: the watchdog re-reads
+  `approval/listPending` on lively-but-silent turns and mounts /
+  auto-cancels / escalates from the snapshot — the live frame is the fast
+  path, the poll is the guarantee, and a cancel ignored past grace ends in
+  a loud interrupt, never a silent hold.
 - `session/resume` returns history in the RESULT (no wire replay); `excludeItems: true` keeps
   it lean since we keep our own transcript.
 - Login state surfaces as turn/RPC failures matching `not logged in` — there is no dedicated

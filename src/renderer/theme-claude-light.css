@@ -13,7 +13,9 @@
  *
  * Two more came out of auditing this port itself: the accent *fill* had to
  * drop to #b5573a for the white ＋/Send glyphs, and --danger to #9e5147 to
- * survive as text on paper. `npm run test:contrast` pins all of it.
+ * survive as text on paper. A later pass darkened --warn to #7d5f24 for the
+ * panel-2 pills (4.17 → 4.92) and lifted six faded states/overlays to solid
+ * or near-solid. `npm run test:contrast` pins all of it.
  *
  * The audit's blind spot is worth repeating: form controls are not text nodes,
  * so a DOM walk that only measures text misses ::placeholder entirely. Hence
@@ -52,7 +54,7 @@ html[data-theme='claude-light'] {
   --focus-ring: rgba(181, 87, 58, 0.3);
 
   --ok: #2f6e47;
-  --warn: #8a6a28;
+  --warn: #7d5f24; /* was #8a6a28: 4.17 on panel-2 pills → 4.92, fill pair holds */
   --warn-ink: #fffcf8;
   --danger: #9e5147;
   --on-danger: #ffffff;
@@ -158,4 +160,50 @@ html[data-theme='claude-light'] .s-del {
 
 html[data-theme='claude-light'] .dashed-tab {
   border-color: #ded5c6;
+}
+
+/* Context bar at warn/danger: hue stays on the border + fill, but the text
+   goes solid ink — warn-on-warn measured 2.60, ink-on-fill is 7.29+. */
+html[data-theme='claude-light'] #context-pill[data-level='warn'],
+html[data-theme='claude-light'] #context-pill[data-level='danger'] {
+  color: var(--ink);
+}
+
+/* Active find hit: tiny caps meta on the 16% accent wash sat at 4.49 —
+   ink-dim keeps the hierarchy (still small caps) and clears at 6.06. */
+html[data-theme='claude-light'] .session-find-hit.is-active .session-find-hit-meta {
+  color: var(--ink-dim);
+}
+
+/* Faded states, lifted for paper (disabled/resolved stay dim, but legible):
+   pop item 0.40→0.65 (4.69), config pill 0.55→0.75 (3.78), resolved card
+   0.60→0.75 (3.09), diagram button 0.55→0.75 (3.29), grip 0.45→0.80 (3.61). */
+html[data-theme='claude-light'] .pop-item:disabled {
+  opacity: 0.65;
+}
+
+html[data-theme='claude-light'] .pill.mode:disabled {
+  opacity: 0.75;
+}
+
+html[data-theme='claude-light'] .ix-card.resolved {
+  opacity: 0.75;
+}
+
+html[data-theme='claude-light'] .msg-assistant .md-diagram-dl-btn:disabled {
+  opacity: 0.75;
+}
+
+html[data-theme='claude-light'] .group-handle {
+  opacity: 0.8;
+}
+
+/* Disabled Send: a faded white-on-accent glyph bottomed out at 1.90, and no
+   opacity lift can save white-on-wash — restyle as a solid ghost instead
+   (muted on panel-2, pinned) so it reads disabled AND legible. */
+html[data-theme='claude-light'] .btn.send:disabled {
+  opacity: 1;
+  background: var(--panel-2);
+  border-color: var(--line);
+  color: var(--muted);
 }

@@ -14,10 +14,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/icon.png" />
     <!-- Blocking on purpose: sets data-theme before the first paint. -->
-    <script src="/theme-boot.js?v=1.1.0"></script>
-    <link rel="stylesheet" href="/style.css?v=1.1.0" />
-    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.0" />
-    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.0" />
+    <script src="/theme-boot.js?v=1.1.21"></script>
+    <link rel="stylesheet" href="/style.css?v=1.1.21" />
+    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.21" />
+    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.21" />
   </head>
   <body>
     <div id="app">
@@ -61,13 +61,7 @@
           </div>
           <div class="head-right">
             <span id="agent-state" class="pill muted">cold</span>
-            <!-- Live subagent count of the active turn (BUG-077) — hidden
-                 when the turn has no agent rows. Click opens the panel. -->
-            <button id="agents-chip" class="pill" type="button" title="subagent ในเทิร์นนี้" hidden>agents 0/0</button>
             <button id="tasks-chip" class="pill" type="button" title="tasks ในเทิร์นนี้" hidden>tasks 0/0</button>
-            <button id="goal-chip" class="pill" type="button" title="goal ของแชทนี้" hidden>
-              <span class="goal-pct" aria-hidden="true"></span><span class="goal-label"></span>
-            </button>
             <button id="mcp-btn" class="pill mode" type="button" title="MCP servers">
               <span class="dot idle" aria-hidden="true"></span><span class="mcp-label">MCP</span>
             </button>
@@ -83,6 +77,7 @@
             <button id="mode-chip" class="pill mode" type="button" title="Mode (Shift+Tab)">yolo</button>
             <button id="btn-session-find" class="btn ghost" type="button" title="ค้นหาในแชทนี้ (⌘F)" aria-expanded="false" aria-label="ค้นหาในแชทนี้">⌕</button>
             <button id="release-agent" class="btn ghost" type="button" title="Stop this chat's agent">⏻</button>
+            <button id="rightbar-toggle" class="btn ghost" type="button" title="แผงขวา: ค่าใช้จ่าย · goal/tasks · subagents · SCB (ซ่อนเป็นค่าเริ่มต้น)" aria-expanded="false" aria-label="แผงขวา" aria-controls="rightbar">☰</button>
           </div>
         </header>
 
@@ -122,6 +117,18 @@
         </div>
 
         <div id="transcript" class="transcript"></div>
+
+        <!-- Live cluster, bottom-right of the result: goal % (realtime, like
+             the CLI) + running agents. In flow and right-aligned so it never
+             overlaps the composer; JS hides the cluster when both chips hide. -->
+        <div id="live-cluster" hidden>
+          <button id="goal-chip" class="pill" type="button" title="goal ของแชทนี้" hidden>
+            <span class="goal-pct" aria-hidden="true"></span><span class="goal-label"></span>
+          </button>
+          <!-- Live subagent count of the active turn (BUG-077) — hidden
+               when the turn has no agent rows. Click opens the panel. -->
+          <button id="agents-chip" class="pill" type="button" title="subagent ในเทิร์นนี้" hidden>agents 0/0</button>
+        </div>
 
         <!-- Recovery affordance once the user unpins (scrolls up): jump back
              to the live tail. Shown from app.js when new content lands while
@@ -188,12 +195,19 @@
           </div>
         </form>
       </main>
+
+      <div id="rightbar-gutter" role="separator" aria-orientation="vertical" aria-controls="rightbar" aria-label="ปรับความกว้างแผงขวา" tabindex="0" title="ลากเพื่อปรับความกว้าง (ดับเบิลคลิกเพื่อรีเซ็ต)" hidden></div>
+
+      <!-- Right rail: cost · goal/tasks · subagents · SCB projects.
+           Hidden by default (Codex Desktop parity) — the ☰ button, or the
+           goal/tasks/agents chips, opens it. Rendered by rightbar.js. -->
+      <aside id="rightbar" aria-label="แผงขวา" hidden></aside>
     </div>
 
     <!-- Standalone version paint: runs even when app.js fails to load, so a
          dead boot never leaves a silent shell (BUG-066). External file rather
          than an inline script because the CSP is script-src 'self'. -->
-    <script src="/version-boot.js?v=1.1.0"></script>
-    <script type="module" src="/app.js?v=1.1.0"></script>
+    <script src="/version-boot.js?v=1.1.21"></script>
+    <script type="module" src="/app.js?v=1.1.21"></script>
   </body>
 </html>

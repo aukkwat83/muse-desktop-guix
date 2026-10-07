@@ -111,6 +111,8 @@ const PAIRS = [
   ['body text on page', '--ink', '--bg'],
   ['body text on panel', '--ink', '--panel'],
   ['body text on raised', '--ink', '--raised'],
+  // Table headers sit straight on the panel-2 chrome bar.
+  ['body text on panel-2', '--ink', '--panel-2'],
   ['secondary text on panel', '--ink-dim', '--panel'],
   ['secondary text on page', '--ink-dim', '--bg'],
   ['muted on panel', '--muted', '--panel'],
@@ -126,6 +128,8 @@ const PAIRS = [
   ['selected text on page', '--ink', '--accent-soft', '--bg'],
   ['accent type on page', '--accent-text', '--bg'],
   ['accent type on panel', '--accent-text', '--panel'],
+  // Goal % and mode pills live on panel-2 chips.
+  ['accent type on panel-2', '--accent-text', '--panel-2'],
   ['accent type on active row', '--accent-text', '--accent-soft', '--panel'],
   ['glyph on accent fill', '--accent-ink', '--accent'],
   ['label on danger fill', '--on-danger', '--danger'],
@@ -135,6 +139,10 @@ const PAIRS = [
   // The copied flash on the code-block chrome button sits on the panel-2 bar.
   ['success text on panel-2', '--ok', '--panel-2'],
   ['danger text on panel', '--danger', '--panel'],
+  // Level pills (usage/context) put warn/danger type on panel-2 chips —
+  // claude-light warn sat at 4.17 here until #7d5f24.
+  ['warn text on panel-2', '--warn', '--panel-2'],
+  ['danger text on panel-2', '--danger', '--panel-2'],
   ['warn text on page', '--warn', '--bg'],
   // Placeholders are not text nodes — a DOM walk that only reads text misses
   // them entirely, and they must be measured against the input, not the page.

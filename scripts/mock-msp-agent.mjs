@@ -17,12 +17,26 @@
 //   long     → 60 chunks then an authoritative completed object
 //   mixorder → text, tool row, thought, text (frame-order assertion)
 //   histfail → first turn fails session-not-found (rotation), then normal
+//   auditfail → first turn fails MCP-audit-failed (rotation, session kept), then normal
 //   boom     → turn fails with a synthetic error
 //   kids     → subagent lifecycle + workflow fold (panel e2e; session/read drillable)
+//   kidshold → a child that stays inProgress until subagent/stop (command e2e)
+//   nativespawn → native children via subagent_spawn/wait toolCalls whose
+//     outputs arrive as visibleOutput with NO deltas (instant tools, as the
+//     real binary emits them) — alpha completes, beta stays running
+//   reminders → system reminderChild items shaped like the real wire
+//     (reminderAgentId + generationId + v4 childSessionId)
+//
+// Owner verbs (SS3.16) for the command e2e: subagent/stop|resume|sendMessage.
+// Each validates the wire contract (UUIDv7 commandId, parent sessionId,
+// known subagentId, non-empty send body), appends one JSON line to
+// MOCK_MSP_SUBAGENT_LOG, and emits the resulting item frames.
 //   mcptool  → one mcp__github.* tool call (usage-learning e2e)
 //   goal     → session/goalChanged set (45% running); ungoal → goal:null clear
 //   ctxusage → session/contextUsage + session/tokenUsage pair
 //   quota    → usage/changed broadcast (usage/read answers the same shape)
+//   topic    → two tool_calls: one with a human description (topic title),
+//     one path-only (basename fallback title)
 //
 // Modes (MOCK_MSP_MODE, set per host process by the e2e):
 //   normal   → everything above
@@ -38,7 +52,10 @@ const LOG = process.env.MOCK_MSP_CONFIG_LOG || '';
 const DECIDE_LOG = process.env.MOCK_MSP_DECIDE_LOG || '';
 const ID_FILE = process.env.MOCK_MSP_ID_FILE || '';
 const MARKER = process.env.MOCK_MSP_HISTFAIL_MARKER || '';
+const AUDITFAIL_MARKER = process.env.MOCK_MSP_AUDITFAIL_MARKER || '';
 const PROMPT_LOG = process.env.MOCK_MSP_PROMPT_LOG || '';
+const SESSION_LOG = process.env.MOCK_MSP_SESSION_LOG || '';
+const SUBAGENT_LOG = process.env.MOCK_MSP_SUBAGENT_LOG || '';
 
 const MODEL = process.env.MUSE_DESKTOP_MODEL || 'mock-model-1';
 const EFFORT = process.env.MUSE_DESKTOP_EFFORT || 'max';
@@ -49,8 +66,15 @@ try {
 } catch { /* first agent in this e2e — counter starts at 0 */ }
 sidCounter += 1;
 try { fs.writeFileSync(ID_FILE, String(sidCounter)); } catch { /* ignore */ }
-const SESSION_ID = `mock-session-${sidCounter}`;
+// let, not const: session/resume ADOPTS the requested id, like the real
+// binary resumes the same session — a fresh boot that kept minting would
+// fork the host's id from the agent's, and every sessionId-scoped verb
+// (subagent/*) would 502 after a rotation (the host correctly keeps the
+// requested id; BUG-082 pins the stored id untouched).
+let SESSION_ID = `mock-session-${sidCounter}`;
 let turnCounter = 0;
+/** Goal block the goal/* verbs mutate (null until a goal turn sets it). */
+let MOCK_GOAL = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function send(obj) {
@@ -79,6 +103,18 @@ function replyError(id, code, message, data) {
 const waiters = new Map();
 // cancelled turnIds (turn/interrupt) — the script checks between steps.
 const cancelled = new Set();
+// BUG-084 wedge emulation: prompts the agent holds but never announced over
+// the wire (served via approval/listPending only), and ids whose cancel the
+// agent ignores (served pending forever, until turn/interrupt).
+const ghostPending = new Map();
+const ignoreCancel = new Set();
+// subagentId → itemId for every child the scripts can spawn. Owner verbs
+// reject anything outside this map, like the real host rejects a child id
+// it never minted.
+const KNOWN_CHILDREN = new Map([
+  ['mock-sub-1', 'sub-1'],
+  ['mock-sub-hold', 'sub-hold'],
+]);
 
 const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
 rl.on('line', (line) => {
@@ -123,23 +159,76 @@ async function handle(msg) {
         replyError(id, -32001, 'not logged in: run muse login');
         return;
       }
+      if (SESSION_LOG) {
+        try { fs.appendFileSync(SESSION_LOG, `${JSON.stringify({ verb: 'start', minted: SESSION_ID })}\n`); } catch { /* ignore */ }
+      }
       reply(id, { session: sessionObject(), viewCursor: 'mock-cursor-0' });
       notify('session/started', { session: sessionObject() });
       return;
     }
-    case 'session/resume':
+    case 'session/resume': {
+      if (SESSION_LOG) {
+        try { fs.appendFileSync(SESSION_LOG, `${JSON.stringify({ verb: 'resume', requested: String(params?.sessionId || ''), minted: SESSION_ID })}\n`); } catch { /* ignore */ }
+      }
+      // Adopt-then-reply: the log keeps the boot-minted id (BUG-082 asserts
+      // the retry runs on a fresh PROCESS), while the session from here on
+      // answers to the resumed id, exactly like the real binary.
+      if (String(params?.sessionId || '')) SESSION_ID = String(params.sessionId);
       reply(id, { session: sessionObject(), viewCursor: 'mock-cursor-0', history: { mode: 'none' } });
       return;
+    }
     case 'usage/read': {
       reply(id, { usage: mockUsage() });
       return;
     }
     case 'session/read': {
       // Drill-down fixture: mock-child-1 nests one deeper, everything else
-      // is a leaf. Unknown ids read as empty history (mode none).
+      // is a leaf. Unknown ids read as empty history (mode none) — except
+      // mock-gone-*, which fail like a pruned child session, and the live
+      // parent session itself, which carries one historical spawn+wait pair
+      // for the boot backfill to recover.
       const sid = String(params?.sessionId || '');
+      if (sid.startsWith('mock-gone-')) {
+        replyError(id, -32000, `session ${sid} was not found: {"kind":"sessionNotFound","retryable":false,"sessionId":"${sid}"}`);
+        return;
+      }
+      if (sid === SESSION_ID) {
+        reply(id, {
+          session: sessionObject(),
+          history: { mode: 'inline', items: [
+            {
+              itemId: 'hist-spawn-old', kind: 'toolCall', status: 'completed', tool: 'subagent_spawn',
+              callId: 'call-hist-spawn-old', turnId: 'mock-turn-0', revision: 2,
+              args: JSON.stringify({ command_id: 'mock-cmd-old', objective: 'answer old', role: 'research', task_name: 'old-probe' }),
+              visibleOutput: JSON.stringify({ status: 'accepted', subagent_id: 'mock-nat-old', agent_path: 'main/old-probe/1', task_ref: 'task/mock#0' }),
+            },
+            {
+              itemId: 'hist-wait-old', kind: 'toolCall', status: 'completed', tool: 'subagent_wait',
+              callId: 'call-hist-wait-old', turnId: 'mock-turn-0', revision: 2,
+              args: JSON.stringify({ subagent_id: 'mock-nat-old', timeout_ms: 30000 }),
+              visibleOutput: JSON.stringify({ status: 'ready', subagent_id: 'mock-nat-old', summary: 'old did it', evidence_refs: [] }),
+            },
+          ] },
+        });
+        return;
+      }
       const leaf = sid === 'mock-child-1-1';
-      const items = sid === 'mock-child-1' ? [
+      const held = sid === 'mock-child-hold';
+      const rem = sid.startsWith('mock-rem-');
+      // Wire-true: a real reminder child calls submit_reminder_decision once
+      // with {decision, reason} — the host folds it as the row's topic line.
+      const remDecision = sid === 'mock-rem-2'
+        ? { decision: 'none', reason: 'no skill gap this turn' }
+        : { decision: 'remind', reason: 'memory: capture the Redis choice' };
+      const items = rem ? [
+        { itemId: 'rem-msg-1', kind: 'agentMessage', status: 'completed', text: 'reminder noted. ' },
+        {
+          itemId: 'rem-dec-1', kind: 'toolCall', status: 'completed', tool: 'submit_reminder_decision',
+          args: JSON.stringify(remDecision), fallbackText: remDecision.decision,
+        },
+      ] : held ? [
+        { itemId: 'h-msg-1', kind: 'agentMessage', status: 'completed', text: 'holding. ' },
+      ] : sid === 'mock-child-1' ? [
         { itemId: 'c-user-1', kind: 'userMessage', status: 'completed', text: 'research the cache options' },
         { itemId: 'c-msg-1', kind: 'agentMessage', status: 'completed', text: 'Redis wins on latency. ' },
         { itemId: 'c-tool-1', kind: 'toolCall', status: 'completed', tool: 'mcp__github.search_repositories', args: '{}', fallbackText: '3 repos' },
@@ -201,6 +290,7 @@ async function handle(msg) {
     case 'userInput/answer': {
       if (DECIDE_LOG) fs.appendFileSync(DECIDE_LOG, `${JSON.stringify(params)}\n`);
       reply(id, {});
+      ghostPending.delete(params?.userInputId);
       const w = waiters.get(params?.userInputId);
       if (w) {
         waiters.delete(params.userInputId);
@@ -209,10 +299,126 @@ async function handle(msg) {
       notify('userInput/settled', { sessionId: SESSION_ID, userInputId: params?.userInputId });
       return;
     }
-    case 'userInput/cancel':
+    case 'userInput/cancel': {
       if (DECIDE_LOG) fs.appendFileSync(DECIDE_LOG, `cancel ${JSON.stringify(params)}\n`);
+      // Binary-true: 1.4.2 rejects a reason-less cancel (`missing field
+      // 'reason'`) even though the schema marks it optional — the actual
+      // f381a7e1 wedge. The mock enforces it so the e2e fails if the
+      // client ever drops the field again.
+      if (typeof params?.reason !== 'string' || !params.reason.trim()) {
+        replyError(id, -32602, 'Invalid params: missing field `reason`');
+        return;
+      }
       reply(id, {});
+      // Wire-true (schema: the tool call resolves with a cancelled result),
+      // except ids flagged to emulate an agent that ignores the cancel.
+      if (ignoreCancel.has(params?.userInputId)) return;
+      ghostPending.delete(params?.userInputId);
+      const w = waiters.get(params?.userInputId);
+      if (w) {
+        waiters.delete(params.userInputId);
+        w.resolve({ cancelled: true });
+      }
+      notify('userInput/settled', { sessionId: SESSION_ID, userInputId: params?.userInputId });
       return;
+    }
+    case 'approval/listPending':
+      // The pull dual of the push frames: full request params per pending
+      // prompt, exactly like the binary serves them.
+      reply(id, { approvals: [], userInputs: [...ghostPending.values()] });
+      return;
+    case 'goal/pause':
+    case 'goal/resume': {
+      // Real-binary contract (probed 2026-09-22): accepted ack + a
+      // session/goalChanged carrying the new status; the host repaints from
+      // the event, never from this reply.
+      const status = method === 'goal/pause' ? 'paused' : 'active';
+      MOCK_GOAL = {
+        ...(MOCK_GOAL || {
+          objective: 'Ship the tasks panel',
+          percentComplete: 45,
+          currentWork: 'wiring the goal chip',
+          nextWork: 'e2e for the panel',
+        }),
+        status,
+      };
+      reply(id, { commandId: params?.commandId, status: 'accepted' });
+      notify('session/goalChanged', { sessionId: SESSION_ID, goal: { ...MOCK_GOAL } });
+      return;
+    }
+    case 'subagent/stop':
+    case 'subagent/resume':
+    case 'subagent/sendMessage': {
+      // Wire-trueness the e2e asserts on: the real host rejects a
+      // non-UUIDv7 commandId with -32602 (AGENTS.md), and every verb
+      // addresses the child through its PARENT session id.
+      const UUIDV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+      if (!UUIDV7.test(String(params?.commandId || ''))) {
+        replyError(id, -32602, 'Invalid params: commandId must be UUIDv7');
+        return;
+      }
+      if (String(params?.sessionId || '') !== SESSION_ID) {
+        replyError(id, -32000, `unknown session ${params?.sessionId}`);
+        return;
+      }
+      const itemId = KNOWN_CHILDREN.get(String(params?.subagentId || ''));
+      if (!itemId) {
+        replyError(id, -32000, `unknown subagent ${params?.subagentId}`);
+        return;
+      }
+      if (method === 'subagent/sendMessage' && !String(params?.body ?? '').trim()) {
+        replyError(id, -32602, 'Invalid params: body must be non-empty');
+        return;
+      }
+      if (SUBAGENT_LOG) {
+        try {
+          fs.appendFileSync(SUBAGENT_LOG, `${JSON.stringify({
+            method,
+            sessionId: params.sessionId,
+            subagentId: params.subagentId,
+            commandId: params.commandId,
+            ...(params.body != null ? { body: params.body } : {}),
+            ...(params.reason != null ? { reason: params.reason } : {}),
+          })}\n`);
+        } catch { /* ignore */ }
+      }
+      reply(id, { commandId: params.commandId, status: 'accepted' });
+      const turnId = `mock-turn-${turnCounter}`;
+      if (method === 'subagent/stop') {
+        // A held script owns its own terminal frame (cancelled + turn
+        // settle); anything else just folds closed — idempotent ack.
+        const w = waiters.get(`hold:${params.subagentId}`);
+        if (w) {
+          waiters.delete(`hold:${params.subagentId}`);
+          w.resolve({ stopped: true });
+        } else {
+          turnNotify(turnId, 'item/updated', {
+            item: { itemId, kind: 'subagent', status: 'completed', subagentId: params.subagentId, controlStatus: 'closed' },
+          });
+        }
+      } else if (method === 'subagent/resume') {
+        // Re-run then land: the e2e asserts the inProgress frame AND the
+        // new terminal summary, so a dropped intermediate cannot hide.
+        turnNotify(turnId, 'item/started', {
+          item: {
+            itemId, kind: 'subagent', status: 'inProgress', subagentId: params.subagentId,
+            agentPath: 'researcher', depth: 1, controlStatus: 'running', childSessionId: 'mock-child-1',
+          },
+        });
+        await sleep(60);
+        turnNotify(turnId, 'item/completed', {
+          item: {
+            itemId, kind: 'subagent', status: 'completed', subagentId: params.subagentId,
+            agentPath: 'researcher', depth: 1, durationMs: 4100, controlStatus: 'closed',
+            childSessionId: 'mock-child-1',
+            result: { artifactRefs: [], evidenceRefs: [], summary: 'resumed done' },
+          },
+        });
+      }
+      // sendMessage is ack-only: the real binary does not echo the note
+      // back as an item frame, so neither do we.
+      return;
+    }
     case 'turn/interrupt':
       if (params?.turnId) cancelled.add(String(params.turnId));
       // Unpark any script awaiting a decision — it checks cancelled next.
@@ -262,8 +468,12 @@ function completeTurn(turnId, terminal = 'completed', extra = {}) {
 }
 
 async function runTurn(turnId, text) {
-  turnNotify(turnId, 'turn/started', {});
   const t = text.toLowerCase();
+  if (t.includes('stay-deaf')) {
+    return; // accept the ack, emit nothing — not even turn/started. The
+    // deaf-client watchdog owns this turn (BUG-080).
+  }
+  turnNotify(turnId, 'turn/started', {});
 
   if (t.includes('boom')) {
     await sleep(30);
@@ -281,6 +491,24 @@ async function runTurn(turnId, text) {
       return;
     }
     if (await emitAgentText('m-hist', ['สวัสดีจาก mock agent '], 'สวัสดีจาก mock agent (final)', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('auditfail')) {
+    // BUG-082: first turn dies with the verbatim production reason, the
+    // retry on a fresh agent succeeds. Separate marker from histfail so
+    // the two rotation e2es stay independent.
+    let seen = false;
+    try { seen = fs.existsSync(AUDITFAIL_MARKER); } catch { /* ignore */ }
+    if (!seen) {
+      try { fs.writeFileSync(AUDITFAIL_MARKER, '1'); } catch { /* ignore */ }
+      await sleep(30);
+      completeTurn(turnId, 'failed', { reason: 'invalid run configuration: MCP startup audit failed; MCP is disabled for this runtime' });
+      return;
+    }
+    if (await emitAgentText('m-audit', ['สวัสดีจาก mock agent '], 'สวัสดีจาก mock agent (audit-retry final)', turnId)) {
       completeTurn(turnId);
     }
     return;
@@ -469,6 +697,56 @@ async function runTurn(turnId, text) {
     return;
   }
 
+  if (t.includes('ghostquiz')) {
+    // BUG-084: the wedge — a multi-question prompt the agent holds but never
+    // announces (no userInput/request, no userInput/requested). The client's
+    // only rescue is the listPending recovery poll, whose auto-cancel must
+    // unblock this waiter; the turn then completes normally.
+    const userInputId = `mock-ghost-${turnId}`;
+    ghostPending.set(userInputId, {
+      sessionId: SESSION_ID,
+      userInputId,
+      toolName: 'AskUserQuestion',
+      toolCallId: 'mock-tool-ghost',
+      turnId,
+      questions: [
+        { id: 'g1', question: 'Ghost first?', header: 'Ghost1', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
+        { id: 'g2', question: 'Ghost second?', header: 'Ghost2', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
+      ],
+    });
+    await new Promise((resolve) => waiters.set(userInputId, { resolve }));
+    ghostPending.delete(userInputId);
+    if (cancelled.has(turnId)) return;
+    if (await emitAgentText('m-ghost', ['Recovered without an answer. '], 'Recovered without an answer.', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('stubbornquiz')) {
+    // BUG-084 escalation: like ghostquiz, but the agent ignores the cancel
+    // (stays pending) — the client must interrupt the run and settle loud.
+    // The interrupt unparks the waiter; the script then stays silent because
+    // the client already settled the turn itself.
+    const userInputId = `mock-stubborn-${turnId}`;
+    ignoreCancel.add(userInputId);
+    ghostPending.set(userInputId, {
+      sessionId: SESSION_ID,
+      userInputId,
+      toolName: 'AskUserQuestion',
+      toolCallId: 'mock-tool-stubborn',
+      turnId,
+      questions: [
+        { id: 's1', question: 'Stubborn first?', header: 'Stub1', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
+        { id: 's2', question: 'Stubborn second?', header: 'Stub2', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
+      ],
+    });
+    await new Promise((resolve) => waiters.set(userInputId, { resolve }));
+    ghostPending.delete(userInputId);
+    ignoreCancel.delete(userInputId);
+    return; // interrupted (or released) — the client owns the terminal event
+  }
+
   if (t.includes('quiz')) {
     const userInputId = `mock-quiz-${turnId}`;
     const params = {
@@ -499,12 +777,17 @@ async function runTurn(turnId, text) {
   }
 
   if (t.includes('plan') && !t.includes('explain')) {
+    // Wire-true TodoItem shape: { text, status: camelCase, activeForm? } —
+    // the host normalizes onto its snake_case plan vocabulary.
     notify('session/todoListChanged', {
       sessionId: SESSION_ID,
+      revision: 7,
+      sourceTool: 'TodoWrite',
+      viewCursor: 'mock-cursor-todo-7',
       items: [
-        { content: 'Set up scaffolding', status: 'pending' },
-        { content: 'Wire the mock provider', status: 'in_progress' },
-        { content: 'Ship it', status: 'completed' },
+        { text: 'Set up scaffolding', status: 'pending' },
+        { text: 'Wire the mock provider', status: 'inProgress', activeForm: 'Wiring the mock provider' },
+        { text: 'Ship it', status: 'completed' },
       ],
     });
     await sleep(30);
@@ -530,6 +813,121 @@ async function runTurn(turnId, text) {
     });
     await sleep(20);
     if (await emitAgentText('m-edit', ['I updated the config file. '], 'I updated the config file. ', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('kidshold')) {
+    // BEFORE the plain `kids` branch: "kidshold" contains "kids".
+    // The child stays inProgress until subagent/stop resolves the waiter —
+    // the owner-verb round-trip the command e2e drives mid-turn.
+    turnNotify(turnId, 'item/started', {
+      item: msgItem('sub-hold', 'subagent', {
+        subagentId: 'mock-sub-hold', agentPath: 'holder', role: 'hold',
+        objective: 'hold until stopped', depth: 1, controlStatus: 'running',
+        childSessionId: 'mock-child-hold',
+      }),
+    });
+    await sleep(20);
+    turnNotify(turnId, 'item/delta', { itemId: 'sub-hold', delta: 'holding-for-stop ' });
+    await new Promise((resolve) => waiters.set('hold:mock-sub-hold', { resolve }));
+    if (cancelled.has(turnId)) return;
+    turnNotify(turnId, 'item/completed', {
+      item: {
+        itemId: 'sub-hold', kind: 'subagent', status: 'cancelled', subagentId: 'mock-sub-hold',
+        agentPath: 'holder', depth: 1, durationMs: 1200, controlStatus: 'closed',
+        childSessionId: 'mock-child-hold',
+        result: { artifactRefs: [], evidenceRefs: [], summary: 'stopped by owner' },
+      },
+    });
+    await sleep(20);
+    if (await emitAgentText('m-hold', ['Held child stopped. '], 'Held child stopped. ', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('nativespawn')) {
+    // Native parallel children, wire-true to the real binary: plain toolCalls
+    // whose outputs arrive ONLY as visibleOutput on the completed item (no
+    // deltas — instant tools). Alpha runs to ready; beta is still working
+    // when the turn lands, so the rail shows one of each state.
+    const spawnArgs = (task, objective) => JSON.stringify({
+      command_id: 'mock-cmd-1', objective, role: 'research', task_name: task,
+    });
+    const spawnOut = (id, task) => JSON.stringify({
+      status: 'accepted', subagent_id: id, agent_path: `main/${task}/1`, task_ref: `task/mock#1`,
+    });
+    const natStarted = (id, tool, args) => turnNotify(turnId, 'item/started', {
+      item: {
+        itemId: id, kind: 'toolCall', status: 'inProgress', tool, callId: `call-${id}`,
+        args, turnId, revision: 1,
+      },
+    });
+    const natDone = (id, tool, args, out) => turnNotify(turnId, 'item/completed', {
+      item: {
+        itemId: id, kind: 'toolCall', status: 'completed', tool, callId: `call-${id}`,
+        args, turnId, revision: 2, visibleOutput: out,
+      },
+    });
+    natStarted('nt-spawn-a', 'subagent_spawn', spawnArgs('alpha-probe', 'answer alpha'));
+    await sleep(20);
+    natDone('nt-spawn-a', 'subagent_spawn', spawnArgs('alpha-probe', 'answer alpha'),
+      spawnOut('mock-nat-alpha', 'alpha-probe'));
+    natStarted('nt-wait-a', 'subagent_wait', JSON.stringify({ subagent_id: 'mock-nat-alpha', timeout_ms: 30000 }));
+    await sleep(20);
+    natDone('nt-wait-a', 'subagent_wait', JSON.stringify({ subagent_id: 'mock-nat-alpha', timeout_ms: 30000 }),
+      JSON.stringify({
+        status: 'ready', subagent_id: 'mock-nat-alpha', task_ref: 'task/mock#1',
+        summary: 'alpha did the thing',
+        evidence_refs: ['subagent/mock-nat-alpha/session.jsonl'],
+      }));
+    natStarted('nt-spawn-b', 'subagent_spawn', spawnArgs('beta-probe', 'answer beta'));
+    await sleep(20);
+    natDone('nt-spawn-b', 'subagent_spawn', spawnArgs('beta-probe', 'answer beta'),
+      spawnOut('mock-nat-beta', 'beta-probe'));
+    await sleep(20);
+    if (await emitAgentText('m-nat', ['Native children spawned. '], 'Native children spawned. ', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('reminders')) {
+    // System reminder children, shaped exactly like the production wire:
+    // reminderAgentId + generationId + a v4 childSessionId, no role/objective.
+    turnNotify(turnId, 'item/started', {
+      item: msgItem('rem-1', 'reminderChild', {
+        childSessionId: 'mock-rem-1', generationId: 3, reminderAgentId: 'memory-reminder',
+        taskId: 'mock-task-1', fallbackText: 'Reminder child session',
+      }),
+    });
+    await sleep(20);
+    turnNotify(turnId, 'item/completed', {
+      item: {
+        itemId: 'rem-1', kind: 'reminderChild', status: 'completed', childSessionId: 'mock-rem-1',
+        generationId: 3, reminderAgentId: 'memory-reminder', taskId: 'mock-task-1',
+        fallbackText: 'Reminder child session',
+      },
+    });
+    turnNotify(turnId, 'item/started', {
+      item: msgItem('rem-2', 'reminderChild', {
+        childSessionId: 'mock-rem-2', generationId: 1, reminderAgentId: 'skill-reminder',
+        taskId: 'mock-task-2', fallbackText: 'Reminder child session',
+      }),
+    });
+    // rem-3's session is already pruned server-side — the drill must fall
+    // back to the record detail instead of a bare error page.
+    turnNotify(turnId, 'item/completed', {
+      item: {
+        itemId: 'rem-3', kind: 'reminderChild', status: 'cancelled', childSessionId: 'mock-gone-1',
+        generationId: 2, reminderAgentId: 'todo-reminder', taskId: 'mock-task-3',
+        fallbackText: 'Reminder child session',
+      },
+    });
+    await sleep(20);
+    if (await emitAgentText('m-rem', ['Reminders observed. '], 'Reminders observed. ', turnId)) {
       completeTurn(turnId);
     }
     return;
@@ -625,18 +1023,50 @@ async function runTurn(turnId, text) {
   }
 
   if (t.includes('goal')) {
+    // The real binary reports status:'active' here (probed 2026-09-22).
+    MOCK_GOAL = {
+      objective: 'Ship the tasks panel',
+      percentComplete: 45,
+      status: 'active',
+      currentWork: 'wiring the goal chip',
+      nextWork: 'e2e for the panel',
+    };
     notify('session/goalChanged', {
       sessionId: SESSION_ID,
-      goal: {
-        objective: 'Ship the tasks panel',
-        percentComplete: 45,
-        status: 'running',
-        currentWork: 'wiring the goal chip',
-        nextWork: 'e2e for the panel',
-      },
+      goal: { ...MOCK_GOAL },
     });
     await sleep(20);
     if (await emitAgentText('m-goal', ['Goal set. '], 'Goal set. ', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('topic')) {
+    // Topic-title probe (1.1.19): the first call carries a human
+    // description (the row must name THAT, not the command); the second is
+    // path-only (the row must name the basename, not the deep path).
+    turnNotify(turnId, 'item/started', {
+      item: msgItem('tc-topic-1', 'toolCall', { tool: 'Bash', args: '{"command":"ls /tmp/mock","description":"ตรวจไฟล์ชั่วคราว"}' }),
+    });
+    await sleep(30);
+    if (cancelled.has(turnId)) return;
+    turnNotify(turnId, 'item/delta', { itemId: 'tc-topic-1', field: 'output', delta: 'mock-file.txt\n' });
+    turnNotify(turnId, 'item/completed', {
+      item: { itemId: 'tc-topic-1', kind: 'toolCall', status: 'completed', tool: 'Bash', args: '{"command":"ls /tmp/mock","description":"ตรวจไฟล์ชั่วคราว"}', fallbackText: 'mock-file.txt\n' },
+    });
+    await sleep(20);
+    if (cancelled.has(turnId)) return;
+    turnNotify(turnId, 'item/started', {
+      item: msgItem('tc-topic-2', 'toolCall', { tool: 'Read', args: '{"file_path":"src/deeply/nested/auth.js"}' }),
+    });
+    await sleep(30);
+    if (cancelled.has(turnId)) return;
+    turnNotify(turnId, 'item/completed', {
+      item: { itemId: 'tc-topic-2', kind: 'toolCall', status: 'completed', tool: 'Read', args: '{"file_path":"src/deeply/nested/auth.js"}', fallbackText: 'file contents' },
+    });
+    await sleep(20);
+    if (await emitAgentText('m-topic', ['Topics titled. '], 'Topics titled. ', turnId)) {
       completeTurn(turnId);
     }
     return;

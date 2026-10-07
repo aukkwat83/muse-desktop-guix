@@ -3,7 +3,7 @@
 // (teams-format.js:546-566). grok's Teams/HTML variant is grok-specific and
 // deliberately not ported. Pure — unit-testable in Node.
 
-import { toolStatusLabel } from './turn-view.js?v=0.4.16';
+import { toolStatusLabel, toolTopic } from './turn-view.js?v=0.4.23';
 
 /** A fence that can hold `text` even when it contains backtick runs. */
 function fenceFor(text) {
@@ -42,7 +42,7 @@ export function chatToMarkdown(chat) {
 
     bits.push('## คำตอบ');
     for (const tool of msg.meta?.toolCalls || []) {
-      const name = String(tool.title || tool.kind || 'tool');
+      const name = String(toolTopic(tool) || tool.kind || 'tool');
       bits.push(`**🔧 ${name} — ${toolStatusLabel(tool.status)}**`, '');
       const out = String(tool.output ?? '');
       if (out) {

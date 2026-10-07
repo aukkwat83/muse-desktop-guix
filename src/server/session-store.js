@@ -17,6 +17,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { cutEllipsis } from './text.js';
 
 export function stateDir() {
   const base =
@@ -173,12 +174,19 @@ export class SessionStore {
     return id;
   }
 
-  createGroup({ name } = {}) {
+  createGroup({ name, position = 'top' } = {}) {
     const group = makeGroup(
       String(name || '').trim() || `Group ${this.data.groups.length + 1}`,
-      this.data.groups.length,
+      0,
     );
-    this.data.groups.push(group);
+    // The sidebar has two creation affordances and each lands where it sits:
+    // the header ▤ button drafts at the top and lands on TOP (the default —
+    // the thing just created is what the user is about to use); the bottom
+    // "＋ group" tab drafts at the bottom and lands at the BOTTOM.
+    // Either way renumber() keeps `order` dense from the array's current
+    // sequence (never re-sort here).
+    if (position === 'bottom') this.data.groups.push(group);
+    else this.data.groups.unshift(group);
     this.renumber();
     this.flushNow();
     this._emit('group', { group });
@@ -291,7 +299,11 @@ export class SessionStore {
   update(id, patch) {
     const chat = this.get(id);
     if (!chat) return null;
-    Object.assign(chat, patch, { updatedAt: Date.now() });
+    // Metadata only — never bumps updatedAt. Queue order is conversation
+    // activity (a prompt sent, a run settled), so a mode flip, a model pick,
+    // or an agent spawn/rotation id landing must not reshuffle the sidebar.
+    // Only addMessage/setAssistantMessage move a chat to the top.
+    Object.assign(chat, patch);
     // `mspSessionId` is the one field a restart cannot guess — never debounce it.
     if (Object.prototype.hasOwnProperty.call(patch, 'mspSessionId')) this.flushNow();
     else this.persistSoon();
@@ -352,6 +364,46 @@ export class SessionStore {
     // Positional msg: indexes shifted — the indexer re-sources this chat.
     this._emit('trim', { chatId: id });
   }
+
+  /**
+   * Persist the chat's subagent registry mirror (sanitized records, no
+   * liveText). Metadata-only like update(): never bumps updatedAt, so a
+   * child finishing does not reshuffle sidebar queue order. Debounced —
+   * losing the newest record to a crash only hides one rail row until the
+   * next turn, unlike mspSessionId which would strand the resume path.
+   * Deliberately emits nothing: the FTS indexer has no subagent shape, and
+   * drill content lives in the agent's own session logs.
+   */
+  saveSubagents(id, records) {
+    const chat = this.get(id);
+    if (!chat) return null;
+    chat.subagents = normalizeSubagents(records);
+    this.persistSoon();
+    return chat.subagents;
+  }
+}
+
+/** Cap per chat — the rail lists newest-first, the tail is unreachable. */
+export const SUBAGENT_STORE_CAP = 50;
+
+/**
+ * Validate stored subagent records on the way in (disk → memory and
+ * memory → disk share this one shape). Malformed entries are dropped, never
+ * repaired: a half-parsed child row is worse than a missing one.
+ */
+export function normalizeSubagents(records) {
+  if (!Array.isArray(records)) return [];
+  const out = [];
+  for (const r of records) {
+    if (!r || typeof r !== 'object') continue;
+    if (typeof r.itemId !== 'string' || !r.itemId) continue;
+    if (typeof r.kind !== 'string' || !r.kind) continue;
+    const rec = { ...r, itemId: r.itemId, kind: r.kind };
+    // liveText is a streaming buffer, not state — it never touches disk.
+    delete rec.liveText;
+    out.push(rec);
+  }
+  return out.slice(0, SUBAGENT_STORE_CAP);
 }
 
 function makeGroup(name, order) {
@@ -379,6 +431,7 @@ function normalizeChat(raw) {
     mspSessionId: raw.mspSessionId ?? null,
     createdAt: Number(raw.createdAt) || Date.now(),
     updatedAt: Number(raw.updatedAt) || Date.now(),
+    subagents: normalizeSubagents(raw.subagents),
     messages: Array.isArray(raw.messages)
       ? raw.messages.map((m) => ({
           id: String(m.id || randomUUID()),
@@ -397,6 +450,5 @@ export function deriveTitle(text) {
     .replace(/\s+/g, ' ')
     .trim();
   if (!flat) return 'New chat';
-  const cut = flat.slice(0, 60);
-  return cut.length < flat.length ? `${cut}…` : cut;
+  return cutEllipsis(flat, 60);
 }

@@ -266,3 +266,49 @@ export function mspUserInputCard(params = {}) {
       .map((label) => ({ optionId: label, name: label, kind: 'allow_once' })),
   };
 }
+
+/**
+ * Sort a point-in-time `approval/listPending` userInputs snapshot into what
+ * the recovery poll must do (BUG-084): chat f381a7e1 held a multi-question
+ * prompt for 2h with no card and no trace — its auto-cancel was rejected
+ * (`missing field 'reason'`) and swallowed silently — so the watchdog
+ * re-reads pending prompts and acts: mount what the card UI can answer,
+ * cancel what it cannot, and escalate what we already cancelled but the
+ * agent still holds past grace.
+ *
+ * Pure: `pending` is the raw userInputs array, `knownIds` the mounted card
+ * ids, `cancelledAt` id → cancel-timestamp ms. Repeats and id-less entries
+ * are dropped. A mounted card is the human's to answer — never re-driven.
+ */
+export function classifyPendingUserInputs({
+  pending = [],
+  knownIds = new Set(),
+  cancelledAt = new Map(),
+  now = Date.now(),
+  graceMs = 30_000,
+} = {}) {
+  const mount = [];
+  const cancel = [];
+  const escalate = [];
+  const seen = new Set();
+  for (const p of pending) {
+    const id = String(p?.userInputId || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    if (knownIds.has(id)) continue;
+    const cancelledTs = cancelledAt.get(id);
+    if (cancelledTs != null) {
+      if (now - cancelledTs >= graceMs) {
+        escalate.push({
+          userInputId: id,
+          waitedMs: now - cancelledTs,
+          questions: Array.isArray(p?.questions) ? p.questions : [],
+        });
+      }
+      continue;
+    }
+    if (mspUserInputCard(p)) mount.push(p);
+    else cancel.push(p);
+  }
+  return { mount, cancel, escalate };
+}

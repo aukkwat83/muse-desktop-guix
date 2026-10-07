@@ -1,7 +1,7 @@
 {
   "name": "muse-desktop-guix",
   "productName": "Muse Desktop",
-  "version": "1.1.0",
+  "version": "1.1.21",
   "description": "Muse Desktop — native multi-session MSP client for Muse CLI (muse serve); macOS shell + Guix System GTK shell",
   "type": "module",
   "private": true,
@@ -28,7 +28,8 @@
     "test:mode": "node scripts/unit-test-session-mode.mjs",
     "test:msp": "node scripts/smoke-msp.mjs",
     "test:e2e": "node scripts/e2e-mock-agent.mjs",
-    "test:mac-app": "node scripts/test-mac-app.mjs"
+    "test:mac-app": "node scripts/test-mac-app.mjs",
+    "test:menutitle": "swift scripts/probe-menu-titles.swift"
   },
   "engines": {
     "node": ">=20"

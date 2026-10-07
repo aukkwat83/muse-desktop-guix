@@ -14,12 +14,13 @@
 
 import { renderMarkdown, installCodeCopyDelegation, copyTextToClipboard, paintMarkdownDiagrams, applyMermaidTheme, installDiagramDownloadDelegation } from './markdown.js?v=0.4.4';
 import { escapeHtml } from './markdown-core.js?v=0.4.1';
-import { Sidebar } from './sidebar.js?v=0.4.4';
+import { Sidebar } from './sidebar.js?v=0.4.6';
 import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
-import { closePopover, openMenu } from './popover.js?v=0.4.2';
+import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
+import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.4.2';
 import { createMcpPanel } from './mcp-panel.js?v=1.0.0';
-import { createSubagentsPanel } from './subagents-panel.js?v=1.0.0';
-import { createTasksPanel } from './tasks-panel.js?v=1.0.0';
+import { createRightbar, goalControlFor } from './rightbar.js?v=1.1.3';
+import { paintApTitle } from './ap-tags.js?v=1.0.0';
 import { formatCtxMeter } from './ctx-meter.js?v=1.0.0';
 import { computePin } from './scroll-pin.js?v=0.4.0';
 import { createComposerDraftStore } from './composer-draft.js?v=0.4.0';
@@ -27,7 +28,7 @@ import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.4.0';
 import { adaptiveHistoryDefaults, computeHistoryStartIndex, expandHistoryStartIndex, sliceHistoryMessages } from './history-window.js?v=0.4.0';
 import { parseSlashCommand } from './slash-commands.js?v=0.4.0';
 import { chatToMarkdown } from './transcript-markdown.js?v=0.4.0';
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, messageChildOrder, shouldAutoExpandTool, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from './turn-view.js?v=0.4.20';
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts } from './turn-view.js?v=0.4.23';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -41,6 +42,7 @@ const el = {
   agentsChip: $('#agents-chip'),
   tasksChip: $('#tasks-chip'),
   goalChip: $('#goal-chip'),
+  liveCluster: $('#live-cluster'),
   mcpBtn: $('#mcp-btn'),
   contextPill: $('#context-pill'),
   ctxBarFill: $('#ctx-bar-fill'),
@@ -64,6 +66,8 @@ const el = {
   promptQueueList: $('#prompt-queue-list'),
   newChat: $('#new-chat'),
   releaseAgent: $('#release-agent'),
+  rightbar: $('#rightbar'),
+  rightbarToggle: $('#rightbar-toggle'),
   themeToggle: $('#theme-toggle'),
   authGate: $('#auth-gate'),
   authLogin: $('#auth-login'),
@@ -164,12 +168,35 @@ function paintCtxPill() {
 function snapCtxLive(chatId, ctx, tokens) {
   const prev = wireCtx.get(chatId) || {};
   const tvLen = state.turnViews.get(chatId)?.text.length || 0;
-  wireCtx.set(chatId, {
+  const merged = {
     ctx: ctx ?? prev.ctx ?? null,
     tokens: tokens ?? prev.tokens ?? null,
     baseChars: tvLen,
-  });
+  };
+  wireCtx.set(chatId, merged);
   if (chatId === state.activeId) paintCtxPill();
+  rightbar.applyCtx(chatId, merged.tokens, costModelFor(chatId));
+}
+
+/** Live turn id for the rail's identity rows — null when no turn runs
+ * (a 'pending' placeholder is not a turn yet). */
+function liveTurnIdFor(chatId) {
+  const id = state.turnViews.get(chatId)?.turnId;
+  return id && id !== 'pending' ? id : null;
+}
+
+/** Best-known model id for the cost math: live advertised value first,
+ * then the chat's configured model. */
+function costModelFor(chatId) {
+  if (chatId === state.activeId) {
+    return (
+      state.chatConfig?.options?.model?.currentValue ??
+      state.chat?.model ??
+      state.chats.find((c) => c.id === chatId)?.model ??
+      null
+    );
+  }
+  return state.chats.find((c) => c.id === chatId)?.model ?? null;
 }
 
 /* Subscription usage pill (5h window + weekly): account-level, so one pill
@@ -309,8 +336,10 @@ function paintMcpButton(snap) {
 }
 
 const mcpPanel = createMcpPanel({ api, onSnapshot: paintMcpButton });
-const subagentsPanel = createSubagentsPanel({ api });
-const tasksPanel = createTasksPanel();
+// Right rail (Codex Desktop parity): cost · goal/tasks · subagents · SCB.
+// Hidden by default; the ☰ button and the head-bar chips open it. It replaces
+// the old floating subagents/tasks popovers — one rail, no stacked popups.
+const rightbar = createRightbar({ api, aside: el.rightbar, toggleBtn: el.rightbarToggle });
 
 // ------------------------------------------------------------ turn view
 
@@ -337,7 +366,7 @@ const sidebar = new Sidebar({
     selectGroup: (id) => void selectGroup(id),
     createChat: (groupId) => void newChat({ groupId }),
     deleteChat: (id) => void deleteChat(id),
-    createGroup: (name) => void createGroup(name),
+    createGroup: (name, position) => void createGroup(name, position),
     renameGroup: (id, name) => void renameGroup(id, name),
     deleteGroup: (id) => void deleteGroup(id),
     reorderGroups: (order) => void reorderGroups(order),
@@ -459,11 +488,33 @@ function messageNode(msg, index = null) {
   const wrap = stamp(document.createElement('div'));
   // Same order as the live paint (liveChildOrder) — a reload that reshuffles
   // tools/plan/answer reads as a visible jump right after turn_done (BUG-031).
+  // Tools + plan ride inside one collapsed progress group; the answer stays
+  // the visible content.
+  const histTools = msg.meta?.toolCalls || [];
+  const histPlan = msg.meta?.plan || [];
+  const histPlanDone = histPlan.filter((e) => String(e?.status || '') === 'completed').length;
+  let histPg = null;
+  const ensureHistPg = () => {
+    if (histPg) return histPg;
+    const pg = progressGroupNode(
+      progressLabel(histTools.length, 0, histPlan.length, histPlanDone),
+      false,
+      () => {
+        const collapsed = !pg.group.classList.contains('pg-collapsed');
+        pg.group.classList.toggle('pg-collapsed', collapsed);
+        pg.glyphEl.textContent = collapsed ? '▸' : '▾';
+      },
+    );
+    histPg = pg;
+    wrap.append(pg.group);
+    return pg;
+  };
   for (const key of messageChildOrder(msg)) {
     if (key === 'tools') {
-      for (const tool of msg.meta.toolCalls) wrap.append(toolNode(tool));
+      const pg = ensureHistPg();
+      for (const tool of histTools) pg.body.append(toolNode(tool));
     } else if (key === 'plan') {
-      wrap.append(planNode(msg.meta.plan));
+      ensureHistPg().body.append(planNode(histPlan));
     } else if (key === 'text') {
       const div = document.createElement('div');
       div.className = 'msg-assistant';
@@ -496,27 +547,55 @@ function toolNode(tool, existing = null, onUserToggle = null) {
   if (!existing) {
     row.className = 'tool-row collapsed';
     row.dataset.toolId = tool.id;
-    const head = document.createElement('button');
-    head.type = 'button';
+    // The head is a div, not a button: it holds TWO buttons (toggle +
+    // explain) and a <button> inside a <button> silently breaks clicks in
+    // WKWebView — the same trap the sidebar row comment warns about.
+    const head = document.createElement('div');
     head.className = 'tool-head';
-    head.innerHTML = '<span class="glyph">▸</span><span class="tool-spin" aria-hidden="true"></span><span class="name"></span><span class="sub"></span><span class="status"></span>';
-    head.addEventListener('click', () => {
-      setToolRowCollapsed(row, !row.classList.contains('collapsed'));
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'tool-toggle';
+    toggle.innerHTML = '<span class="glyph">▸</span><span class="name"></span><span class="sub"></span><span class="status"></span>';
+    toggle.title = 'แสดง/ซ่อน console ของ tool นี้';
+    const flip = () => {
+      const collapsed = !row.classList.contains('collapsed');
+      setToolRowCollapsed(row, collapsed);
       // A manual toggle mutes auto-expand for this row for the rest of the
-      // turn (BUG-033) — history rows pass no callback and are never
-      // auto-expanded anyway.
-      onUserToggle?.(tool.id);
-    });
+      // turn (BUG-033) — history rows pass no callback and stay exactly as
+      // the user left them. The live turn also records expands so a
+      // re-paint re-opens rows the user explicitly opened.
+      onUserToggle?.(tool.id, !collapsed);
+    };
+    toggle.addEventListener('click', flip);
+    // "explain" reveals this console only — progress hides by default and
+    // this is the per-row way back in (group-level toggle lives on the
+    // progress group header).
+    const explain = document.createElement('button');
+    explain.type = 'button';
+    explain.className = 'tool-explain';
+    explain.textContent = 'explain';
+    explain.title = 'แสดง console ของ tool นี้';
+    explain.addEventListener('click', flip);
+    head.append(toggle, explain);
     const body = document.createElement('div');
     body.className = 'tool-body';
     row.append(head, body);
   }
   row.classList.toggle('agent', !!agent);
   row.dataset.status = tool.status || 'pending';
-  row.querySelector('.name').textContent = tool.title || tool.kind || 'tool';
-  row.querySelector('.sub').textContent = agent ? agentSubtitle(tool) : '';
-  // Thai label, not the raw wire string (BUG-027); the spinner span keys off
-  // data-status in CSS. A completed BACKGROUND agent keeps running behind
+  // The row names the TOPIC, not the raw command (toolTopic strips the old
+  // `Bash ls …` prefix; stored transcripts still carry it). The tool kind
+  // moves to the quiet subtitle so "which tool ran" stays answerable, and
+  // the full original title survives as a hover tooltip for debugging.
+  const topic = toolTopic(tool) || tool.kind || 'tool';
+  row.querySelector('.name').textContent = topic;
+  const sub = agent ? agentSubtitle(tool) : (tool.kind && tool.kind !== topic ? tool.kind : '');
+  row.querySelector('.sub').textContent = sub;
+  const full = String(tool.title || '').replace(/\s+/g, ' ').trim();
+  row.querySelector('.tool-toggle').title =
+    full && full !== topic ? `แสดง/ซ่อน console ของ tool นี้ — ${full}` : 'แสดง/ซ่อน console ของ tool นี้';
+  // Thai label, not the raw wire string (BUG-027); the row's left strip
+  // blinks off data-status in CSS. A completed BACKGROUND agent keeps running behind
   // the scenes — say so instead of "เสร็จแล้ว" (BUG-076; display only, the
   // wire status is untouched).
   row.querySelector('.status').textContent =
@@ -543,6 +622,47 @@ function planNode(entries) {
   }
   card.append(h, ol);
   return card;
+}
+
+/**
+ * Collapsible wrapper around a turn's tools + plan (Codex Desktop parity).
+ * Hidden by default — the answer is the content; progress is one click away
+ * at group level, or per-console via the row's "explain" button. The live
+ * turn drives `open` from tv.progressOpen; history rows own DOM-local state.
+ */
+function progressGroupNode(label, open, onToggle) {
+  const group = document.createElement('div');
+  group.className = 'progress-group' + (open ? '' : ' pg-collapsed');
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'progress-head';
+  head.title = 'แสดง/ซ่อนความคืบหน้าทั้งหมดของเทิร์นนี้';
+  const glyph = document.createElement('span');
+  glyph.className = 'glyph';
+  glyph.textContent = open ? '▾' : '▸';
+  const text = document.createElement('span');
+  text.className = 'progress-label';
+  text.textContent = label;
+  // The wheel lives here and only here: visible while .pg-running (BUG-027).
+  const wheel = document.createElement('span');
+  wheel.className = 'progress-spin';
+  wheel.setAttribute('aria-hidden', 'true');
+  head.append(glyph, text, wheel);
+  head.addEventListener('click', () => onToggle?.());
+  const body = document.createElement('div');
+  body.className = 'progress-body';
+  group.append(head, body);
+  return { group, body, glyphEl: glyph, labelEl: text };
+}
+
+/** Header line for a tool+plan bundle: `<topic> · 3 tools · plan 2/4`.
+ * The topic names the live work (plan step, else running tool); settled
+ * history passes none and keeps the generic `Progress Bar` head. */
+function progressLabel(toolsCount, running, planSteps, planDone, topic) {
+  const bits = [topic || 'Progress Bar'];
+  if (toolsCount) bits.push(`${toolsCount} tools${running ? ` · ${running} กำลังรัน` : ''}`);
+  if (planSteps) bits.push(`plan ${planDone}/${planSteps}`);
+  return bits.join(' · ');
 }
 
 // Fallback for pre-options agents (grok-shaped hosts with no option list).
@@ -728,7 +848,10 @@ let liveText = null;
 // key → element for the CURRENT liveWrap ('tool:<id>' | 'plan' | 'text' |
 // 'ix:<id>'). Re-appending in liveChildOrder() every paint keeps the
 // streaming answer bottommost no matter when a tool row or card arrives.
+// Tool + plan nodes live inside the progress group's body; text + cards stay
+// direct children of the wrap.
 let liveChildren = new Map();
+let liveProgress = null;
 // chatId:turnId:rev of the last STRUCTURAL paint — pure text deltas reuse
 // the rows/cards/order and only reschedule markdown + scroll.
 let lastLiveStamp = null;
@@ -742,6 +865,7 @@ function paintLiveTurn(rebuild = false) {
     liveWrap = null;
     liveText = null;
     liveChildren = new Map();
+    liveProgress = null;
     lastLiveStamp = null;
     return;
   }
@@ -752,6 +876,7 @@ function paintLiveTurn(rebuild = false) {
     liveWrap.className = 'turn live-turn';
     liveText = null;
     liveChildren = new Map();
+    liveProgress = null;
     el.transcript.append(liveWrap);
   }
 
@@ -773,13 +898,16 @@ function paintLiveTurn(rebuild = false) {
   // Upsert content into the child map; the re-append below pins the order.
   for (const tool of tv.tools.values()) {
     const key = `tool:${tool.id}`;
-    const node = toolNode(tool, liveChildren.get(key), (toolId) => {
+    const node = toolNode(tool, liveChildren.get(key), (toolId, expanded) => {
       // The click lands on the visible (active) chat's rows.
-      state.turnViews.get(state.activeId)?.userToggledTools?.add(toolId);
+      const cur = state.turnViews.get(state.activeId);
+      cur?.userToggledTools?.add(toolId);
+      if (expanded) cur?.userExpandedTools?.add(toolId);
+      else cur?.userExpandedTools?.delete(toolId);
     });
-    // A running tool streams its output — a collapsed row hides the very
-    // thing that is happening (BUG-033). History-rendered rows never come
-    // through here and stay collapsed.
+    // Progress hides by default — a row opens only when the user explicitly
+    // opened it (head click or "explain"); streaming never pops rows open.
+    // A fresh row is born collapsed, so only the explicit-open path unhides.
     if (shouldAutoExpandTool(tv, tool)) setToolRowCollapsed(node, false);
     liveChildren.set(key, node);
   }
@@ -822,23 +950,47 @@ function paintLiveTurn(rebuild = false) {
     if (!existing) liveChildren.set(key, interactionNode(ix));
   }
 
+  // The progress group owns the tool + plan nodes; its header carries live
+  // counts and flips tv.progressOpen (rev bump → next paint is structural).
+  const sum = progressSummary(tv);
+  const hasProgress = sum.tools > 0 || sum.planSteps > 0;
+  if (hasProgress && (!liveProgress || !liveProgress.group.isConnected)) {
+    const chatOfPaint = chatId;
+    liveProgress = progressGroupNode('', !!tv.progressOpen, () => {
+      const cur = state.turnViews.get(chatOfPaint);
+      if (!cur) return;
+      toggleProgressOpen(cur);
+      if (chatOfPaint === state.activeId) paintLiveTurn();
+    });
+  }
+  if (liveProgress) {
+    if (!hasProgress) {
+      // Everything inside was pruned (e.g. a cleared plan) — drop the empty
+      // shell rather than painting a header with nothing under it.
+      liveProgress.group.remove();
+      liveProgress = null;
+    } else {
+      liveProgress.labelEl.textContent = progressLabel(sum.tools, sum.running, sum.planSteps, sum.planDone, progressTopic(tv));
+      liveProgress.group.classList.toggle('pg-collapsed', !tv.progressOpen);
+      liveProgress.glyphEl.textContent = tv.progressOpen ? '▾' : '▸';
+      liveProgress.group.classList.toggle('pg-running', sum.running > 0);
+    }
+  }
+
   // Pin the order — a tool call that starts after some answer text must still
   // render ABOVE the streaming bubble, not below it. append() moves connected
   // nodes, so re-appending in order is free when the order is already right.
+  // Tools + plan ride inside the progress body; the answer and every
+  // interaction card stay direct children of the wrap — a card anchored
+  // inside a collapsed group would hide the very question that blocks the
+  // turn (the old BUG-029 after-the-row mount cannot survive hide-defaults).
   const order = liveChildOrder(tv);
-  // A permission card mounts right after the tool row that asked (BUG-029) —
-  // the wire carries the row's toolCallId. anchorAfter stacks multiple cards
-  // for one row in arrival order instead of reversing them.
-  const anchoredAfter = new Map();
+  if (liveProgress && hasProgress) liveWrap.append(liveProgress.group);
   for (const key of order) {
     const node = liveChildren.get(key);
     if (!node) continue;
-    const ix = key.startsWith('ix:') ? tv.interactions.get(key.slice(3)) : null;
-    const anchorKey = ix ? ixAnchorKey(tv, ix) : null;
-    const anchor = anchorKey ? anchoredAfter.get(anchorKey) || liveChildren.get(anchorKey) : null;
-    if (anchor) {
-      anchor.after(node);
-      anchoredAfter.set(anchorKey, node);
+    if ((key.startsWith('tool:') || key === 'plan') && liveProgress && hasProgress) {
+      liveProgress.body.append(node);
       continue;
     }
     liveWrap.append(node);
@@ -909,9 +1061,10 @@ function updateRunningChrome() {
 }
 
 /**
- * Tasks + goal chips in the head bar: `tasks done/total` from the active
- * chat's live plan, and the session goal's percent + objective. Both hide
- * when there is nothing to show; both open the shared panel on click.
+ * Tasks chip in the head bar (`tasks done/total` from the active chat's live
+ * plan) + goal chip in the bottom-right live cluster (the session goal's
+ * percent + objective, realtime like the CLI). Both hide when there is
+ * nothing to show; both open the shared panel on click.
  */
 function updateTasksGoalChips() {
   const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
@@ -932,17 +1085,23 @@ function updateTasksGoalChips() {
     const pctEl = el.goalChip.querySelector('.goal-pct');
     if (pctEl) pctEl.textContent = `${pct}%`;
     if (label) label.textContent = String(goal.objective || '');
-    el.goalChip.classList.toggle('busy', String(goal.status) === 'running');
+    el.goalChip.classList.toggle('busy', goalControlFor(goal.status) === 'pause');
     el.goalChip.title = `${goal.objective || ''} — ${pct}% ${goal.status || ''} — คลิกเพื่อดูรายละเอียด`;
   }
+  updateLiveCluster();
+}
+
+/** The live cluster collapses when both of its chips hide — no stray gap. */
+function updateLiveCluster() {
+  el.liveCluster.hidden = el.goalChip.hidden && el.agentsChip.hidden;
 }
 
 /**
- * Agents chip in the head bar (BUG-077; grok-desktop setAgentsPill,
- * app.js:1383-1411): `agents running/total` of the ACTIVE chat's turn view,
- * accent + pulsing while anything runs, hidden when the turn has no agent
- * rows. Driven from updateRunningChrome — the same funnel every
- * tool_call/turn_started/turn_done already flows through, no new SSE.
+ * Agents chip in the bottom-right live cluster (BUG-077; grok-desktop
+ * setAgentsPill, app.js:1383-1411): `agents running/total` of the ACTIVE
+ * chat's turn view, accent + pulsing while anything runs, hidden when the
+ * turn has no agent rows. Driven from updateRunningChrome — the same funnel
+ * every tool_call/turn_started/turn_done already flows through, no new SSE.
  */
 function updateAgentsChip() {
   const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
@@ -953,6 +1112,7 @@ function updateAgentsChip() {
     ({ running, total } = wireSubagentCounts(state.activeId));
   }
   el.agentsChip.hidden = total === 0;
+  updateLiveCluster(); // before the early return, or the cluster never collapses
   if (!total) return;
   el.agentsChip.textContent = `agents ${running}/${total}`;
   el.agentsChip.classList.toggle('busy', running > 0);
@@ -1117,6 +1277,38 @@ function hideAuthGate() {
 
 // --------------------------------------------------------------- events
 
+/**
+ * macOS alert when the agent blocks on a question/approval. Two paths: the
+ * Web Notification (works in a real browser) and POST /api/notify (osascript
+ * banner — the WKWebView shell does not deliver Web Notifications reliably).
+ * Either may fail silently; the card in the transcript is the fallback that
+ * never fails.
+ */
+function notifyAgentQuestion(ix, chatId) {
+  const chat = chatId === state.activeId
+    ? state.chat
+    : state.chats.find((c) => c.id === chatId);
+  const title =
+    ix?.subtype === 'ask'
+      ? 'Muse มีคำถาม'
+      : ix?.subtype === 'plan'
+        ? 'Muse รอตรวจแผน'
+        : 'Muse รอการอนุญาต';
+  const detail = String(ix?.toolName || ix?.summary || ix?.body || 'ตอบหน่อย')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+  const body = `${chat?.title || 'แชท'} — ${detail}`;
+  try {
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(title, { body, tag: String(ix?.id || chatId) });
+    }
+  } catch {
+    // The host banner below is the real path on macOS; this is best-effort.
+  }
+  void api('/api/notify', { method: 'POST', body: { title, body } }).catch(() => {});
+}
+
 function onEvent(type, data) {
   const chatId = data.chatId;
 
@@ -1139,6 +1331,8 @@ function onEvent(type, data) {
       tv.rev = 0;
       tv.interactions = new Map();
       tv.userToggledTools = new Set(); // per-turn: last turn's manual collapses do not leak
+      tv.userExpandedTools = new Set(); // explicit opens do not leak either
+      tv.progressOpen = false; // every turn starts with progress hidden
       tv.startedAt = Date.now();
       tv.cancelling = false; // a leftover 'pending' view may carry a stale flag
       tv.thoughtSeen = false; // the reasoning stream restarts with the turn
@@ -1152,7 +1346,8 @@ function onEvent(type, data) {
         el.transcript.querySelector('.empty')?.remove();
         paintLiveTurn(true);
       }
-      if (data.title && state.chat?.id === chatId) el.title.textContent = data.title;
+      if (data.title && state.chat?.id === chatId) paintApTitle(el.title, data.title);
+      rightbar.applyTurn(chatId, data.turnId ?? null);
       updateRunningChrome();
       void refreshChats();
       return;
@@ -1220,18 +1415,14 @@ function onEvent(type, data) {
       } else if (bind === 'open') {
         updateRunningChrome();
       }
-      if (tasksPanel.isOpen() && tasksPanel.openChat() === chatId) {
-        tasksPanel.applyPlan(data.entries);
-      }
+      rightbar.applyPlan(chatId, data.entries);
       return;
     }
 
     case 'goal': {
       wireGoals.set(chatId, data.goal ?? null);
       if (chatId === state.activeId) updateRunningChrome(); // chips
-      if (tasksPanel.isOpen() && tasksPanel.openChat() === chatId) {
-        tasksPanel.applyGoal(data.goal ?? null);
-      }
+      rightbar.applyGoal(chatId, data.goal ?? null);
       return;
     }
 
@@ -1255,17 +1446,17 @@ function onEvent(type, data) {
         if (!wireSubagents.has(chatId)) wireSubagents.set(chatId, new Map());
         wireSubagents.get(chatId).set(rec.itemId, rec);
         if (chatId === state.activeId) updateRunningChrome(); // chip fallback
-        if (subagentsPanel.isOpen() && subagentsPanel.openChat() === chatId) {
-          subagentsPanel.applyRecord(rec);
-        }
+        rightbar.applyAgents(chatId, wireSubagents.get(chatId));
       }
       return;
     }
 
     case 'subagent_delta': {
-      if (data.itemId && subagentsPanel.isOpen() && subagentsPanel.openChat() === chatId) {
-        subagentsPanel.applyDelta(data.itemId, data.text);
-      }
+      // Live child text patches the rail rows in place (list + open drill);
+      // the mirror update keeps a rail opened later honest too.
+      const live = wireSubagents.get(chatId)?.get(String(data.itemId));
+      if (live && typeof data.text === 'string') live.liveText = data.text;
+      rightbar.applyAgentDelta(chatId, String(data.itemId), String(data.text || ''));
       return;
     }
 
@@ -1278,8 +1469,12 @@ function onEvent(type, data) {
       const tv = turnView(chatId, true);
       const bind = bindTurnId(tv, data);
       if (bind === 'drop') return;
+      // Replays (resync, second window) re-deliver the same card — notify
+      // only the first time an id is seen, or one question spams N banners.
+      const isNew = !tv.interactions.has(data.id) && !data.resolved;
       tv.interactions.set(data.id, data);
       tv.rev = (tv.rev || 0) + 1;
+      if (isNew) notifyAgentQuestion(data, chatId);
       if (chatId === state.activeId) {
         paintLiveTurn();
         updateRunningChrome(); // the status verb flips to รอการอนุญาต…
@@ -1316,6 +1511,7 @@ function onEvent(type, data) {
       // final chunks would stay unrendered if the transcript reload fails.
       if (chatId === state.activeId) liveMd.flush();
       state.turnViews.delete(chatId);
+      rightbar.applyTurn(chatId, null);
       if (chatId === state.activeId) {
         // Dereference only the ACTIVE chat's live nodes. Nulling them for a
         // background chat's settle orphaned the visible live wrap: the next
@@ -1324,6 +1520,7 @@ function onEvent(type, data) {
         // for non-active settles).
         liveWrap = null;
         liveText = null;
+        liveProgress = null;
         // Paint the outcome BEFORE the transcript reload wipes the live DOM —
         // a cancelled turn with no text otherwise leaves zero trace, and an
         // errored one reads as a normal answer until the reload lands
@@ -1382,6 +1579,18 @@ function onEvent(type, data) {
       return;
     }
 
+    case 'agent_stderr': {
+      // MSP diagnostics (subscribe retries, dropped completions) + raw agent
+      // stderr. Shown as a transient notice, never modal, and never an
+      // errored state — stderr is a warning, not a death. Chat 81442763
+      // hung silently for 20+ minutes because this event had no handler.
+      if (chatId === state.activeId) {
+        const first = String(data.text || '').split('\n')[0].slice(0, 300);
+        if (first.trim()) showError(`agent: ${first}`);
+      }
+      return;
+    }
+
     case 'auth_required':
       showAuthGate(data.command);
       return;
@@ -1397,6 +1606,7 @@ function onEvent(type, data) {
       if (chatId === state.activeId) {
         state.chatConfig = data.config || null;
         updateConfigPills();
+        rightbar.applyModel(chatId, costModelFor(chatId));
       }
       return;
     }
@@ -1545,8 +1755,8 @@ async function selectGroup(groupId) {
   renderSidebar();
 }
 
-async function createGroup(name) {
-  const res = await api('/api/groups', { method: 'POST', body: { name } });
+async function createGroup(name, position = 'top') {
+  const res = await api('/api/groups', { method: 'POST', body: { name, position } });
   applyGroupsState(res);
   if (res.group) {
     sidebar.ensureExpanded(res.group.id);
@@ -1589,7 +1799,8 @@ function ensureMsgMounted(msgIndex) {
 function findTranscriptNode(m) {
   const root = el.transcript;
   if (!root) return null;
-  // Tool / console hits land on the tool row.
+  // Tool / console hits land on the tool row — opening every collapsed
+  // ancestor (progress group + the row itself) so the flash is visible.
   if (m.surface === 'activity' || m.surface === 'console' || m.kind === 'tool' || m.kind === 'agent' || m.kind === 'tool_out') {
     const tid = m.refId;
     let row = tid
@@ -1598,7 +1809,29 @@ function findTranscriptNode(m) {
     if (!row && m.msgIndex != null) {
       row = root.querySelector(`[data-msg-index="${m.msgIndex}"]`);
     }
-    if (row) return row;
+    if (row) {
+      const toolRow = row.classList?.contains('tool-row') ? row : row.querySelector?.('.tool-row');
+      const group = (toolRow || row).closest?.('.progress-group');
+      if (group?.classList.contains('pg-collapsed')) {
+        group.classList.remove('pg-collapsed');
+        const glyph = group.querySelector('.progress-head .glyph');
+        if (glyph) glyph.textContent = '▾';
+        // A DOM-only open of the LIVE group would be re-collapsed by the
+        // next structural paint — sync the turn view too.
+        if (liveProgress && group === liveProgress.group) {
+          const cur = state.activeId ? state.turnViews.get(state.activeId) : null;
+          if (cur) cur.progressOpen = true;
+        }
+      }
+      if (toolRow?.classList.contains('collapsed')) {
+        setToolRowCollapsed(toolRow, false);
+        const tid2 = toolRow.dataset?.toolId;
+        if (tid2 && liveProgress && group === liveProgress.group) {
+          state.turnViews.get(state.activeId)?.userExpandedTools?.add(tid2);
+        }
+      }
+      return toolRow || row;
+    }
   }
   const snip = String(m.snippet || '').replace(/[[\]]/g, '').slice(0, 48);
   if (m.msgIndex != null) {
@@ -2325,8 +2558,9 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
   if (!chatId) {
     state.chat = null;
     state.chatConfig = null;
-    el.title.textContent = 'Muse Desktop';
+    paintApTitle(el.title, 'Muse Desktop');
     el.cwd.textContent = '';
+    rightbar.showChat(null);
     renderTranscript();
     updateRunningChrome();
     updateConfigPills();
@@ -2337,13 +2571,16 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
   const { chat } = await api(`/api/chats/${encodeURIComponent(chatId)}`);
   state.chat = chat;
   state.chatConfig = chat.config || null; // BUG-074 snapshot feeds the pills
-  // Opening a chat makes its group the active one, and its group must be
-  // visible — you can never be looking at a chat hidden inside a collapsed box.
+  // Opening a session to look at it never reorders: the queue moves only
+  // on conversation activity (a prompt sent, a run settled).
+  // Opening a chat makes its group the active one. A real switch expands
+  // the incoming group so the session is visible — but a same-chat refetch
+  // (turn_done repaint) leaves a deliberate collapse alone.
   if (chat.groupId) {
     state.activeGroupId = chat.groupId;
-    sidebar.ensureExpanded(chat.groupId);
+    if (chatId !== prevId) sidebar.ensureExpanded(chat.groupId);
   }
-  el.title.textContent = chat.title;
+  paintApTitle(el.title, chat.title);
   el.cwd.textContent = chat.cwd;
   el.cwd.title = chat.cwd;
   setMode(chat.mode);
@@ -2376,6 +2613,24 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
       .catch(() => ({ ctx: null, tokens: null }));
     wireCtx.set(chatId, { ctx: snap?.ctx ?? null, tokens: snap?.tokens ?? null, baseChars: 0 });
   }
+  // Same for the subagent registry — the rail must list the chat's children
+  // the moment it opens, not only children born while the page watches.
+  if (!wireSubagents.has(chatId)) {
+    const { subagents } = await api(`/api/chats/${encodeURIComponent(chatId)}/subagents`)
+      .catch(() => ({ subagents: [] }));
+    wireSubagents.set(chatId, new Map(
+      (Array.isArray(subagents) ? subagents : []).map((s) => [s.itemId, s]),
+    ));
+  }
+  // Point the right rail at the incoming chat: cost inputs, goal/plan state
+  // and the SCB re-detect (its title may have gained [APxxxx] since).
+  rightbar.showChat(chatId);
+  rightbar.showSession(chatId, chat.mspSessionId ?? null);
+  rightbar.applyTurn(chatId, liveTurnIdFor(chatId));
+  rightbar.applyGoal(chatId, wireGoals.get(chatId) ?? null);
+  rightbar.applyPlan(chatId, state.turnViews.get(chatId)?.plan);
+  rightbar.applyAgents(chatId, wireSubagents.get(chatId));
+  rightbar.applyCtx(chatId, wireCtx.get(chatId)?.tokens ?? null, costModelFor(chatId));
 
   renderTranscript({ stick: !keepScroll || state.pinned });
   if (keepScroll) {
@@ -2649,6 +2904,25 @@ async function stopTurn() {
   }
 }
 
+/**
+ * ESC-to-stop: ask first, stop only on "หยุด". Anchored to the Stop-morphed
+ * send button so the question sits on the control it talks about (the same
+ * miniConfirm the sidebar uses for deletes). The popover's own capture-phase
+ * ESC dismiss wins over the global binding below, so ESC ESC cancels the
+ * ask instead of stopping — and anything but an explicit "หยุด" (outside
+ * click, second ESC) resolves false and the turn keeps running. The
+ * confirmedStopProceeds guard drops a stale yes: a turn that settled, or a
+ * chat switched, behind the open popover must not be stopped.
+ */
+async function confirmStopTurn() {
+  const chatId = state.activeId;
+  if (!chatId) return;
+  const ok = await miniConfirm(el.send, 'หยุดเทิร์นนี้ใช่หรือไม่?', { okLabel: 'หยุด', cancelLabel: 'ทำต่อ' });
+  if (!ok) return;
+  if (!confirmedStopProceeds({ escChatId: chatId, activeChatId: state.activeId, running: isRunning(chatId) })) return;
+  await stopTurn();
+}
+
 async function cycleMode() {
   if (!state.activeId) return;
   const current = el.modeChip.dataset.mode || 'always';
@@ -2845,9 +3119,9 @@ function wireUi() {
         }
       }
     }
-    if (ev.key === 'Escape' && isRunning(state.activeId)) {
+    if (escStopAction({ key: ev.key, running: isRunning(state.activeId) }) === 'confirm') {
       ev.preventDefault();
-      void stopTurn();
+      void confirmStopTurn();
       return;
     }
     // New chat: Cmd+N on mac, Ctrl+N on Linux (the GTK shell has no browser
@@ -2942,6 +3216,7 @@ function wireUi() {
   el.newGroup.addEventListener('click', () => {
     closePopover();
     sidebar.draftOpen = true;
+    sidebar.draftAt = 'top';
     sidebar.draftValue = sidebar.draftValue || `Group ${state.groups.length + 1}`;
     renderSidebar();
   });
@@ -2951,19 +3226,12 @@ function wireUi() {
   el.effortChip.addEventListener('click', () => openConfigMenu('thinking', el.effortChip));
 
   el.mcpBtn?.addEventListener('click', () => mcpPanel.open(el.mcpBtn));
-  el.agentsChip.addEventListener('click', () => {
-    if (state.activeId) subagentsPanel.open(el.agentsChip, state.activeId, state.chat?.title || '');
-  });
-  const openTasks = (anchor) => {
-    if (!state.activeId) return;
-    const tv = state.turnViews.get(state.activeId);
-    tasksPanel.open(anchor, state.activeId, state.chat?.title || '', {
-      goal: wireGoals.get(state.activeId) ?? null,
-      plan: Array.isArray(tv?.plan) ? tv.plan : [],
-    });
-  };
-  el.tasksChip.addEventListener('click', () => openTasks(el.tasksChip));
-  el.goalChip.addEventListener('click', () => openTasks(el.goalChip));
+  // Head-bar chips open the right rail at their section (the old floating
+  // popovers are gone — one rail instead of stacked popups).
+  el.agentsChip.addEventListener('click', () => rightbar.reveal('agents'));
+  el.tasksChip.addEventListener('click', () => rightbar.reveal('tasks'));
+  el.goalChip.addEventListener('click', () => rightbar.reveal('goal'));
+  el.rightbarToggle?.addEventListener('click', () => rightbar.toggle());
 
   el.releaseAgent.addEventListener('click', async () => {
     if (!state.activeId) return;
@@ -3008,7 +3276,17 @@ async function boot() {
   // Sidebar width first: restoring the stored width before first paint
   // avoids a visible snap from the stylesheet default.
   initSidebarResize();
+  initRightbarResize();
   wireUi();
+  // Ask once for Web Notification permission (browser path for agent
+  // questions; the macOS host banner via /api/notify needs no permission).
+  try {
+    if ('Notification' in window && Notification.permission === 'default') {
+      void Notification.requestPermission().catch(() => {});
+    }
+  } catch {
+    // ignore — the transcript card + host banner still alert
+  }
   installCodeCopyDelegation();
   installDiagramDownloadDelegation();
   connectStream();

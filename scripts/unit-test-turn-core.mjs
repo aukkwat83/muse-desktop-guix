@@ -8,7 +8,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
-import { extractText, extractToolOutput, readUpdate, SessionManager } from '../src/server/sessions.js';
+import { extractText, extractToolOutput, readUpdate, resolveWatchdogHardMs, SessionManager } from '../src/server/sessions.js';
 import { SessionStore } from '../src/server/session-store.js';
 import { MspClient } from '../src/server/msp-client.js';
 
@@ -22,6 +22,10 @@ const test = (name, fn) => tests.push([name, fn]);
 function tmpStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-turn-'));
   return new SessionStore({ file: path.join(dir, 'chats.json'), debounceMs: 5 });
+}
+
+function tmpSearchDb() {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'muse-turn-idx-')), 'search.sqlite');
 }
 
 /** Wire double: records everything instead of writing to sockets. */
@@ -41,7 +45,7 @@ function fakeWire() {
 function managerWithOpenTurn(turnId = 't1') {
   const store = tmpStore();
   const wire = fakeWire();
-  const mgr = new SessionManager({ store, wire });
+  const mgr = new SessionManager({ store, wire, searchDbPath: tmpSearchDb() });
   const chat = store.create({ title: 'x', cwd: os.tmpdir() });
   mgr.slots.set(chat.id, {
     client: null,
@@ -287,10 +291,16 @@ test('an errored text-less turn keeps both its tool rows and the failure notice'
   assert.ok(notice?.text.includes('stalled'), 'the failure notice must not be lost either');
 });
 
-test('a text-less turn with no tools and no error still persists nothing', () => {
+test('a cancelled text-less turn persists a stub notice instead of nothing', () => {
+  // Contract change (bcb3975b): silent settles looked exactly like "never
+  // ran", so users re-sent and collected orphan user messages. Every reason
+  // except 'rotated' (which has its own recovery notice) leaves a trace.
   const { mgr, store, wire, chatId } = managerWithOpenTurn();
   mgr.settleTurn(chatId, 't1', { reason: 'cancelled' });
-  assert.equal(store.get(chatId).messages.length, 0);
+  const msgs = store.get(chatId).messages;
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].role, 'notice');
+  assert.match(msgs[0].text, /ยกเลิกเทิร์นแล้ว/);
   assert.equal(wire.of('turn_done').length, 1);
 });
 
@@ -335,7 +345,7 @@ test('pending approvals survive out of view and are listable', () => {
 
 test('a rotated session prepends a recovery recap to the wire text, once', () => {
   const store = tmpStore();
-  const mgr = new SessionManager({ store, wire: fakeWire() });
+  const mgr = new SessionManager({ store, wire: fakeWire(), searchDbPath: tmpSearchDb() });
   const chat = store.create({ title: 'x', cwd: os.tmpdir() });
   store.addMessage(chat.id, { role: 'user', text: 'build the thing' });
   store.addMessage(chat.id, { role: 'assistant', text: 'step 1 done' });
@@ -356,7 +366,7 @@ test('a rotated session prepends a recovery recap to the wire text, once', () =>
 
 test('the recovery recap trims oversized context and skips the just-stored prompt', () => {
   const store = tmpStore();
-  const mgr = new SessionManager({ store, wire: fakeWire() });
+  const mgr = new SessionManager({ store, wire: fakeWire(), searchDbPath: tmpSearchDb() });
   const chat = store.create({ title: 'x', cwd: os.tmpdir() });
   store.addMessage(chat.id, { role: 'user', text: 'old task' });
   store.addMessage(chat.id, { role: 'assistant', text: 'x'.repeat(20_000) });
@@ -402,11 +412,11 @@ test('chatSummary reports the running turn so the sidebar can show it', () => {
 test('mcp last-used marks persist across manager restarts', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-usage-'));
   const file = path.join(dir, 'chats.json');
-  const mgr = new SessionManager({ store: new SessionStore({ file, debounceMs: 5 }), wire: fakeWire() });
+  const mgr = new SessionManager({ store: new SessionStore({ file, debounceMs: 5 }), wire: fakeWire(), searchDbPath: tmpSearchDb() });
   mgr._onUpdate('c1', { update: { sessionUpdate: 'tool_call', toolCallId: 't', kind: 'mcp__github.search_repositories' } });
   assert.ok(mgr.mcpUsageSnapshot().github > 0);
   await new Promise((r) => setTimeout(r, 1200)); // debounce window
-  const mgr2 = new SessionManager({ store: new SessionStore({ file, debounceMs: 5 }), wire: fakeWire() });
+  const mgr2 = new SessionManager({ store: new SessionStore({ file, debounceMs: 5 }), wire: fakeWire(), searchDbPath: tmpSearchDb() });
   assert.equal(mgr2.mcpUsageSnapshot().github, mgr.mcpUsageSnapshot().github);
 });
 
@@ -415,7 +425,7 @@ test('reuseEmpty returns the existing blank chat instead of piling up new ones',
   // tab, or a fast reload) each used to POST /api/chats, leaving a row of
   // identical "New chat" entries.
   const store = tmpStore();
-  const mgr = new SessionManager({ store, wire: fakeWire() });
+  const mgr = new SessionManager({ store, wire: fakeWire(), searchDbPath: tmpSearchDb() });
 
   const a = mgr.createChat({ reuseEmpty: true });
   const b = mgr.createChat({ reuseEmpty: true });
@@ -456,16 +466,11 @@ function fakeLivelyClient() {
   };
 }
 
-test('watchdog never settles while a live client holds the turn open', () => {
+test('watchdog never settles a lively turn that already produced activity', () => {
   const { mgr, wire, chatId } = managerWithOpenTurn();
   const slot = mgr.slots.get(chatId);
   slot.client = fakeLivelyClient();
-  slot.turn.startedAt = Date.now() - 10 * 60 * 1000; // way past NO_ACTIVITY_MS
-  mgr._checkWatchdog(chatId, 't1');
-  assert.equal(wire.of('turn_error').length, 0, 'a long quiet tool run is work, not a wedge');
-  assert.equal(slot.turn?.settled, false);
-
-  // …and the stall path is guarded the same way once activity was seen
+  // …the stall path is guarded the same way once activity was seen
   slot.turn.sawActivity = true;
   slot.turn.lastActivity = Date.now() - 20 * 60 * 1000; // past STALL threshold in tests' clocks
   mgr._checkWatchdog(chatId, 't1');
@@ -473,15 +478,124 @@ test('watchdog never settles while a live client holds the turn open', () => {
   assert.equal(slot.turn?.settled, false);
 });
 
-test('watchdog hard-caps a live client whose prompt never comes back', () => {
+test('watchdog settles a lively turn that never produced a single frame (81442763)', () => {
+  // Contract change from 'never settles while lively': chat 81442763 held
+  // two already-completed runs open forever because the client was deaf —
+  // zero frames is not a quiet build (turn/started + item/started always
+  // precede any work). A lively client with nothing to show past
+  // NO_ACTIVITY_MS is wedged: settle loudly and release it so the next
+  // prompt boots a fresh one. Turns WITH activity still hold (74f04882).
   const { mgr, wire, chatId } = managerWithOpenTurn();
   const slot = mgr.slots.get(chatId);
   slot.client = fakeLivelyClient();
-  slot.turn.startedAt = Date.now() - 70 * 60 * 1000; // past the 65 min hard cap
+  slot.turn.startedAt = Date.now() - 10 * 60 * 1000; // way past NO_ACTIVITY_MS
   mgr._checkWatchdog(chatId, 't1');
   const errs = wire.of('turn_error');
-  assert.equal(errs.length, 1, 'hard cap must still settle a genuinely wedged RPC');
-  assert.match(errs[0].error, /hard cap/);
+  assert.equal(errs.length, 1);
+  assert.match(errs[0].error, /ไม่ได้ยิน/);
+  assert.equal(mgr.slots.has(chatId), false, 'a deaf client must be released, not reused');
+  assert.equal(wire.of('agent_released').length, 1);
+});
+
+test('watchdog holds a lively silent turn by default, like the CLI (74f04882)', () => {
+  // Contract change: chat 74f04882 ran 3h09m with 22 tools done and the agent
+  // silent, and the old 65 min default cut it. The CLI waits indefinitely
+  // (the user Ctrl-C's a wedged turn); the desktop now holds the same way —
+  // the stop button is the Ctrl-C. A ceiling exists only as an explicit
+  // MUSE_DESKTOP_WATCHDOG_HARD_MS opt-in (next test).
+  const saved = process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+  delete process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+  try {
+    const { mgr, wire, chatId } = managerWithOpenTurn();
+    const slot = mgr.slots.get(chatId);
+    slot.client = fakeLivelyClient();
+    slot.turn.startedAt = Date.now() - 70 * 60 * 1000;
+    slot.turn.sawActivity = true;
+    slot.turn.lastActivity = Date.now() - 70 * 60 * 1000;
+    mgr._checkWatchdog(chatId, 't1');
+    assert.equal(wire.of('turn_error').length, 0, 'default must hold a lively turn');
+    assert.equal(slot.turn.settled, false);
+  } finally {
+    if (saved == null) delete process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+    else process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = saved;
+  }
+});
+
+test('watchdog honors an explicit ceiling, but live tools still hold it', () => {
+  const saved = process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+  process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = '3600000'; // 60 min ceiling
+  try {
+    const { mgr, wire, chatId } = managerWithOpenTurn();
+    const slot = mgr.slots.get(chatId);
+    slot.client = fakeLivelyClient();
+    slot.turn.sawActivity = true;
+    slot.turn.lastActivity = Date.now() - 70 * 60 * 1000;
+    slot.turn.toolCalls.set('long', { id: 'long', status: 'in_progress' });
+    mgr._checkWatchdog(chatId, 't1');
+    assert.equal(wire.of('turn_error').length, 0, 'a live tool holds even an explicit ceiling');
+    assert.equal(slot.turn.settled, false);
+
+    slot.turn.toolCalls.set('long', { id: 'long', status: 'completed' });
+    mgr._checkWatchdog(chatId, 't1');
+    const errs = wire.of('turn_error');
+    assert.equal(errs.length, 1, 'explicit ceiling settles a stuck RPC past it');
+    assert.match(errs[0].error, /hard cap/);
+  } finally {
+    if (saved == null) delete process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+    else process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = saved;
+  }
+});
+
+test('watchdog ceiling resolves per tick, unset/0/false/garbage all hold', () => {
+  const saved = process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+  try {
+    delete process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+    assert.equal(resolveWatchdogHardMs(), 0, 'unset holds forever (CLI parity)');
+    process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = '0';
+    assert.equal(resolveWatchdogHardMs(), 0);
+    process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = 'false';
+    assert.equal(resolveWatchdogHardMs(), 0);
+    process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = '7200000';
+    assert.equal(resolveWatchdogHardMs(), 7200000);
+    process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = '30000';
+    assert.equal(resolveWatchdogHardMs(), 0, 'below the 60s floor means hold');
+    process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = 'nope';
+    assert.equal(resolveWatchdogHardMs(), 0, 'garbage holds (safe direction)');
+  } finally {
+    if (saved == null) delete process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS;
+    else process.env.MUSE_DESKTOP_WATCHDOG_HARD_MS = saved;
+  }
+});
+
+test('settleTurn never blanks an empty turn (bcb3975b)', () => {
+  // No text + no tools + no error used to persist NOTHING — the spinner died
+  // and the user could not tell "ran and said nothing" from "never ran".
+  const { mgr, store, chatId } = managerWithOpenTurn();
+  assert.equal(mgr.settleTurn(chatId, 't1', { reason: 'end_turn' }), true);
+  const msgs = store.get(chatId).messages;
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].role, 'notice');
+  assert.match(msgs[0].text, /ไม่มีข้อความตอบกลับ/);
+});
+
+test('settleTurn skips the empty stub for rotations (own notice covers it)', () => {
+  const { mgr, store, chatId } = managerWithOpenTurn();
+  assert.equal(mgr.settleTurn(chatId, 't1', { reason: 'rotated' }), true);
+  assert.equal(store.get(chatId).messages.length, 0);
+});
+
+test('shutdown without killing agents settles live turns with a trace', async () => {
+  // Deploy/restart used to evaporate in-flight turns silently (user message,
+  // no reply, no error). The stored session id is kept for resume.
+  const { mgr, store, chatId } = managerWithOpenTurn();
+  store.update(chatId, { mspSessionId: 's-keep' });
+  await mgr.shutdown({ killAgents: false });
+  const slot = mgr.slots.get(chatId);
+  assert.equal(slot.turn, null, 'settleTurn clears the live turn');
+  const msgs = store.get(chatId).messages;
+  assert.equal(msgs[msgs.length - 1].role, 'notice');
+  assert.match(msgs[msgs.length - 1].text, /host หยุดทำงานระหว่างเทิร์น/);
+  assert.equal(store.get(chatId).mspSessionId, 's-keep', 'resume id must survive the restart');
 });
 
 test('a pending permission card freezes the stall clock', () => {

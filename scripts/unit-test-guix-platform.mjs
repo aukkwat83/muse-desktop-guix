@@ -176,7 +176,10 @@ test('package.json keeps the guix scripts', () => {
   for (const s of ['desktop:install', 'test:guix', 'test:guix-shell']) {
     assert(pkg.scripts && pkg.scripts[s], `missing script: ${s}`);
   }
-  assert(/^1\.1\.0/.test(pkg.version), `guix line starts at 1.1.0, got ${pkg.version}`);
+  const parts = String(pkg.version).split('.').map(Number);
+  const atOrAfterBaseline =
+    parts[0] > 1 || (parts[0] === 1 && (parts[1] > 1 || parts[1] === 1));
+  assert(atOrAfterBaseline, `guix line starts at 1.1.0, got ${pkg.version}`);
 });
 
 console.log(

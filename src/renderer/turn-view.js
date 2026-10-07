@@ -19,6 +19,13 @@ export function createTurnView() {
     /** tool ids the user collapsed/expanded by hand this turn — a manual
      * toggle beats auto-expand for the rest of the turn (BUG-033). */
     userToggledTools: new Set(),
+    /** Tool rows the user explicitly opened this turn (head click or the
+     * console "Explain" button). Progress hides by default; this set is the
+     * only thing that opens a row. */
+    userExpandedTools: new Set(),
+    /** The whole progress group (tools + plan) starts hidden, like Codex
+     * Desktop's collapsed working block — the answer is the content. */
+    progressOpen: false,
     startedAt: 0,
     cancelling: false,
     /** a thought_delta arrived this turn — drives the กำลังคิด… status verb
@@ -63,6 +70,7 @@ export function bindTurnId(tv, data) {
  */
 export function interruptedMarkerText(reason) {
   if (reason === 'watchdog') return '⚠︎ ระบบหยุดให้ (เงียบเกินเพดาน watchdog)';
+  if (reason === 'interrupted') return '⏹ host หยุดระหว่างเทิร์น — prompt ใหม่เพื่อทำต่อ';
   return '⏹ หยุดโดยผู้ใช้';
 }
 
@@ -145,6 +153,11 @@ export function seedTurnView(tv, snapshot) {
     tv.interactions = new Map();
     tv.startedAt = 0;
     tv.turnId = snapshot.turnId;
+    // A new turn starts with progress hidden again — open state must not
+    // leak from the turn this view just replaced.
+    tv.userToggledTools = new Set();
+    tv.userExpandedTools = new Set();
+    tv.progressOpen = false;
   }
   if (!tv.turnId || tv.turnId === 'pending') tv.turnId = snapshot.turnId;
   if (!tv.startedAt) tv.startedAt = snapshot.startedAt || 0;
@@ -254,6 +267,29 @@ export function ixKeyToOptionId(options, key) {
 }
 
 /**
+ * Global ESC-to-stop decision (app.js document keydown). ESC never stops a
+ * turn directly: while a turn runs it opens a confirm popover, so a stray
+ * keypress cannot kill a long turn. The interaction-card map above runs
+ * first — an ESC that rejects a card never reaches this. Returns 'confirm'
+ * when the handler should ask, 'none' otherwise.
+ */
+export function escStopAction({ key, running }) {
+  if (key !== 'Escape' || !running) return 'none';
+  return 'confirm';
+}
+
+/**
+ * Stale-confirm guard for the other side of escStopAction: the turn may have
+ * settled — or the chat switched — while the popover sat open, so the
+ * confirmed stop only proceeds when the ESC-time chat is still the active
+ * one and still running. Stopping anything else would surprise.
+ */
+export function confirmedStopProceeds({ escChatId, activeChatId, running }) {
+  if (escChatId == null || escChatId !== activeChatId) return false;
+  return !!running;
+}
+
+/**
  * Child order for a persisted assistant message — must mirror
  * liveChildOrder() (tools → plan → answer, marker last). After turn_done the
  * transcript reloads from disk; if history rendered plan → tools → text while
@@ -273,16 +309,42 @@ export function messageChildOrder(msg) {
 }
 
 /**
- * Whether a live tool row should auto-expand while streaming (grok-desktop
- * paintToolOutput, app.js:3533-3545: bash/execute/running rows open so the
- * output is visible). A row the user toggled by hand this turn is left alone
- * either way — auto-expand must never fight the user (BUG-033).
+ * Whether a live tool row should be expanded. Progress hides by default
+ * (Codex Desktop parity): streaming no longer pops rows open — not even
+ * running bash rows (the old grok-desktop behaviour this replaced). A row
+ * opens only when the user explicitly asked: head click or the console
+ * "Explain" button records the id in `userExpandedTools` for the turn.
+ * `userToggledTools` keeps its BUG-033 meaning (a manual toggle wins).
  */
 export function shouldAutoExpandTool(tv, tool) {
   const id = tool?.id;
-  if (id != null && tv?.userToggledTools?.has?.(id)) return false;
-  if (/^(in_progress|running)$/i.test(String(tool?.status || ''))) return true;
-  return /execute|bash|shell|command/i.test(String(tool?.kind || ''));
+  if (id == null) return false;
+  if (tv?.userToggledTools?.has?.(id) && !tv?.userExpandedTools?.has?.(id)) return false;
+  return !!tv?.userExpandedTools?.has?.(id);
+}
+
+/** Flip the whole progress group (tools + plan) open/closed for the turn. */
+export function toggleProgressOpen(tv) {
+  if (!tv) return false;
+  tv.progressOpen = !tv.progressOpen;
+  tv.rev = (tv.rev || 0) + 1;
+  return tv.progressOpen;
+}
+
+/**
+ * One-line counts for the progress group header: how many tool rows exist,
+ * how many still run, and how many plan steps are done/total.
+ */
+export function progressSummary(tv) {
+  let tools = 0;
+  let running = 0;
+  for (const tool of tv?.tools?.values?.() || []) {
+    tools += 1;
+    if (/pending|in_progress|running/i.test(String(tool?.status || ''))) running += 1;
+  }
+  const plan = Array.isArray(tv?.plan) ? tv.plan : [];
+  const planDone = plan.filter((e) => String(e?.status || '') === 'completed').length;
+  return { tools, running, planSteps: plan.length, planDone };
 }
 
 /**
@@ -367,6 +429,44 @@ export function agentCounts(tv) {
 }
 
 /**
+ * Display topic of one tool row: the title with the old `${tool} ${args}`
+ * prefix stripped (server titles used to read `Bash ls …`, stored
+ * transcripts still do). New server titles are already bare topics, which
+ * pass through untouched. Case-insensitive on purpose — the wire spells
+ * the same tool `Bash`, `bash` and `execute` in different places.
+ */
+export function toolTopic(tool) {
+  const raw = String(tool?.title || '').replace(/\s+/g, ' ').trim();
+  if (!raw) return '';
+  const kind = String(tool?.kind || '').trim();
+  if (kind) {
+    const lower = raw.toLowerCase();
+    const kl = kind.toLowerCase();
+    if (lower === kl) return '';
+    for (const sep of [' ', ':', '：', '—', '-', '·']) {
+      if (lower.startsWith(`${kl}${sep}`)) {
+        return raw.slice(kind.length + sep.length).trim();
+      }
+    }
+  }
+  return raw;
+}
+
+/**
+ * Normalized content of the plan's in-progress step, or '' when no step
+ * runs. Shared by the status verb and the progress header so both name the
+ * same step (callers slice to their own width).
+ */
+export function inProgressPlanStep(tv) {
+  const entry = (tv?.plan || []).find((e) =>
+    /in_progress|running|active|current/i.test(String(e?.status || '')),
+  );
+  return String(entry?.content || entry?.title || '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
  * Kind-aware Thai verb for one running tool (grok-desktop `formatToolVerb`,
  * transcript-model.js:812-837, re-keyed to the MSP wire kinds). A title that
  * already reads like a verb phrase (กำลัง…, or an English -ing word) is used
@@ -374,7 +474,7 @@ export function agentCounts(tv) {
  */
 function formatToolVerb(tool) {
   const kind = String(tool?.kind || '').toLowerCase();
-  const title = String(tool?.title || '').replace(/\s+/g, ' ').trim();
+  const title = toolTopic(tool);
   const short = title.slice(0, 48) || kind || 'tool';
   if (title && (/^กำลัง/.test(title) || /^[a-z]+ing\b/i.test(title))) {
     return title.endsWith('…') ? title : `${title}…`;
@@ -421,13 +521,7 @@ export function resolveStatusVerb(tv) {
     return 'รอการอนุญาต…';
   }
   // 2) The plan's in-progress step
-  const inProgress = (tv.plan || []).find((e) =>
-    /in_progress|running|active|current/i.test(String(e?.status || '')),
-  );
-  const step = String(inProgress?.content || inProgress?.title || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 56);
+  const step = inProgressPlanStep(tv).slice(0, 56);
   if (step) return step.endsWith('…') ? step : `${step}…`;
   // 3) The first still-running NON-agent tool — agents are counted in (4);
   //    a plain tool wins this slot (grok transcript-model.js:761-776).
@@ -451,6 +545,35 @@ export function resolveStatusVerb(tv) {
   // 6) Fallback — thinking is data-driven now, so the fallback must not
   //    claim it.
   return 'กำลังทำงาน…';
+}
+
+/**
+ * Heading topic for the progress group's header: the in-progress plan
+ * step first (the most human line available), else the first running
+ * plain tool's topic, else the running agent count. '' when nothing is
+ * in flight — the caller falls back to the generic `Progress Bar` label.
+ * Same priority spine as resolveStatusVerb minus the interaction branch:
+ * a permission card already has its own card + status verb, the header
+ * keeps naming the work underneath it.
+ */
+export function progressTopic(tv) {
+  if (!tv) return '';
+  const step = inProgressPlanStep(tv).slice(0, 48);
+  if (step) return step;
+  for (const tool of tv.tools?.values?.() || []) {
+    if (!/pending|in_progress|running/i.test(String(tool?.status || ''))) continue;
+    if (isAgentTool(tool)) continue;
+    const topic = toolTopic(tool).slice(0, 48);
+    if (topic) return topic;
+  }
+  let agents = 0;
+  for (const tool of tv.tools?.values?.() || []) {
+    if (isAgentTool(tool) && /pending|in_progress|running/i.test(String(tool?.status || ''))) {
+      agents += 1;
+    }
+  }
+  if (agents > 0) return agents === 1 ? '1 agent' : `${agents} agents`;
+  return '';
 }
 
 /**

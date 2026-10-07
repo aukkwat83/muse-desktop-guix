@@ -8,6 +8,7 @@ import path from 'node:path';
 
 import { SessionStore } from '../src/server/session-store.js';
 import { SessionManager } from '../src/server/sessions.js';
+import { hasLoneSurrogate } from '../src/server/text.js';
 
 // createChat background-warms by default — pin it off so unit tests never
 // spawn a real agent (each suite is its own process).
@@ -33,10 +34,14 @@ function fakeWire() {
   };
 }
 
+function tmpSearchDb() {
+  return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'muse-groups-idx-')), 'search.sqlite');
+}
+
 function manager() {
   const store = freshStore();
   const wire = fakeWire();
-  return { store, wire, mgr: new SessionManager({ store, wire }) };
+  return { store, wire, mgr: new SessionManager({ store, wire, searchDbPath: tmpSearchDb() }) };
 }
 
 const names = (store) => store.listGroups().map((g) => g.name);
@@ -83,6 +88,24 @@ test('a chat pointing at a group that no longer exists is rehomed', () => {
   assert.equal(store.get('a').groupId, 'g1');
 });
 
+test('a new group lands on top', () => {
+  const store = freshStore();
+  const a = store.listGroups()[0];
+  store.createGroup({ name: 'B' });
+  store.createGroup({ name: 'C' });
+  assert.deepEqual(names(store), ['C', 'B', a.name]);
+  assert.deepEqual(store.listGroups().map((g) => g.order), [0, 1, 2]);
+});
+
+test('position bottom appends (the ＋ group tab lands where it sits)', () => {
+  const store = freshStore();
+  const a = store.listGroups()[0];
+  store.createGroup({ name: 'Top' });
+  store.createGroup({ name: 'Bottom', position: 'bottom' });
+  assert.deepEqual(names(store), ['Top', a.name, 'Bottom']);
+  assert.deepEqual(store.listGroups().map((g) => g.order), [0, 1, 2]);
+});
+
 test('reorder actually reorders — and survives a reload', () => {
   // Regression: renumbering used to re-sort by the *old* order values first,
   // which put the list straight back and made the drag look like a no-op.
@@ -90,7 +113,7 @@ test('reorder actually reorders — and survives a reload', () => {
   const a = store.listGroups()[0];
   const b = store.createGroup({ name: 'B' });
   const c = store.createGroup({ name: 'C' });
-  assert.deepEqual(names(store), [a.name, 'B', 'C']);
+  assert.deepEqual(names(store), ['C', 'B', a.name]); // newest on top
 
   store.reorderGroups([c.id, a.id, b.id]);
   assert.deepEqual(names(store), ['C', a.name, 'B']);
@@ -162,9 +185,83 @@ test('listInGroup is newest-first', () => {
   const g = store.listGroups()[0].id;
   const older = store.create({ title: 'older', groupId: g });
   const newer = store.create({ title: 'newer', groupId: g });
-  store.update(newer.id, { title: 'newer' }); // bumps updatedAt
+  store.addMessage(newer.id, { role: 'user', text: 'bump' }); // activity moves it
   assert.equal(store.listInGroup(g)[0].id, newer.id);
   assert.equal(store.listInGroup(g)[1].id, older.id);
+});
+
+test('metadata update never reorders the queue', () => {
+  const store = freshStore();
+  const g = store.listGroups()[0].id;
+  // Pin the clock: two creates inside one ms share an updatedAt and the
+  // queue order between them is meaningless.
+  const realNow = Date.now;
+  let now = 1_700_000_000_000;
+  Date.now = () => now;
+  try {
+    const first = store.create({ title: 'first', groupId: g });
+    now += 1000;
+    store.create({ title: 'second', groupId: g });
+    now += 1000;
+    const before = store.get(first.id).updatedAt;
+    // Mode flip, model pick, agent spawn id, title edit — none is
+    // conversation activity, so none may move the row.
+    store.update(first.id, { title: 'first (renamed)' });
+    store.update(first.id, { mode: 'plan' });
+    store.update(first.id, { model: 'muse-x', effort: 'high' });
+    store.update(first.id, { mspSessionId: 'sess-live' });
+    assert.equal(store.get(first.id).updatedAt, before);
+    assert.equal(store.listInGroup(g)[0].title, 'second');
+    assert.equal(store.listInGroup(g)[1].id, first.id);
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('a prompt floats the continued session to the top', () => {
+  const { mgr, store } = manager();
+  const g = store.listGroups()[0].id;
+  const realNow = Date.now;
+  let now = 1_700_000_000_000;
+  Date.now = () => now;
+  try {
+    const first = store.create({ title: 'first', groupId: g });
+    now += 1000;
+    store.create({ title: 'second', groupId: g });
+    now += 1000;
+    assert.equal(mgr.listChats()[0].title, 'second');
+
+    store.addMessage(first.id, { role: 'user', text: 'continued' });
+    assert.equal(mgr.listChats()[0].id, first.id, 'the prompted session must lead the queue');
+  } finally {
+    Date.now = realNow;
+  }
+});
+
+test('a settled run floats the session to the top and persists', () => {
+  const { mgr, store } = manager();
+  const g = store.listGroups()[0].id;
+  const realNow = Date.now;
+  let now = 1_700_000_000_000;
+  Date.now = () => now;
+  try {
+    const first = store.create({ title: 'first', groupId: g });
+    now += 1000;
+    store.create({ title: 'second', groupId: g });
+    now += 1000;
+    store.setAssistantMessage(first.id, 'turn-1', 'done');
+    assert.equal(mgr.listChats()[0].id, first.id, 'the just-settled session must lead the queue');
+  } finally {
+    Date.now = realNow;
+  }
+
+  store.flushNow();
+  const reloaded = new SessionStore({ file: store.file });
+  assert.equal(
+    reloaded.listInGroup(g)[0].title,
+    'first',
+    'the settle must survive a reload',
+  );
 });
 
 test('manager reports per-group counts and broadcasts changes', () => {
@@ -216,6 +313,40 @@ test('chat summaries expose groupId and a preview', () => {
   assert.equal(summary.groupId, store.listGroups()[0].id);
   assert.match(summary.preview, /ดูให้แล้ว/);
   assert.ok(!summary.preview.includes('```'), 'code fences must not leak into the preview');
+});
+
+test('chat preview never splits an emoji at the cut', () => {
+  const { mgr, store } = manager();
+  const chat = store.create({ title: 'e' });
+  // 'y' + emoji run: UTF-16 offset 90 lands mid-emoji.
+  store.addMessage(chat.id, { role: 'user', text: `y${'🚀'.repeat(100)}` });
+  const summary = mgr.chatSummary(store.get(chat.id));
+  assert.equal(hasLoneSurrogate(summary.preview), false);
+  assert.ok(summary.preview.endsWith('…'));
+});
+
+test('chat summaries expose the agent session id (stored, live wins)', () => {
+  const { mgr, store } = manager();
+  const chat = store.create({ title: 'x' });
+  assert.equal(mgr.chatSummary(store.get(chat.id)).mspSessionId, null);
+  store.update(chat.id, { mspSessionId: 'stored-1' });
+  assert.equal(mgr.chatSummary(store.get(chat.id)).mspSessionId, 'stored-1');
+  // A hot client reports its own id — the stored copy lags during rotation.
+  mgr.slots.set(chat.id, { client: { sessionId: 'live-2' } });
+  assert.equal(mgr.chatSummary(store.get(chat.id)).mspSessionId, 'live-2');
+});
+
+test('SessionManager honors searchDbPath — suite index never touches the real one', () => {
+  const dbPath = tmpSearchDb();
+  const store = freshStore();
+  const mgr = new SessionManager({ store, wire: fakeWire(), searchDbPath: dbPath });
+  assert.equal(mgr.searchIndex.dbPath, dbPath);
+  const chat = store.create({ title: 'search seam probe', cwd: os.tmpdir() });
+  store.addMessage(chat.id, { role: 'user', text: 'zz9 hermetic marker' });
+  mgr.searchIndex.flushNow();
+  assert.ok(fs.existsSync(dbPath), 'the index file must live at the given path');
+  const r = mgr.search('zz9 hermetic');
+  assert.ok(r.ok && r.hits.some((h) => h.sessionId === chat.id), 'fixture must round-trip through the temp index');
 });
 
 let failed = 0;

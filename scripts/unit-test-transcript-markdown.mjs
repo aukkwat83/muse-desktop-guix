@@ -71,6 +71,26 @@ test('a tool output containing backticks gets a longer fence', () => {
   assert.match(md, /````\nhas ``` inside\n````/, 'fence must outrun the content');
 });
 
+test('copied tool rows name the topic, not the old prefixed title', () => {
+  const md = chatToMarkdown({
+    title: 't',
+    messages: [
+      {
+        role: 'assistant',
+        text: '',
+        meta: {
+          toolCalls: [
+            { id: 't1', title: 'Bash ls /tmp/mock', kind: 'Bash', status: 'completed', output: '' },
+            { id: 't2', title: 'ตรวจไฟล์ชั่วคราว', kind: 'Bash', status: 'completed', output: '' },
+          ],
+        },
+      },
+    ],
+  });
+  assert.match(md, /\*\*🔧 ls \/tmp\/mock — เสร็จแล้ว\*\*/);
+  assert.match(md, /\*\*🔧 ตรวจไฟล์ชั่วคราว — เสร็จแล้ว\*\*/);
+});
+
 test('notices become quotes; unknown roles are skipped', () => {
   const md = chatToMarkdown({
     title: 't',

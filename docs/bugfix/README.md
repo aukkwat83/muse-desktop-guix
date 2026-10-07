@@ -87,3 +87,6 @@
 | BUG-077 | ไม่มี chip บอกจำนวน subagent ที่กำลังรันในเทิร์นบน head bar | minor | `git log --grep='\[BUG-077\]'` | [BUG-077-agents-chip.md](BUG-077-agents-chip.md) |
 | BUG-078 | version badge ค้างที่ 0.4.0 ตลอด — package.json ไม่เคย bump ทั้งที่ ?v= token เดินไปไกล | minor | `git log --grep='\[BUG-078\]'` | [BUG-078-version-badge-stale.md](BUG-078-version-badge-stale.md) |
 | BUG-079 | pill model/effort กดไม่ได้บนแชท cold — options ผูกกับ live session ทั้งที่ catalog เป็น agent-wide | major | `git log --grep='\[BUG-079\]'` | [BUG-079-config-pills-cold-chat.md](BUG-079-config-pills-cold-chat.md) |
+| BUG-080 | client หูหนวก: view/subscribe ล้มเงียบแล้วทุกเทิร์นค้างตลอดกาล (watchdog อุ้มเทิร์นตาย) | major | `git log --grep='\[BUG-080\]'` | [BUG-080-deaf-client.md](BUG-080-deaf-client.md) |
+| BUG-081 | กดเมนู Host แล้ว crash: non-ASCII title บน Swift-native string trap ใน NSMenuItem._description | major | `git log --grep='\[BUG-081\]'` | [BUG-081-host-menu-thai-title-trap.md](BUG-081-host-menu-thai-title-trap.md) |
+| BUG-083 | `npm test` ล้าง search index จริงของผู้ใช้แล้ว re-source จาก fixture (SessionManager ไม่มี test seam) | major (test-infra) | `git log --grep='\[BUG-083\]'` | [BUG-083-test-suite-wipes-live-search-index.md](BUG-083-test-suite-wipes-live-search-index.md) |
