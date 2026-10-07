@@ -10,7 +10,7 @@ import {
   subagentDotClass,
   subagentStatusWord,
   subagentTitle,
-} from './rightbar.js?v=1.1.3';
+} from './rightbar.js?v=1.1.4';
 
 const root = document.getElementById('child-root');
 const params = new URLSearchParams(location.search);

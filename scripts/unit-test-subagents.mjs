@@ -18,10 +18,12 @@ import { sanitizeChildItem } from '../src/server/msp-client.js';
 import { SessionStore, SUBAGENT_STORE_CAP, normalizeSubagents } from '../src/server/session-store.js';
 import { SUBAGENT_COMMANDS, agentRowLink, extractReminderDecision, nativeSubagentPatch, reminderDecisionLine, sanitizeDrillItem, SessionManager } from '../src/server/sessions.js';
 import {
+  OVERVIEW_WIRE_CAP,
   SUBAGENT_ACTION_LABEL,
   childWindowUrl,
   drillItemPreview,
   drillKindTag,
+  overviewSubagentRows,
   partitionReminders,
   subagentActions,
   subagentDotClass,
@@ -157,6 +159,37 @@ test('partitionReminders folds system noise below real children', () => {
   assert.deepEqual(main.map((r) => r.itemId), ['native:x', 'sub-1']);
   assert.deepEqual(reminders.map((r) => r.itemId), ['rem-1', 'rem-2']);
   assert.deepEqual(partitionReminders(null), { main: [], reminders: [] });
+});
+
+test('overview rows prefer the live turn, else the wire children (1.1.29)', () => {
+  const tool = { id: 't1' };
+  assert.deepEqual(overviewSubagentRows([tool], [{ itemId: 'w1' }]), { kind: 'turn', tools: [tool] });
+  assert.deepEqual(overviewSubagentRows([], []), { kind: 'empty' });
+  assert.deepEqual(overviewSubagentRows(null, null), { kind: 'empty' });
+  const wire = overviewSubagentRows([], [{ itemId: 'w1', kind: 'subagent', status: 'inProgress', updatedAt: 2 }]);
+  assert.equal(wire.kind, 'wire');
+  assert.deepEqual(wire.main.map((r) => r.itemId), ['w1']);
+  assert.equal(wire.hiddenMain, 0);
+  assert.equal(wire.reminders, 0);
+  assert.equal(wire.remindersRunning, 0);
+});
+
+test('overview wire rows sort newest first, cap mains, fold reminders (1.1.29)', () => {
+  const recs = [];
+  for (let i = 0; i < OVERVIEW_WIRE_CAP + 3; i++) {
+    recs.push({ itemId: `sub-${i}`, kind: 'subagent', status: 'completed', updatedAt: 100 + i });
+  }
+  recs.push(
+    { itemId: 'rem-run', kind: 'reminderChild', status: 'inProgress', updatedAt: 1 },
+    { itemId: 'rem-done', kind: 'reminderChild', status: 'completed', updatedAt: 2 },
+  );
+  const s = overviewSubagentRows([], recs);
+  assert.equal(s.kind, 'wire');
+  assert.equal(s.main.length, OVERVIEW_WIRE_CAP);
+  assert.deepEqual(s.main.map((r) => r.itemId)[0], `sub-${OVERVIEW_WIRE_CAP + 2}`);
+  assert.equal(s.hiddenMain, 3);
+  assert.equal(s.reminders, 2);
+  assert.equal(s.remindersRunning, 1);
 });
 
 test('nativeSubagentPatch folds the probed spawn/wait shapes', () => {

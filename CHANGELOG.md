@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.29 — 2026-10-07
+
+Thread-overview Subagents section falls back to the server's wire
+children when the live turn has no agent rows — the same fallback as
+the agents chip. Before, the chip could read `agents 2/57` while the
+popup claimed no subagents in the thread. Real children list first
+(capped at 6, `+ อีก n` for the rest) and system reminders fold into
+one `reminders · n` row like the rail.
+Full note: [docs/releases/v1.1.29-overview-wire-fallback.md](docs/releases/v1.1.29-overview-wire-fallback.md).
+
 ## 1.1.28 — 2026-10-07
 
 Composer goal strip gets its own row: it was a flex item inside the

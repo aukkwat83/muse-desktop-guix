@@ -1,7 +1,7 @@
 {
   "name": "muse-desktop-guix",
   "productName": "Muse Desktop",
-  "version": "1.1.28",
+  "version": "1.1.29",
   "description": "Muse Desktop — native multi-session MSP client for Muse CLI (muse serve); macOS shell + Guix System GTK shell",
   "type": "module",
   "private": true,

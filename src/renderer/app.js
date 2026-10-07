@@ -19,7 +19,7 @@ import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
 import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
 import { closePopover, miniConfirm, openMenu, openPanel } from './popover.js?v=0.4.2';
 import { createMcpPanel } from './mcp-panel.js?v=1.0.0';
-import { createRightbar, goalControlFor, goalStatusWord } from './rightbar.js?v=1.1.3';
+import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, subagentStatusWord, subagentSub, subagentTitle } from './rightbar.js?v=1.1.4';
 import { createChildActivity } from './child-activity.js?v=1.0.0';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
 import { formatCtxMeter } from './ctx-meter.js?v=1.0.0';
@@ -1248,17 +1248,43 @@ function openThreadOverview() {
     li.textContent = text;
     return li;
   };
-  // Subagents — agent rows of the live turn, newest last like the rail.
+  // Subagents — agent rows of the live turn, newest last like the rail;
+  // when the turn has none, the server's wire children back them (the same
+  // fallback as the agents chip — 1.1.29).
   const agentsUl = mkSection('Subagents');
   const agentTools = tv ? [...tv.tools.values()].map((n) => n.tool).filter((t) => agentToolMeta(t)) : [];
-  if (!agentTools.length) agentsUl.append(mkEmpty('ยังไม่มี subagent ในเทิร์นนี้'));
-  for (const tool of agentTools) {
-    // agentToolMeta takes the tool itself (reads tool.rawInput) — there is
-    // no subKindOf helper. Status words mirror the tool rows: background
-    // agents say so, everything else uses the shared wire-status label.
-    const label = agentSubtitle(tool);
-    const word = toolDisplayState(tool) === 'background' ? 'ทำงานเบื้องหลัง' : toolStatusLabel(tool.status);
-    agentsUl.append(mkRow('✳', label, word, `${label} — ${word}`, () => rightbar.reveal('agents')));
+  const wireRecs = state.activeId ? [...(wireSubagents.get(state.activeId)?.values() || [])] : [];
+  const agentSection = overviewSubagentRows(agentTools, wireRecs);
+  if (agentSection.kind === 'empty') {
+    agentsUl.append(mkEmpty('ยังไม่มี subagent ในเทิร์นนี้'));
+  } else if (agentSection.kind === 'turn') {
+    for (const tool of agentSection.tools) {
+      // agentToolMeta takes the tool itself (reads tool.rawInput) — there is
+      // no subKindOf helper. Status words mirror the tool rows: background
+      // agents say so, everything else uses the shared wire-status label.
+      const label = agentSubtitle(tool);
+      const word = toolDisplayState(tool) === 'background' ? 'ทำงานเบื้องหลัง' : toolStatusLabel(tool.status);
+      agentsUl.append(mkRow('✳', label, word, `${label} — ${word}`, () => rightbar.reveal('agents')));
+    }
+  } else {
+    for (const rec of agentSection.main) {
+      const label = subagentTitle(rec);
+      const word = subagentStatusWord(rec.status);
+      const sub = subagentSub(rec);
+      agentsUl.append(mkRow('✳', label, word, sub ? `${label} — ${word} · ${sub}` : `${label} — ${word}`, () => rightbar.reveal('agents')));
+    }
+    if (agentSection.hiddenMain > 0) {
+      agentsUl.append(mkRow('…', `อีก ${agentSection.hiddenMain} subagents`, '', '', () => rightbar.reveal('agents')));
+    }
+    if (agentSection.reminders > 0) {
+      agentsUl.append(mkRow(
+        '⏳',
+        `reminders · ${agentSection.reminders}`,
+        agentSection.remindersRunning > 0 ? `กำลังรัน ${agentSection.remindersRunning}` : '',
+        '',
+        () => rightbar.reveal('agents'),
+      ));
+    }
   }
   // Tasks — live plan checklist.
   const tasksUl = mkSection('Tasks');

@@ -185,6 +185,37 @@ export function partitionReminders(recs) {
   return { main, reminders };
 }
 
+/** Wire rows the thread-overview popup lists before folding the rest. */
+export const OVERVIEW_WIRE_CAP = 6;
+
+/**
+ * Thread-overview Subagents section rows (1.1.29): the live turn's agent
+ * tool rows win; when the turn has none, the server's wire children back
+ * them — the same fallback as the agents chip, so the overview never
+ * claims "none" while the chip counts running ones. Real children list
+ * first (capped — the popup is a glance, the rail holds the rest) and
+ * system reminders fold into one row like the rail.
+ *
+ * Pure view-model: app.js paints the descriptors. Shapes:
+ *   { kind: 'empty' } — nothing anywhere
+ *   { kind: 'turn', tools } — live-turn agent tools
+ *   { kind: 'wire', main, hiddenMain, reminders, remindersRunning }
+ */
+export function overviewSubagentRows(agentTools, wireRecs) {
+  const tools = Array.isArray(agentTools) ? agentTools : [];
+  if (tools.length) return { kind: 'turn', tools };
+  const recs = [...(wireRecs || [])].sort((a, b) => (b?.updatedAt || 0) - (a?.updatedAt || 0));
+  if (!recs.length) return { kind: 'empty' };
+  const { main, reminders } = partitionReminders(recs);
+  return {
+    kind: 'wire',
+    main: main.slice(0, OVERVIEW_WIRE_CAP),
+    hiddenMain: Math.max(0, main.length - OVERVIEW_WIRE_CAP),
+    reminders: reminders.length,
+    remindersRunning: reminders.filter((r) => String(r?.status) === 'inProgress').length,
+  };
+}
+
 export function drillKindTag(kind) {
   switch (String(kind || '')) {
     case 'agentMessage': return 'ตอบ';

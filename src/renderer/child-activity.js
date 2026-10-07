@@ -15,7 +15,7 @@ import {
   drillKindTag,
   subagentDotClass,
   subagentStatusWord,
-} from './rightbar.js?v=1.1.3';
+} from './rightbar.js?v=1.1.4';
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
