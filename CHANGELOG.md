@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.27 — 2026-10-07
+
+Hotfix for the 1.1.26 overview/history code, caught by live screenshot
+verify on Guix: it called a `subKindOf` helper that exists nowhere, so
+every transcript with tool history painted
+"Can't find variable: subKindOf" and the thread-overview agent rows
+could never open. Agent classification now goes through
+`agentToolMeta(tool)` directly and overview status words mirror the
+tool rows (`ทำงานเบื้องหลัง` for background agents, else the shared
+wire-status label). Settled text-only turns keep their `ทำไป Xs`
+header (the live `กำลังทำ…` no longer vanishes on reload).
+Regression cover: new `renderer-contracts` suite (renderer no-undef
+scan + import resolution + helper shapes).
+Full note: [docs/releases/v1.1.27-overview-hotfix.md](docs/releases/v1.1.27-overview-hotfix.md).
+
+## 1.1.26 — 2026-10-07
+
+ChatGPT Desktop parity: live + settled turn headers (`กำลังทำ Xs` /
+`ทำไป Xs`), persisted `durationMs`, thread overview popup (`▦`:
+Subagents / Tasks / Goal), composer goal strip with pause/resume.
+Full note: [docs/releases/v1.1.26-thread-overview.md](docs/releases/v1.1.26-thread-overview.md).
+
 ## 1.1.25 — 2026-10-07
 
 Result-stack dividers actually reach history: the history wrap holds one

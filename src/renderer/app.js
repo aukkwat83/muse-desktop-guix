@@ -510,7 +510,7 @@ function messageNode(msg, index = null) {
     // Settled turns keep the same header shape as live ones — ChatGPT
     // Desktop's `Worked for 36s · …`; pre-1.1.26 transcripts without a
     // persisted duration fall back to counts only.
-    const histAgents = histTools.filter((t) => agentToolMeta(subKindOf(t))).length;
+    const histAgents = histTools.filter((t) => agentToolMeta(t)).length;
     const pg = progressGroupNode(
       turnHeaderLabel({
         running: false,
@@ -531,6 +531,11 @@ function messageNode(msg, index = null) {
     wrap.append(pg.group);
     return pg;
   };
+  // A settled text-only turn still earns its header when the server
+  // persisted a duration — the live `กำลังทำ…` must settle into a
+  // visible `ทำไป Xs`, not vanish on reload. Pre-1.1.26 transcripts
+  // without a duration stay bare like the reference's plain answers.
+  if (msg.meta?.durationMs != null && !histTools.length && !histPlan.length) ensureHistPg();
   for (const key of messageChildOrder(msg)) {
     if (key === 'tools') {
       const pg = ensureHistPg();
@@ -1245,14 +1250,15 @@ function openThreadOverview() {
   };
   // Subagents — agent rows of the live turn, newest last like the rail.
   const agentsUl = mkSection('Subagents');
-  const agentTools = tv ? [...tv.tools.values()].map((n) => n.tool).filter((t) => agentToolMeta(subKindOf(t))) : [];
+  const agentTools = tv ? [...tv.tools.values()].map((n) => n.tool).filter((t) => agentToolMeta(t)) : [];
   if (!agentTools.length) agentsUl.append(mkEmpty('ยังไม่มี subagent ในเทิร์นนี้'));
   for (const tool of agentTools) {
-    const meta = agentToolMeta(subKindOf(tool));
-    const label = agentSubtitle(tool, meta) || meta.label;
-    const status = toolDisplayState(tool).status;
-    const word = status === 'running' ? 'กำลังรัน' : status === 'error' ? 'ล้มเหลว' : 'เสร็จ';
-    agentsUl.append(mkRow(meta.icon || '✳', label, word, `${label} — ${word}`, () => rightbar.reveal('agents')));
+    // agentToolMeta takes the tool itself (reads tool.rawInput) — there is
+    // no subKindOf helper. Status words mirror the tool rows: background
+    // agents say so, everything else uses the shared wire-status label.
+    const label = agentSubtitle(tool);
+    const word = toolDisplayState(tool) === 'background' ? 'ทำงานเบื้องหลัง' : toolStatusLabel(tool.status);
+    agentsUl.append(mkRow('✳', label, word, `${label} — ${word}`, () => rightbar.reveal('agents')));
   }
   // Tasks — live plan checklist.
   const tasksUl = mkSection('Tasks');
