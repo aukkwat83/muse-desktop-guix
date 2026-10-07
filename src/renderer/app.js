@@ -489,6 +489,9 @@ function messageNode(msg, index = null) {
     return stamp(div);
   }
   const wrap = stamp(document.createElement('div'));
+  // Class hook for the result-stack dividers (same blocks as the live
+  // paint's direct children). Class-only — order untouched (BUG-031).
+  wrap.classList.add('msg-assistant-turn');
   // Same order as the live paint (liveChildOrder) — a reload that reshuffles
   // tools/plan/answer reads as a visible jump right after turn_done (BUG-031).
   // Tools + plan ride inside one collapsed progress group; the answer stays

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.25 — 2026-10-07
+
+Result-stack dividers actually reach history: the history wrap holds one
+assistant wrap per message (not blocks), so it gets a
+`.msg-assistant-turn` hook and the rule scopes to
+`.turn.live-turn` + `.msg-assistant-turn`. Caught by pixel scan of a
+WebKit snapshot (the 1.1.23 rule only divided live turns and drew
+between messages instead).
+
 ## 1.1.24 — 2026-10-07
 
 Result-stack dividers use the standard `--line` separator token —
