@@ -265,6 +265,31 @@ test('reduced-motion blocks only name classes that exist in the renderer', () =>
   assert.equal(missing.length, 0, `dead selectors: ${[...new Set(missing)].join(', ')}`);
 });
 
+// ------------------------------------------------------- goal strip
+// The composer goal strip is a sibling ABOVE the form (own row), never a
+// flex item inside the prompt row — inside, it shared the prompt line and
+// overflowed the edge. Its styles are id-scoped: the `.goal-bar` /
+// `.goal-objective` classes belong to the panel progress rows, which live
+// under `.goal-block` (1.1.28 un-collided the two).
+test('goal strip sits outside the composer form on its own row (1.1.28)', () => {
+  const formOpen = html.indexOf('<form id="composer"');
+  const formClose = html.indexOf('</form>');
+  assert.ok(formOpen !== -1 && formClose > formOpen, 'composer form not found in index.html');
+  const strip = html.indexOf('id="goal-bar"');
+  assert.ok(strip !== -1, '#goal-bar not found in index.html');
+  assert.ok(
+    strip < formOpen || strip > formClose,
+    '#goal-bar is inside form#composer — it must be a sibling above it',
+  );
+});
+
+test('goal strip styles are id-scoped, panel rows under .goal-block (1.1.28)', () => {
+  assert.ok(/^#goal-bar\s*\{/m.test(styleCss), 'missing id-scoped #goal-bar rule');
+  assert.ok(!/^\.goal-bar\s*\{/m.test(styleCss), 'unscoped .goal-bar block rule — the strip and the panel track collide again');
+  assert.ok(/^\.goal-block \.goal-bar\s*\{/m.test(styleCss), 'panel progress track must live under .goal-block');
+  assert.ok(!/^\.goal-objective\s*\{/m.test(styleCss), 'unscoped .goal-objective block rule — panel/strip text rules collide again');
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {

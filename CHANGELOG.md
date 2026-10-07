@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.28 — 2026-10-07
+
+Composer goal strip gets its own row: it was a flex item inside the
+prompt row, sharing the line and overflowing the edge. The strip is
+now a sibling above the composer (gutter-aligned card), id-scoped in
+CSS, and squeezes gracefully (objective ellipsizes first, then the
+meta). The same pass un-collides `.goal-bar` / `.goal-objective` —
+the classes now belong only to the panel progress rows under
+`.goal-block`.
+Full note: [docs/releases/v1.1.28-goal-strip-row.md](docs/releases/v1.1.28-goal-strip-row.md).
+
 ## 1.1.27 — 2026-10-07
 
 Hotfix for the 1.1.26 overview/history code, caught by live screenshot

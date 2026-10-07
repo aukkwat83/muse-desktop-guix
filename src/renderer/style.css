@@ -3420,7 +3420,7 @@ button.drill-row:hover {
   gap: 5px;
 }
 
-.goal-objective {
+.goal-block .goal-objective {
   font-size: var(--fs-callout);
   font-weight: 600;
   line-height: 1.4;
@@ -3428,7 +3428,7 @@ button.drill-row:hover {
   word-break: break-word;
 }
 
-.goal-bar {
+.goal-block .goal-bar {
   height: 5px;
   border-radius: 3px;
   background: var(--panel-2);
@@ -3619,26 +3619,32 @@ button.drill-row:hover {
 /* ------ ChatGPT Desktop parity: goal bar, overview popup, agent chips (1.1.26) ------ */
 
 /* Thread goal strip docked above the composer input. */
-.goal-bar {
+/* Composer goal strip (1.1.28): id-scoped — the `.goal-bar` / `.goal-objective`
+   classes belong to the panel progress rows under `.goal-block`. The strip is
+   a sibling above the composer form (own row, gutter-aligned card); the
+   objective absorbs the squeeze with an ellipsis and the meta shrinks next,
+   so the row fits instead of overflowing the edge. */
+#goal-bar {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
   padding: 6px 10px;
-  margin-bottom: 6px;
+  margin: 0 20px 6px;
+  overflow: hidden;
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   font-size: var(--fs-footnote);
 }
-.goal-bar[hidden] {
+#goal-bar[hidden] {
   display: none;
 }
-.goal-bar .goal-glyph {
+#goal-bar .goal-glyph {
   color: var(--accent-text);
   flex: none;
 }
-.goal-bar .goal-objective {
+#goal-bar .goal-objective {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -3646,12 +3652,15 @@ button.drill-row:hover {
   white-space: nowrap;
   color: var(--ink);
 }
-.goal-bar .goal-meta {
-  flex: none;
+#goal-bar .goal-meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--muted);
   white-space: nowrap;
 }
-.goal-bar .goal-btn {
+#goal-bar .goal-btn {
   flex: none;
   background: transparent;
   border: 1px solid var(--line);
@@ -3661,11 +3670,11 @@ button.drill-row:hover {
   padding: 2px 8px;
   cursor: pointer;
 }
-.goal-bar .goal-btn:hover {
+#goal-bar .goal-btn:hover {
   border-color: var(--accent-line);
   color: var(--ink);
 }
-.goal-bar .goal-btn:disabled {
+#goal-bar .goal-btn:disabled {
   opacity: 0.5;
   cursor: default;
 }
