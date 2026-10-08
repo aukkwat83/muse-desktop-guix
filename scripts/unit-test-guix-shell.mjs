@@ -11,6 +11,9 @@
  *   - R39  cache-ignoring reload (WebKitGTK serves the stale bundle otherwise)
  *   - R58  host restart action + Web Inspector — mac shell parity
  *   - build freshness: the shipped binary must not be older than main.c
+ *   - zombie-window recovery (1.1.34): on_activate verifies the existing
+ *     window against the X server and rebuilds when the surface died
+ *     externally (the 2026-10-08 "won't open" — e2e-shell-zombie.mjs)
  *   - the native-launch prebuilt fast path (a `guix shell` wrap on every launch
  *     looks exactly like "the app won't open")
  *
@@ -199,8 +202,8 @@ test('routes wait for hydration and clear only on receipt', () => {
 test('closed windows rebuild on tap instead of dangling', () => {
   assert(/"destroy", G_CALLBACK\(on_shell_window_destroy\)/.test(main),
     'window destroy must drop the dangling view');
-  assert(/if \(!g_view && g_app\)\s*\n\s*g_application_activate\(g_app\);/.test(main),
-    'a tap with no window must activate (create) one, not route nowhere');
+  assert(/if \(\(!g_view \|\| !shell_view_usable\(\)\) && g_app\)\s*\n\s*g_application_activate\(g_app\);/.test(main),
+    'a tap with no (usable) window must activate (create) one, not route nowhere');
   assert(/GtkNative \*native = gtk_widget_get_native/.test(main),
     'get_native returns GtkNative*, not GtkWidget* (Guix compile error)');
 });
@@ -248,6 +251,49 @@ test('python fallback shell mirrors the notify contract', () => {
   assert(/_boot_ready/.test(py) && /op == "ready"/.test(py), 'python shell must wait for the hydration handshake');
   assert(/op == "routed"/.test(py), 'python shell must clear routes only on receipt');
   assert(/self\._win = None/.test(py) && /self\.activate\(\)/.test(py), 'python shell must rebuild closed windows on tap');
+});
+
+console.log(`\n${c.b}== zombie-window recovery (1.1.34) ==${c.x}`);
+test('on_activate verifies the existing window before presenting it', () => {
+  assert(/if \(shell_window_usable\(existing\)\)/.test(main),
+    'a dead surface still reports visible+mapped — presenting it unverified is the 2026-10-08 "won\'t open"');
+  assert(/gtk_window_present\(existing\);/.test(main), 'healthy windows must still present, not rebuild');
+});
+test('an unusable window is destroyed and rebuilt, never presented', () => {
+  const act = main.slice(main.indexOf('static void on_activate'), main.indexOf('int main('));
+  assert(/gone at the X server — rebuilding/.test(act), 'the zombie path must log loudly (silent recovery hides regressions)');
+  assert(/gtk_window_destroy\(existing\);/.test(act),
+    'the zombie must be destroyed so the build below makes a fresh window');
+});
+test('the detector round-trips the X server (the only working probe)', () => {
+  assert(/static gboolean shell_window_usable\(GtkWindow \*win\)/.test(main), 'shell_window_usable missing');
+  assert(/GDK_IS_X11_DISPLAY/.test(main), 'the X check must be gated to X11 (Wayland has no external-destroy path)');
+  assert(/XGetWindowAttributes/.test(main) && /XSync/.test(main) && /XSetErrorHandler/.test(main),
+    'liveness needs attribute query + sync + a temporary error handler');
+  assert(/g_x11_err_code == 3 && g_x11_err_xid == xid/.test(main),
+    'only BadWindow for OUR xid proves a zombie — any other error is somebody else\'s request');
+});
+test('libX11 stays dlopened — no new link dependency', () => {
+  assert(/dlopen\(paths\[i\]/.test(main), 'libX11 must load via dlopen');
+  const build = read('linux/gtk-shell/build.sh');
+  assert(!/-lX11/.test(build), 'never link -lX11 (manifest has no libX11 headers by design)');
+  assert(/-ldl/.test(build), 'dlopen needs -ldl on old glibc (a stub on new)');
+});
+test('rebuilds do not stack a second memory meter', () => {
+  assert(/if \(g_meter_src == 0\)/.test(main),
+    'a second on_activate build must reuse the running meter source');
+});
+test('app id is overridable for e2e isolation (default unchanged)', () => {
+  assert(/MUSE_DESKTOP_APP_ID", "com\.aukkwat83\.MuseDesktop"/.test(main),
+    'override must default to the production app id');
+  assert(/g_application_id_is_valid/.test(main), 'an invalid override must fall back, not fail to register');
+});
+test('python fallback shell mirrors the zombie recovery', () => {
+  const py = read('linux/gtk-shell/muse_desktop_shell.py');
+  assert(/_x11_own_window_alive/.test(py), 'python shell missing the liveness check');
+  assert(/gone at the X server/.test(py), 'python shell must log the rebuild like the C shell');
+  assert(/MUSE_DESKTOP_APP_ID/.test(py), 'python shell must take the same app-id override');
+  assert(/if not self\._meter_id:/.test(py), 'python rebuilds must not stack a second meter');
 });
 
 console.log(`\n${c.b}== launcher guards (mac never executes these) ==${c.x}`);

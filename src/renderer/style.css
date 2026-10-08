@@ -1185,19 +1185,10 @@ svg.ico-lg {
 .rb-head {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 8px;
   padding: 12px 12px 10px;
   border-bottom: 1px solid var(--line-soft);
-}
-
-.rb-title {
-  flex: 1;
-  min-width: 0;
-  font-weight: 650;
-  letter-spacing: 0.2px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .rb-scroll {

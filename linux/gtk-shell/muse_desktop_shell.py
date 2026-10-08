@@ -18,6 +18,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+import ctypes
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -32,8 +33,118 @@ HOST = os.environ.get("MUSE_DESKTOP_HOST", "127.0.0.1")
 BASE = f"http://{HOST}:{PORT}/"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "muse-desktop"
 ROOT = Path(os.environ.get("MUSE_DESKTOP_ROOT", Path(__file__).resolve().parents[2]))
-APP_ID = "com.aukkwat83.MuseDesktop"
+APP_ID = os.environ.get("MUSE_DESKTOP_APP_ID", "com.aukkwat83.MuseDesktop")
 TITLE = "Muse Desktop"
+
+
+def _x11_own_window_alive() -> bool:
+    """C-shell parity for the 2026-10-08 zombie: is any toplevel with our PID
+    (and title) still known to the X server? Pure ctypes, no GdkX11
+    introspection gamble. Anything unjudgeable (no display, no libX11)
+    returns True — worst case is the old trust-present behaviour."""
+    if not os.environ.get("DISPLAY"):
+        return True
+    for cand in (
+        "/run/current-system/profile/lib/libX11.so.6",
+        "/usr/lib/libX11.so.6",
+        "/usr/lib64/libX11.so.6",
+        "libX11.so.6",
+    ):
+        try:
+            if cand.startswith("/") and not os.path.exists(cand):
+                continue
+            lib = ctypes.CDLL(cand)
+            break
+        except OSError:
+            continue
+    else:
+        return True
+    try:
+        lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        lib.XOpenDisplay.restype = ctypes.c_void_p
+        lib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        lib.XDefaultRootWindow.restype = ctypes.c_ulong
+        lib.XQueryTree.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        lib.XQueryTree.restype = ctypes.c_int
+        lib.XFree.argtypes = [ctypes.c_void_p]
+        lib.XFree.restype = ctypes.c_int
+        lib.XFetchName.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)
+        ]
+        lib.XFetchName.restype = ctypes.c_int
+        lib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        lib.XInternAtom.restype = ctypes.c_ulong
+        lib.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        lib.XGetWindowProperty.restype = ctypes.c_int
+        lib.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.XSync.restype = ctypes.c_int
+        lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        lib.XCloseDisplay.restype = ctypes.c_int
+        lib.XSetErrorHandler.argtypes = [ctypes.c_void_p]
+        lib.XSetErrorHandler.restype = ctypes.c_void_p
+        swallow = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)(
+            lambda dpy, ev: 0
+        )
+        lib.XSetErrorHandler(swallow)
+        dpy = lib.XOpenDisplay(None)
+        if not dpy:
+            return True
+        try:
+            root = lib.XDefaultRootWindow(dpy)
+            pid_atom = lib.XInternAtom(dpy, b"_NET_WM_PID", 0)
+            root_ret, parent_ret = ctypes.c_ulong(), ctypes.c_ulong()
+            kids, n = ctypes.POINTER(ctypes.c_ulong)(), ctypes.c_uint()
+            if not lib.XQueryTree(dpy, root, ctypes.byref(root_ret),
+                                  ctypes.byref(parent_ret), ctypes.byref(kids),
+                                  ctypes.byref(n)):
+                return True
+            try:
+                me = os.getpid()
+                for i in range(n.value):
+                    xid = kids[i]
+                    actual_t, actual_f = ctypes.c_ulong(), ctypes.c_int()
+                    nitems, after = ctypes.c_ulong(), ctypes.c_ulong()
+                    prop = ctypes.c_void_p()
+                    if lib.XGetWindowProperty(
+                        dpy, xid, pid_atom, 0, 1, 0, 6,  # noqa: PLR2004 - XA_CARDINAL
+                        ctypes.byref(actual_t), ctypes.byref(actual_f),
+                        ctypes.byref(nitems), ctypes.byref(after),
+                        ctypes.byref(prop),
+                    ):
+                        continue
+                    wpid = None
+                    if prop and nitems.value >= 1:
+                        wpid = ctypes.cast(prop, ctypes.POINTER(ctypes.c_long))[0]
+                        lib.XFree(prop)
+                    if wpid != me:
+                        continue
+                    name = ctypes.c_char_p()
+                    title = ""
+                    if lib.XFetchName(dpy, xid, ctypes.byref(name)) and name.value:
+                        title = name.value.decode("utf-8", errors="replace")
+                        lib.XFree(name)
+                    if TITLE in title:
+                        return True  # a live toplevel of ours exists (any map state)
+                lib.XSync(dpy, 0)
+                return False
+            finally:
+                if kids:
+                    lib.XFree(kids)
+        finally:
+            lib.XCloseDisplay(dpy)
+    except Exception:
+        return True
 
 
 def http_ok(path: str = "api/state", timeout: float = 1.5) -> bool:
@@ -140,9 +251,24 @@ class MuseDesktopApp(Gtk.Application):
 
     def do_activate(self):
         if self._win is not None:
-            self._win.present()
-            self._flush_route()
-            return
+            if _x11_own_window_alive():
+                self._win.present()
+                self._flush_route()
+                return
+            # Zombie (C shell parity, 2026-10-08): the surface died outside
+            # GTK with no signal — drop the dead window so the build below
+            # makes a fresh one instead of presenting it forever.
+            print(
+                "[native-shell] existing window is gone at the X server"
+                " — rebuilding",
+                flush=True,
+            )
+            self._win.destroy()
+            self._win = None
+            self._view = None
+            self._status = None
+            self._page_ready = False
+            self._boot_ready = False
 
         # Avoid GObject kwargs (broken on this PyGObject) — setters only
         self._win = Adw.ApplicationWindow()
@@ -180,7 +306,9 @@ class MuseDesktopApp(Gtk.Application):
         self._win.connect("close-request", self._on_close)
         self._win.present()
 
-        self._meter_id = GLib.timeout_add_seconds(8, self._poll_memory)
+        # Rebuilds must not stack a second meter (C shell parity).
+        if not self._meter_id:
+            self._meter_id = GLib.timeout_add_seconds(8, self._poll_memory)
         GLib.idle_add(self._poll_memory)
         print("[native-shell] window presented — engine=WebKitGTK host=", BASE)
 

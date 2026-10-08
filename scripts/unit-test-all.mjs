@@ -57,6 +57,7 @@ const SUITES = [
   ['search', 'unit-test-search.mjs'],
   ['attach', 'unit-test-attach.mjs'],
   ['e2e (mock agent)', 'e2e-mock-agent.mjs'],
+  ['e2e (shell zombie)', 'e2e-shell-zombie.mjs'],
 ];
 
 function run(file) {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.34 — 2026-10-08
+
+Zombie-window recovery: `on_activate` verifies the existing window against
+the X server (libX11 dlopened, conservative by design) and rebuilds when
+its surface died externally — the 2026-10-08 "won't open", now covered by
+`test:e2e-shell` (RED 2/4 pre-fix, GREEN 4/4) plus 7 static pins; same
+recovery mirrored in the Python fallback shell, `MUSE_DESKTOP_APP_ID`
+isolates e2e bus names. Rail heading `แผงขวา` removed (close-only header,
+content-based labels). `?v=`=1.1.34.
+Full note: [docs/releases/v1.1.34-zombie-recovery.md](docs/releases/v1.1.34-zombie-recovery.md).
+
 ## 1.1.33 — 2026-10-08
 
 Question workflow: pending→submitting→resolved on RPC ack or authoritative

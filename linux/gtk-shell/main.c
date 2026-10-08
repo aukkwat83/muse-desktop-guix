@@ -11,6 +11,10 @@
 #include <glib/gstdio.h>
 #include <adwaita.h>
 #include <webkit/webkit.h>
+#ifdef GDK_WINDOWING_X11
+#include <gdk/x11/gdkx.h>
+#endif
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -639,6 +643,117 @@ static void on_shell_window_destroy(GtkWidget *widget, gpointer user_data)
   g_status = NULL;
 }
 
+/* ---- Zombie-window recovery (2026-10-08 incident) ----
+ * The compositor (or any foreign X client) can destroy our toplevel out from
+ * under GTK: GDK logs "GdkSurface unexpectedly destroyed" and NO widget
+ * signal fires — no unmap, no hide, no destroy. The GtkWindow object stays in
+ * the application's window list (so the process lives on), still reporting
+ * visible=1 mapped=1 with a non-NULL surface — a probe proved every public
+ * API agrees the zombie is healthy. The only detector is asking the X server
+ * whether the xid still exists. Wayland has no such external-destroy path
+ * (killing the client kills our connection, not one surface), so there the
+ * window is trusted as before. */
+struct x11_err_evt {
+  int type;
+  void *display;
+  unsigned long resourceid;
+  unsigned long serial;
+  unsigned char error_code;
+  unsigned char request_code;
+  unsigned char minor_code;
+};
+
+static unsigned long g_x11_err_xid = 0;
+static unsigned int g_x11_err_code = 0;
+
+static int x11_probe_error(void *dpy, void *ev)
+{
+  (void)dpy;
+  struct x11_err_evt *e = (struct x11_err_evt *)ev;
+  g_x11_err_code = e->error_code;
+  g_x11_err_xid = e->resourceid;
+  return 0;
+}
+
+/* TRUE when the window can actually be presented. Conservative by design:
+ * anything we cannot judge (not X11, libX11 unresolvable, never shown)
+ * returns TRUE — worst case is the old behaviour, never destroying a window
+ * we could have presented. Main-loop only (Activates run there). */
+static gboolean shell_window_usable(GtkWindow *win)
+{
+#ifdef GDK_WINDOWING_X11
+  GdkDisplay *gdpy = gdk_display_get_default();
+  if (gdpy != NULL && GDK_IS_X11_DISPLAY(gdpy)) {
+    GdkSurface *s = gtk_native_get_surface(GTK_NATIVE(win));
+    if (s == NULL)
+      return TRUE; /* never shown — trust the build path */
+    /* libX11 via dlopen: no new link dep (build.sh links gtk/adwaita/webkit
+     * only), absolute system path first so a shifted store cannot break it. */
+    static void *x11 = NULL;
+    static int inited = 0;
+    static int (*XGetWindowAttributes_fn)(void *, unsigned long, void *) = NULL;
+    static int (*XSync_fn)(void *, int) = NULL;
+    static void *(*XSetErrorHandler_fn)(void *) = NULL;
+    if (!inited) {
+      inited = 1;
+      const char *paths[] = {
+        "/run/current-system/profile/lib/libX11.so.6",
+        "/usr/lib/libX11.so.6",
+        "/usr/lib64/libX11.so.6",
+        "libX11.so.6",
+        NULL,
+      };
+      for (int i = 0; paths[i] != NULL && x11 == NULL; i++)
+        x11 = dlopen(paths[i], RTLD_NOW | RTLD_LOCAL);
+      if (x11 != NULL) {
+        XGetWindowAttributes_fn = dlsym(x11, "XGetWindowAttributes");
+        XSync_fn = dlsym(x11, "XSync");
+        XSetErrorHandler_fn = dlsym(x11, "XSetErrorHandler");
+      }
+    }
+    if (x11 != NULL && XGetWindowAttributes_fn != NULL && XSync_fn != NULL &&
+        XSetErrorHandler_fn != NULL) {
+      /* Deprecated but irreplaceable: nothing else hands out the Display* /
+       * xid a server round-trip needs. Narrowly suppressed, not -Wno. */
+G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+      void *dpy = gdk_x11_display_get_xdisplay(gdpy);
+      unsigned long xid = (unsigned long)gdk_x11_surface_get_xid(s);
+G_GNUC_END_IGNORE_DEPRECATIONS
+      /* XGetWindowAttributes fills sizeof(XWindowAttributes) (~136 bytes on
+       * LP64, ABI-stable); only success vs BadWindow matters here. */
+      char attrs[512];
+      memset(attrs, 0, sizeof(attrs));
+      g_x11_err_code = 0;
+      g_x11_err_xid = 0;
+      void *old = XSetErrorHandler_fn(x11_probe_error);
+      XGetWindowAttributes_fn(dpy, xid, attrs);
+      XSync_fn(dpy, 0);
+      XSetErrorHandler_fn(old);
+      /* BadWindow(3) for OUR xid means the server has no such window. Any
+       * other error is somebody else's in-flight request — ignore it. */
+      if (g_x11_err_code == 3 && g_x11_err_xid == xid)
+        return FALSE;
+    }
+  }
+#else
+  (void)win;
+#endif
+  return TRUE;
+}
+
+/* Banner-tap twin of the on_activate check: a zombie view's native window
+ * presents nowhere, so taps must route through activation (which rebuilds)
+ * instead of presenting dead pixels. */
+static gboolean shell_view_usable(void)
+{
+  if (!g_view)
+    return FALSE;
+  GtkNative *native = gtk_widget_get_native(GTK_WIDGET(g_view));
+  if (native == NULL || !GTK_IS_WINDOW(native))
+    return FALSE;
+  return shell_window_usable(GTK_WINDOW(native));
+}
+
 /* Banner tap → window up, then route the renderer. The ids come from the
  * GAction's typed (ss) parameter (set at show time). When no window
  * exists (closed, or a cold D-Bus activation racing startup), activate
@@ -652,7 +767,7 @@ static void on_open_question_action(GSimpleAction *action, GVariant *parameter,
   char *ix_id = NULL;
   if (parameter != NULL)
     g_variant_get(parameter, "(ss)", &chat_id, &ix_id);
-  if (!g_view && g_app)
+  if ((!g_view || !shell_view_usable()) && g_app)
     g_application_activate(g_app);
   muse_present_window();
   queue_question_route(chat_id, ix_id);
@@ -1013,9 +1128,15 @@ static void on_activate(GtkApplication *app, gpointer user_data)
    * presents the existing window instead of building a duplicate. */
   GtkWindow *existing = gtk_application_get_active_window(app);
   if (existing != NULL) {
-    gtk_window_present(existing);
-    flush_pending_route();
-    return;
+    if (shell_window_usable(existing)) {
+      gtk_window_present(existing);
+      flush_pending_route();
+      return;
+    }
+    /* Zombie (see shell_window_usable): drop it so the build below makes a
+     * fresh window instead of presenting a dead one forever. */
+    fprintf(stderr, "[native-shell] existing window is gone at the X server — rebuilding\n");
+    gtk_window_destroy(existing);
   }
   AdwApplicationWindow *win = ADW_APPLICATION_WINDOW(adw_application_window_new(app));
   gtk_window_set_title(GTK_WINDOW(win), "Muse Desktop");
@@ -1147,7 +1268,10 @@ static void on_activate(GtkApplication *app, gpointer user_data)
   gtk_widget_add_controller(GTK_WIDGET(win), keys);
 
   gtk_window_present(GTK_WINDOW(win));
-  g_meter_src = g_timeout_add_seconds(8, poll_memory, NULL);
+  /* Rebuilds must not stack a second meter: the first source keeps firing
+   * against the recreated status label. */
+  if (g_meter_src == 0)
+    g_meter_src = g_timeout_add_seconds(8, poll_memory, NULL);
   poll_memory(NULL);
 
   fprintf(stderr, "[native-shell] presented WebKitGTK → %s\n", g_base_url);
@@ -1168,7 +1292,16 @@ int main(int argc, char **argv)
   ensure_host();
 
   adw_init();
-  AdwApplication *app = adw_application_new("com.aukkwat83.MuseDesktop", G_APPLICATION_DEFAULT_FLAGS);
+  /* Test/dev override so an e2e instance can own its own bus name beside the
+   * live app (production default unchanged — an invalid id falls back). */
+  char *app_id = env_or("MUSE_DESKTOP_APP_ID", "com.aukkwat83.MuseDesktop");
+  if (!g_application_id_is_valid(app_id)) {
+    fprintf(stderr, "[native-shell] invalid MUSE_DESKTOP_APP_ID '%s' — using default\n", app_id);
+    g_free(app_id);
+    app_id = g_strdup("com.aukkwat83.MuseDesktop");
+  }
+  AdwApplication *app = adw_application_new(app_id, G_APPLICATION_DEFAULT_FLAGS);
+  g_free(app_id);
   g_signal_connect(app, "startup", G_CALLBACK(on_startup), NULL);
   g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
   int status = g_application_run(G_APPLICATION(app), argc, argv);

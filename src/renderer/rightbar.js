@@ -463,12 +463,13 @@ export function createRightbar({ api, aside, toggleBtn }) {
   aside.replaceChildren();
 
   const head = el('div', 'rb-head');
-  head.append(el('div', 'rb-title', 'แผงขวา'));
+  // No heading text: the rail holds session + cost sections that label
+  // themselves — a "right panel" title states position, not content (1.1.34).
   const close = el('button', 'btn ghost sm');
   setIcon(close, 'x', 'ico ico-sm');
   close.type = 'button';
-  close.title = 'ซ่อนแผงขวา';
-  close.setAttribute('aria-label', 'ซ่อนแผงขวา');
+  close.title = 'ซ่อนแผง';
+  close.setAttribute('aria-label', 'ซ่อนแผง');
   close.addEventListener('click', () => setOpen(false));
   head.append(close);
   aside.append(head);
