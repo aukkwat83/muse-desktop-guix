@@ -12,24 +12,27 @@
 //     chat's chunks land in the visible transcript. `turnViews` keeps one
 //     record per chat and paints only when that chat is on screen.
 
-import { renderMarkdown, installCodeCopyDelegation, copyTextToClipboard, paintMarkdownDiagrams, applyMermaidTheme, installDiagramDownloadDelegation } from './markdown.js?v=0.4.4';
-import { escapeHtml } from './markdown-core.js?v=0.4.1';
-import { Sidebar } from './sidebar.js?v=0.4.6';
+import { renderMarkdown, installCodeCopyDelegation, copyTextToClipboard, paintMarkdownDiagrams, applyMermaidTheme, installDiagramDownloadDelegation } from './markdown.js?v=0.5.1';
+import { escapeHtml } from './markdown-core.js?v=0.5.1';
+import { Sidebar } from './sidebar.js?v=0.5.0';
+import { iconElement, iconSvgString, setIcon, setIconLabel, updateIconLabel } from './icons.js?v=1.0.0';
 import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
 import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
-import { closePopover, miniConfirm, openMenu, openPanel } from './popover.js?v=0.4.2';
-import { createMcpPanel } from './mcp-panel.js?v=1.0.0';
-import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, subagentStatusWord, subagentSub, subagentTitle } from './rightbar.js?v=1.1.4';
-import { createChildActivity } from './child-activity.js?v=1.0.0';
+import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.5.1';
+import { createMcpPanel } from './mcp-panel.js?v=1.1.0';
+import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, unionSubagentCounts } from './rightbar.js?v=1.2.0';
+import { createChildActivity } from './child-activity.js?v=1.1.0';
+import { createOverviewPanel, resolvePlan } from './overview-panel.js?v=1.1.0';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
 import { formatCtxMeter } from './ctx-meter.js?v=1.0.0';
 import { computePin } from './scroll-pin.js?v=0.4.0';
+import { createWireRevisions } from './wire-rev.js?v=1.0.2';
 import { createComposerDraftStore } from './composer-draft.js?v=0.4.0';
 import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.4.0';
 import { adaptiveHistoryDefaults, computeHistoryStartIndex, expandHistoryStartIndex, sliceHistoryMessages } from './history-window.js?v=0.4.0';
 import { parseSlashCommand } from './slash-commands.js?v=0.4.0';
 import { chatToMarkdown } from './transcript-markdown.js?v=0.4.0';
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.4.24';
+import { createTurnView, bindTurnId, interruptedMarkerText, stripMarkerGlyph, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.4.26';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -143,6 +146,11 @@ const wireSubagents = new Map();
 const wireGoals = new Map();
 /** chatId → { ctx, tokens, baseChars } — usage snaps + estimator anchor. */
 const wireCtx = new Map();
+/** Per-resource revisions so GET snapshots never overwrite newer same-chat
+ * SSE (a slow fetch resolving after a live frame would resurrect a cleared
+ * goal or re-run a landed child). Every mirror write bumps; every snapshot
+ * apply checks its captured revision first. */
+const wireRevs = createWireRevisions();
 
 /* Realtime CTX estimator (grok-desktop app.js:1440-1472): contextUsage only
  * moves when the (window, used, pressure) triple changes, so between snaps
@@ -180,6 +188,7 @@ function snapCtxLive(chatId, ctx, tokens) {
     baseChars: tvLen,
   };
   wireCtx.set(chatId, merged);
+  wireRevs.bump(chatId, 'ctx');
   if (chatId === state.activeId) paintCtxPill();
   rightbar.applyCtx(chatId, merged.tokens, costModelFor(chatId));
 }
@@ -286,16 +295,6 @@ function scheduleCtxLive(chatId) {
   });
 }
 
-function wireSubagentCounts(chatId) {
-  let running = 0;
-  let total = 0;
-  for (const rec of wireSubagents.get(chatId)?.values() || []) {
-    total += 1;
-    if (rec.status === 'inProgress') running += 1;
-  }
-  return { running, total };
-}
-
 // ------------------------------------------------------------------ api
 
 async function api(path, options = {}) {
@@ -342,12 +341,13 @@ function paintMcpButton(snap) {
 }
 
 const mcpPanel = createMcpPanel({ api, onSnapshot: paintMcpButton });
-// Right rail (Codex Desktop parity): cost · goal/tasks · subagents · SCB.
-// Hidden by default; the ☰ button and the head-bar chips open it. It replaces
-// the old floating subagents/tasks popovers — one rail, no stacked popups.
+// Right rail: session identity + cost only. Goal, tasks and subagents live in
+// the live overview popup — every chip and activity link below opens it.
 const rightbar = createRightbar({ api, aside: el.rightbar, toggleBtn: el.rightbarToggle });
-// Inline child activity inside transcript agent rows (nested delegate view).
-const childActivity = createChildActivity({ api, onOpenRail: () => rightbar.reveal('agents') });
+const overview = createOverviewPanel({ api });
+// Inline child activity inside transcript agent rows (nested delegate view) —
+// the full view opens drilled into that exact child in the overview popup.
+const childActivity = createChildActivity({ api, onOpenRail: (cid, item, anchor) => openChildOverview(cid, item, anchor) });
 
 // ------------------------------------------------------------ turn view
 
@@ -459,8 +459,25 @@ function cancelPendingScroll() {
 function interruptedMarkerNode(reason) {
   const div = document.createElement('div');
   div.className = 'turn-interrupted-marker';
-  div.textContent = interruptedMarkerText(reason);
+  // The persisted string keeps its leading glyph (pure-data contract), but
+  // the paint shows the vector twin: strip the glyph, mount the icon.
+  const text = document.createElement('span');
+  text.textContent = stripMarkerGlyph(interruptedMarkerText(reason));
+  const ico = document.createElement('span');
+  ico.className = 'marker-ico';
+  ico.setAttribute('aria-hidden', 'true');
+  setIcon(ico, reason === 'watchdog' ? 'warn' : 'stop', 'ico ico-sm');
+  div.append(ico, text);
   return div;
+}
+
+/**
+ * One chevron paint for every collapsible glyph (.tool-head .glyph,
+ * .progress-head .glyph): open state in, vector out. Callers never touch
+ * textContent here — that would erase the SVG.
+ */
+function paintGlyph(el, open) {
+  setIcon(el, open ? 'chevDown' : 'chevRight', 'ico ico-sm');
 }
 
 /**
@@ -524,7 +541,7 @@ function messageNode(msg, index = null) {
       () => {
         const collapsed = !pg.group.classList.contains('pg-collapsed');
         pg.group.classList.toggle('pg-collapsed', collapsed);
-        pg.glyphEl.textContent = collapsed ? '▸' : '▾';
+        paintGlyph(pg.glyphEl, !collapsed);
       },
     );
     histPg = pg;
@@ -562,7 +579,7 @@ function messageNode(msg, index = null) {
 function setToolRowCollapsed(row, collapsed) {
   row.classList.toggle('collapsed', collapsed);
   const glyph = row.querySelector('.tool-head .glyph');
-  if (glyph) glyph.textContent = collapsed ? '▸' : '▾';
+  if (glyph) paintGlyph(glyph, !collapsed);
 }
 
 function toolNode(tool, existing = null, onUserToggle = null) {
@@ -582,7 +599,8 @@ function toolNode(tool, existing = null, onUserToggle = null) {
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'tool-toggle';
-    toggle.innerHTML = '<span class="glyph">▸</span><span class="name"></span><span class="sub"></span><span class="status"></span>';
+    toggle.innerHTML = '<span class="glyph" aria-hidden="true"></span><span class="name"></span><span class="sub"></span><span class="status"></span>';
+    paintGlyph(toggle.querySelector('.glyph'), false);
     toggle.title = 'แสดง/ซ่อน console ของ tool นี้';
     const flip = () => {
       const collapsed = !row.classList.contains('collapsed');
@@ -684,7 +702,8 @@ function progressGroupNode(label, open, onToggle) {
   head.title = 'แสดง/ซ่อนความคืบหน้าทั้งหมดของเทิร์นนี้';
   const glyph = document.createElement('span');
   glyph.className = 'glyph';
-  glyph.textContent = open ? '▾' : '▸';
+  glyph.setAttribute('aria-hidden', 'true');
+  paintGlyph(glyph, open);
   const text = document.createElement('span');
   text.className = 'progress-label';
   text.textContent = label;
@@ -876,14 +895,14 @@ function renderTranscript({ stick = true } = {}) {
   if (!chat) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.innerHTML = '<span class="big">◗</span>เลือกแชทด้านซ้าย หรือกด ＋ เพื่อเริ่มใหม่';
+    empty.innerHTML = `${iconSvgString('brand', 'ico empty-mark')}<span>เลือกแชทด้านซ้าย หรือกด + เพื่อเริ่มใหม่</span>`;
     el.transcript.append(empty);
     return;
   }
   if (!chat.messages.length && !isRunning(chat.id)) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.innerHTML = '<span class="big">◗</span>พิมพ์คำถามด้านล่างเพื่อเริ่มคุยกับ Muse';
+    empty.innerHTML = `${iconSvgString('brand', 'ico empty-mark')}<span>พิมพ์คำถามด้านล่างเพื่อเริ่มคุยกับ Muse</span>`;
     el.transcript.append(empty);
   }
 
@@ -1011,7 +1030,11 @@ function paintLiveTurn(rebuild = false) {
         : null;
       if (chosen && !chosen.classList.contains('chosen')) {
         chosen.classList.add('chosen');
-        chosen.textContent = `${chosen.textContent} ✓ เลือกแล้ว`;
+        // Append (guarded by .chosen): a textContent rewrite would erase a
+        // re-painted icon, and re-paints must not stack suffixes either.
+        const mark = iconElement('check', 'ico ico-sm');
+        if (mark) chosen.appendChild(mark);
+        chosen.append(document.createTextNode(' เลือกแล้ว'));
       }
       continue;
     }
@@ -1037,7 +1060,7 @@ function paintLiveTurn(rebuild = false) {
   }
   liveProgress.labelEl.textContent = liveTurnHeaderLabel(tv, sum, agents);
   liveProgress.group.classList.toggle('pg-collapsed', !tv.progressOpen);
-  liveProgress.glyphEl.textContent = tv.progressOpen ? '▾' : '▸';
+  paintGlyph(liveProgress.glyphEl, tv.progressOpen);
   liveProgress.group.classList.toggle('pg-running', sum.running > 0);
 
   // Pin the order — a tool call that starts after some answer text must still
@@ -1095,9 +1118,12 @@ function updateRunningChrome() {
   // turn-view.js:335-341 + composerMorph 1052-1063).
   const cancelling = !!tv?.cancelling;
   el.send.classList.toggle('stopping', running);
-  el.send.textContent = running ? (cancelling ? '…' : '■') : '↑';
+  // One morphing control: send ⇄ stop ⇄ cancelling-dots. The icon swaps,
+  // the accessible name follows — textContent here would erase the SVG.
+  setIcon(el.send, running ? (cancelling ? 'ellipsis' : 'stop') : 'arrowUp', 'ico ico-lg');
   el.send.disabled = cancelling;
   el.send.title = running ? (cancelling ? 'กำลังหยุด…' : 'Stop (Esc)') : 'Send (⏎)';
+  el.send.setAttribute('aria-label', running ? (cancelling ? 'กำลังหยุด' : 'หยุด') : 'ส่งข้อความ');
   el.statusLine.hidden = !running;
 
   if (running) {
@@ -1136,7 +1162,11 @@ function updateRunningChrome() {
  */
 function updateTasksGoalChips() {
   const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
-  const entries = Array.isArray(tv?.plan) ? tv.plan : [];
+  // The live plan dies with its turn view on settle — the persisted
+  // transcript plan keeps the chip honest after (same fallback as the popup).
+  const entries = state.activeId
+    ? resolvePlan(tv?.plan, state.activeId === state.chat?.id ? state.chat?.messages : null)
+    : [];
   const done = entries.filter((t) => String(t?.status) === 'completed').length;
   el.tasksChip.hidden = entries.length === 0;
   if (entries.length) {
@@ -1175,11 +1205,25 @@ function updateGoalBar(goal) {
   if (el.goalMeta) el.goalMeta.textContent = `${pct}% · ${goalStatusWord(goal.status)}`;
   if (el.goalBarBtn) {
     const control = goalControlFor(goal.status);
-    el.goalBarBtn.hidden = !control;
-    if (control) {
-      el.goalBarBtn.textContent = control === 'pause' ? '⏸ หยุดชั่วคราว' : '▶ ทำต่อ';
-      el.goalBarBtn.title = control === 'pause' ? 'หยุด goal ชั่วคราว' : 'ทำ goal ต่อ';
+    // Only pause/resume are verbs — a completed goal ('done') offers no
+    // button at all. The old fallthrough rendered 'done' as Resume and
+    // POSTed an action the server rejects.
+    const actionable = control === 'pause' || control === 'resume';
+    el.goalBarBtn.hidden = !actionable;
+    if (actionable) {
+      // A rehydrated goal on a cold chat shows state with a disabled verb —
+      // the server 409s commands without a live agent, so never offer them.
+      const cold = !state.chat?.live;
+      // Repaint the whole icon + label: a textContent write would erase the
+      // SVG, and pause/resume swap both the glyph and the word together.
+      setIconLabel(el.goalBarBtn, control === 'pause' ? 'pause' : 'play', control === 'pause' ? 'หยุดชั่วคราว' : 'ทำต่อ', 'ico ico-sm');
+      el.goalBarBtn.title = cold
+        ? 'รอ agent spawn ก่อน (prompt สักครั้ง)'
+        : control === 'pause' ? 'หยุด goal ชั่วคราว' : 'ทำ goal ต่อ';
+      el.goalBarBtn.disabled = cold;
       el.goalBarBtn.dataset.action = control;
+    } else {
+      delete el.goalBarBtn.dataset.action;
     }
   }
 }
@@ -1192,118 +1236,51 @@ async function sendGoalBarCommand() {
   try {
     await api(`/api/chats/${encodeURIComponent(chatId)}/goal`, { method: 'POST', body: { action } });
   } catch (err) {
-    if (el.goalBarBtn) {
-      el.goalBarBtn.disabled = false;
-      el.goalBarBtn.title = `สั่งไม่ได้: ${err?.message || err}`;
-    }
+    if (el.goalBarBtn) el.goalBarBtn.title = `สั่งไม่ได้: ${err?.message || err}`;
+  } finally {
+    // Success used to leave the button disabled until the next goal SSE —
+    // repaint from the mirror so repeated pause/resume always works. But
+    // only when the chat is still active: an A→B switch while A's command
+    // resolves must not paint A's goal into B's bar.
+    if (el.goalBarBtn && state.activeId === chatId) updateGoalBar(wireGoals.get(chatId) ?? null);
   }
 }
 
-/**
- * Thread overview popup — ChatGPT Desktop's header toggle (Outputs /
- * Subagents / Sources): one glance at this chat's live turn with a row per
- * subagent, task, and the session goal. Rows drill into the right rail;
- * empty sections collapse to a quiet hint instead of a bare list.
- */
-function openThreadOverview() {
-  const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
-  const goal = state.activeId ? wireGoals.get(state.activeId) : null;
-  const root = document.createElement('div');
-  root.className = 'panel thread-overview';
-  const mkSection = (title) => {
-    const h = document.createElement('h2');
-    h.textContent = title;
-    root.append(h);
-    const ul = document.createElement('ul');
-    root.append(ul);
-    return ul;
+function overviewSnap(chatId) {
+  const tv = chatId ? state.turnViews.get(chatId) : null;
+  // state.chat must be THIS chat — while a new chat's fetch is in flight,
+  // state.activeId already moved but state.chat still holds the old
+  // transcript; reading it would paint old title/tasks under the new id.
+  const chat = state.chat?.id === chatId ? state.chat : state.chats.find((c) => c.id === chatId);
+  return {
+    chatTitle: chat?.title || '',
+    goal: chatId ? wireGoals.get(chatId) ?? null : null,
+    // A rehydrated goal on a cold chat shows state with disabled verbs —
+    // the server 409s commands without a live agent (goalCommand backstop).
+    goalCold: chat ? !chat.live : true,
+    plan: resolvePlan(tv?.plan, state.chat?.id === chatId ? state.chat?.messages : null),
+    toolRows: agentToolRows(tv),
+    agents: chatId ? wireSubagents.get(chatId) || [] : [],
   };
-  const mkRow = (icon, label, trailing, title, onPick) => {
-    const li = document.createElement('li');
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'ov-row';
-    const avatar = document.createElement('span');
-    avatar.className = 'ov-avatar';
-    avatar.textContent = icon;
-    avatar.setAttribute('aria-hidden', 'true');
-    const name = document.createElement('span');
-    name.className = 'ov-label';
-    name.textContent = label;
-    btn.append(avatar, name);
-    if (trailing) {
-      const trail = document.createElement('span');
-      trail.className = 'ov-trailing';
-      trail.textContent = trailing;
-      btn.append(trail);
-    }
-    if (title) btn.title = title;
-    btn.addEventListener('click', () => { closePopover(); onPick(); });
-    li.append(btn);
-    return li;
-  };
-  const mkEmpty = (text) => {
-    const li = document.createElement('li');
-    li.className = 'ov-empty';
-    li.textContent = text;
-    return li;
-  };
-  // Subagents — agent rows of the live turn, newest last like the rail;
-  // when the turn has none, the server's wire children back them (the same
-  // fallback as the agents chip — 1.1.29).
-  const agentsUl = mkSection('Subagents');
-  const agentTools = tv ? [...tv.tools.values()].map((n) => n.tool).filter((t) => agentToolMeta(t)) : [];
-  const wireRecs = state.activeId ? [...(wireSubagents.get(state.activeId)?.values() || [])] : [];
-  const agentSection = overviewSubagentRows(agentTools, wireRecs);
-  if (agentSection.kind === 'empty') {
-    agentsUl.append(mkEmpty('ยังไม่มี subagent ในเทิร์นนี้'));
-  } else if (agentSection.kind === 'turn') {
-    for (const tool of agentSection.tools) {
-      // agentToolMeta takes the tool itself (reads tool.rawInput) — there is
-      // no subKindOf helper. Status words mirror the tool rows: background
-      // agents say so, everything else uses the shared wire-status label.
-      const label = agentSubtitle(tool);
-      const word = toolDisplayState(tool) === 'background' ? 'ทำงานเบื้องหลัง' : toolStatusLabel(tool.status);
-      agentsUl.append(mkRow('✳', label, word, `${label} — ${word}`, () => rightbar.reveal('agents')));
-    }
-  } else {
-    for (const rec of agentSection.main) {
-      const label = subagentTitle(rec);
-      const word = subagentStatusWord(rec.status);
-      const sub = subagentSub(rec);
-      agentsUl.append(mkRow('✳', label, word, sub ? `${label} — ${word} · ${sub}` : `${label} — ${word}`, () => rightbar.reveal('agents')));
-    }
-    if (agentSection.hiddenMain > 0) {
-      agentsUl.append(mkRow('…', `อีก ${agentSection.hiddenMain} subagents`, '', '', () => rightbar.reveal('agents')));
-    }
-    if (agentSection.reminders > 0) {
-      agentsUl.append(mkRow(
-        '⏳',
-        `reminders · ${agentSection.reminders}`,
-        agentSection.remindersRunning > 0 ? `กำลังรัน ${agentSection.remindersRunning}` : '',
-        '',
-        () => rightbar.reveal('agents'),
-      ));
-    }
-  }
-  // Tasks — live plan checklist.
-  const tasksUl = mkSection('Tasks');
-  const entries = Array.isArray(tv?.plan) ? tv.plan : [];
-  if (!entries.length) tasksUl.append(mkEmpty('ยังไม่มี tasks ในเทิร์นนี้'));
-  for (const t of entries) {
-    const done = String(t?.status) === 'completed';
-    const active = String(t?.status) === 'in_progress';
-    tasksUl.append(mkRow(done ? '☑' : '☐', String(t?.content || '(ไม่มีชื่อ task)'), active ? 'กำลังทำ' : '', '', () => rightbar.reveal('tasks')));
-  }
-  // Goal — the CLI-owned session goal.
-  const goalUl = mkSection('Goal');
-  if (!goal) goalUl.append(mkEmpty('แชทนี้ยังไม่มี goal (ตั้งใน CLI)'));
-  else {
-    const pct = Math.min(100, Math.max(0, Math.round(Number(goal.percentComplete) || 0)));
-    goalUl.append(mkRow('◎', String(goal.objective || 'goal'), `${pct}% · ${goalStatusWord(goal.status)}`, '', () => rightbar.reveal('goal')));
-  }
-  openPanel(el.overviewBtn, root);
 }
+
+/**
+ * Thread overview popup — ChatGPT Desktop's header toggle, live: goal +
+ * tasks + the subagent union for the active chat. Sections repaint in place
+ * on goal/plan/subagent/subagent_delta while open; a drill into one child
+ * reads its actual session (same endpoints as the child page).
+ */
+function openThreadOverview(anchor) {
+  if (!state.activeId) return;
+  overview.open(anchor || el.overviewBtn, state.activeId, overviewSnap(state.activeId));
+}
+
+/** Transcript activity link: the same popup, drilled into that exact child. */
+function openChildOverview(chatId, itemId, anchor) {
+  if (!chatId || !itemId) return;
+  overview.openDrill(anchor || el.overviewBtn, chatId, itemId, overviewSnap(chatId));
+}
+
 
 /** The live cluster collapses when both of its chips hide — no stray gap. */
 function updateLiveCluster() {
@@ -1318,13 +1295,12 @@ function updateLiveCluster() {
  * every tool_call/turn_started/turn_done already flows through, no new SSE.
  */
 function updateAgentsChip() {
+  // The chip counts the same deduped union the popup lists (live tool rows
+  // + wire children) — the old tool-only OR wire-only count disagreed with
+  // the panel behind it whenever both sides were non-empty.
   const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
-  let { running, total } = agentCounts(tv);
-  if (!total && state.activeId) {
-    // No agent tool rows — fall back to the server's wire children so the
-    // chip (and the panel behind it) still shows real subagents.
-    ({ running, total } = wireSubagentCounts(state.activeId));
-  }
+  const recs = state.activeId ? [...(wireSubagents.get(state.activeId)?.values() || [])] : [];
+  const { running, total } = unionSubagentCounts(overviewSubagentRows(agentToolRows(tv), recs));
   el.agentsChip.hidden = total === 0;
   updateLiveCluster(); // before the early return, or the cluster never collapses
   if (!total) return;
@@ -1417,7 +1393,8 @@ function openConfigMenu(kind, anchor) {
   openMenu(
     anchor,
     configMenuItems(select, stored).map((it) => ({
-      label: it.current ? `${it.label} ✓` : it.label,
+      label: it.label,
+      checked: !!it.current,
       action: () => void setChatConfig(kind, it.value),
     })),
   );
@@ -1562,6 +1539,7 @@ function onEvent(type, data) {
       }
       if (data.title && state.chat?.id === chatId) paintApTitle(el.title, data.title);
       rightbar.applyTurn(chatId, data.turnId ?? null);
+      overview.applyTools(chatId, []);
       updateRunningChrome();
       void refreshChats();
       return;
@@ -1608,6 +1586,7 @@ function onEvent(type, data) {
       if (bind === 'drop') return;
       tv.tools.set(data.tool.id, data.tool);
       tv.rev = (tv.rev || 0) + 1;
+      overview.applyTools(chatId, agentToolRows(tv));
       if (chatId === state.activeId) {
         paintLiveTurn();
         updateRunningChrome();
@@ -1623,20 +1602,21 @@ function onEvent(type, data) {
       if (bind === 'drop') return;
       tv.plan = data.entries;
       tv.rev = (tv.rev || 0) + 1;
+      overview.applyPlan(chatId, data.entries);
       if (chatId === state.activeId) {
         paintLiveTurn();
         updateRunningChrome(); // the status verb follows the in-progress step
       } else if (bind === 'open') {
         updateRunningChrome();
       }
-      rightbar.applyPlan(chatId, data.entries);
       return;
     }
 
     case 'goal': {
       wireGoals.set(chatId, data.goal ?? null);
+      wireRevs.bump(chatId, 'goal');
       if (chatId === state.activeId) updateRunningChrome(); // chips
-      rightbar.applyGoal(chatId, data.goal ?? null);
+      overview.applyGoal(chatId, data.goal ?? null);
       return;
     }
 
@@ -1659,19 +1639,23 @@ function onEvent(type, data) {
       if (rec?.itemId) {
         if (!wireSubagents.has(chatId)) wireSubagents.set(chatId, new Map());
         wireSubagents.get(chatId).set(rec.itemId, rec);
+        wireRevs.bump(chatId, 'subagents');
         if (chatId === state.activeId) updateRunningChrome(); // chip fallback
-        rightbar.applyAgents(chatId, wireSubagents.get(chatId));
+        overview.applyAgents(chatId, wireSubagents.get(chatId));
         childActivity.noteSubagent(chatId, rec);
       }
       return;
     }
 
     case 'subagent_delta': {
-      // Live child text patches the rail rows in place (list + open drill);
-      // the mirror update keeps a rail opened later honest too.
+      // Live child text patches the popup rows in place (list + open drill);
+      // the mirror update keeps a popup opened later honest too.
       const live = wireSubagents.get(chatId)?.get(String(data.itemId));
-      if (live && typeof data.text === 'string') live.liveText = data.text;
-      rightbar.applyAgentDelta(chatId, String(data.itemId), String(data.text || ''));
+      if (live && typeof data.text === 'string') {
+        live.liveText = data.text;
+        wireRevs.bump(chatId, 'subagents');
+      }
+      overview.applyAgentDelta(chatId, String(data.itemId), String(data.text || ''));
       childActivity.noteSubagentDelta(chatId, String(data.itemId), String(data.text || ''));
       return;
     }
@@ -1767,18 +1751,35 @@ function onEvent(type, data) {
 
     case 'agent_ready':
       hideAuthGate();
-      if (chatId === state.activeId) setAgentState('idle');
+      if (chatId === state.activeId) {
+        // Goal verbs key off chat liveness — refresh it live, not on the
+        // next reload, or a warmed chat keeps disabled controls.
+        if (state.chat) state.chat.live = true;
+        setAgentState('idle');
+        updateRunningChrome();
+        if (overview.isOpen()) overview.rebind(chatId, overviewSnap(chatId));
+      }
       return;
 
     case 'agent_exit':
       warmedChats.delete(chatId);
-      if (chatId === state.activeId) setAgentState('exited');
+      if (chatId === state.activeId) {
+        if (state.chat) state.chat.live = false;
+        setAgentState('exited');
+        updateRunningChrome();
+        if (overview.isOpen()) overview.rebind(chatId, overviewSnap(chatId));
+      }
       void refreshChats();
       return;
 
     case 'agent_released':
       warmedChats.delete(chatId);
-      if (chatId === state.activeId) setAgentState('cold');
+      if (chatId === state.activeId) {
+        if (state.chat) state.chat.live = false;
+        setAgentState('cold');
+        updateRunningChrome();
+        if (overview.isOpen()) overview.rebind(chatId, overviewSnap(chatId));
+      }
       void refreshChats();
       return;
 
@@ -1919,42 +1920,75 @@ async function refreshChats() {
  * from the host ring). Reuses the boot-time fetches: chat list + groups, any
  * permission cards still waiting, and the open chat's transcript.
  */
+let resyncSeq = 0;
+
 async function resyncFromServer() {
+  const mySeq = ++resyncSeq;
+  const id = state.activeId;
+  const fresh = () => mySeq === resyncSeq && state.activeId === id;
   wireSubagents.clear();
   wireGoals.clear();
   wireCtx.clear();
-  if (state.activeId) {
-    const { goal } = await api(`/api/chats/${encodeURIComponent(state.activeId)}/goal`)
+  if (id) wireRevs.reset(id);
+  if (id) {
+    const revGoal = wireRevs.revOf(id, 'goal');
+    const { goal } = await api(`/api/chats/${encodeURIComponent(id)}/goal`)
       .catch(() => ({ goal: null }));
-    if (goal) wireGoals.set(state.activeId, goal);
-    const snap = await api(`/api/chats/${encodeURIComponent(state.activeId)}/ctx`)
+    if (!fresh()) return;
+    // A goal frame landing mid-refetch is newer than this snapshot — but a
+    // null snapshot at the current revision is authoritative (the server
+    // cleared or never had a goal), so it applies instead of leaving the
+    // resync-cleared mirror to be resurrected by a stale select GET.
+    if (!wireRevs.stale(id, 'goal', revGoal)) {
+      wireGoals.set(id, goal ?? null);
+      wireRevs.bump(id, 'goal');
+    }
+    const revCtx = wireRevs.revOf(id, 'ctx');
+    const snap = await api(`/api/chats/${encodeURIComponent(id)}/ctx`)
       .catch(() => ({ ctx: null, tokens: null }));
-    if (snap?.ctx || snap?.tokens) {
-      wireCtx.set(state.activeId, { ctx: snap.ctx ?? null, tokens: snap.tokens ?? null, baseChars: 0 });
+    if (!fresh()) return;
+    if ((snap?.ctx || snap?.tokens) && !wireRevs.stale(id, 'ctx', revCtx)) {
+      wireCtx.set(id, { ctx: snap.ctx ?? null, tokens: snap.tokens ?? null, baseChars: 0 });
+      wireRevs.bump(id, 'ctx');
     }
   }
-  if (state.activeId) {
+  if (id) {
     // A subagent frame may have fallen into the evicted gap — the registry
-    // is the truth, like the running flags below.
-    const { subagents } = await api(`/api/chats/${encodeURIComponent(state.activeId)}/subagents`)
+    // is the truth, like the running flags below. Live frames that landed
+    // mid-refetch still win per-key: the snapshot only backfills gaps.
+    const revSubs = wireRevs.revOf(id, 'subagents');
+    const { subagents } = await api(`/api/chats/${encodeURIComponent(id)}/subagents`)
       .catch(() => ({ subagents: [] }));
+    if (!fresh()) return;
     if (Array.isArray(subagents) && subagents.length) {
-      wireSubagents.set(state.activeId, new Map(subagents.map((s) => [s.itemId, s])));
+      if (!wireRevs.stale(id, 'subagents', revSubs)) {
+        wireSubagents.set(id, new Map(subagents.map((s) => [s.itemId, s])));
+      } else {
+        if (!wireSubagents.has(id)) wireSubagents.set(id, new Map());
+        const mirror = wireSubagents.get(id);
+        for (const s of subagents) {
+          if (s?.itemId != null && !mirror.has(s.itemId)) mirror.set(s.itemId, s);
+        }
+      }
+      wireRevs.bump(id, 'subagents');
     }
   }
   await refreshChats();
+  if (!fresh()) return;
   // A turn_done that fell into the evicted gap would leave the local live
   // view spinning forever — the server's per-chat running flag is the truth.
   for (const chat of state.chats) {
     if (!chat.running) state.turnViews.delete(chat.id);
   }
   const { interactions } = await api('/api/interactions').catch(() => ({ interactions: [] }));
+  if (!fresh()) return;
   for (const ix of interactions || []) {
     const tv = turnView(ix.chatId, true);
     if (!tv.turnId) tv.turnId = 'pending';
     tv.interactions.set(ix.id, ix);
   }
   if (state.activeId) await selectChat(state.activeId, { keepScroll: true });
+  if (!fresh()) return;
   updateRunningChrome();
 }
 
@@ -2031,7 +2065,7 @@ function findTranscriptNode(m) {
       if (group?.classList.contains('pg-collapsed')) {
         group.classList.remove('pg-collapsed');
         const glyph = group.querySelector('.progress-head .glyph');
-        if (glyph) glyph.textContent = '▾';
+        if (glyph) paintGlyph(glyph, true);
         // A DOM-only open of the LIVE group would be re-collapsed by the
         // next structural paint — sync the turn view too.
         if (liveProgress && group === liveProgress.group) {
@@ -2430,13 +2464,13 @@ function baseName(p) {
 }
 
 function attachIcon(a) {
-  if (a.kind === 'image-data' || a.mediaType?.startsWith('image/')) return '🖼️';
+  if (a.kind === 'image-data' || a.mediaType?.startsWith('image/')) return 'image';
   if (a.kind === 'path' || a.path) {
     const p = a.path || '';
-    if (/\/$/.test(p)) return '📁';
-    if (/\.(png|jpe?g|gif|webp)$/i.test(p)) return '🖼️';
+    if (/\/$/.test(p)) return 'folder';
+    if (/\.(png|jpe?g|gif|webp)$/i.test(p)) return 'image';
   }
-  return '📄';
+  return 'file';
 }
 
 function renderAttachBar() {
@@ -2451,15 +2485,15 @@ function renderAttachBar() {
   }
   bar.hidden = false;
   bar.innerHTML =
-    `<span class="attach-bar-label" title="ไฟล์เหล่านี้แนบไปกับข้อความถัดไป (ไม่รวมในข้อความ)">📎 ${list.length} รายการ</span>`;
+    `<span class="attach-bar-label" title="ไฟล์เหล่านี้แนบไปกับข้อความถัดไป (ไม่รวมในข้อความ)">${iconSvgString('clip', 'ico ico-sm')} ${list.length} รายการ</span>`;
   for (const a of list) {
     const chip = document.createElement('span');
     chip.className = 'attach-chip';
     chip.title = a.path || `${a.name || 'image'} (${a.mediaType || ''})`;
     chip.innerHTML =
-      `<span class="attach-chip-ico" aria-hidden="true">${attachIcon(a)}</span>` +
+      `<span class="attach-chip-ico" aria-hidden="true">${iconSvgString(attachIcon(a), 'ico ico-sm')}</span>` +
       `<span class="attach-chip-name">${escapeHtml(a.path ? baseName(a.path) : a.name || 'image')}</span>` +
-      `<button type="button" class="attach-chip-x" aria-label="เอาออก">✕</button>`;
+      `<button type="button" class="attach-chip-x" aria-label="เอาออก">${iconSvgString('x', 'ico ico-sm')}</button>`;
     chip.querySelector('.attach-chip-x')?.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -2480,7 +2514,7 @@ function attachChipsNode(attachments) {
     chip.className = 'attach-chip static';
     chip.title = a.path;
     chip.innerHTML =
-      `<span class="attach-chip-ico" aria-hidden="true">${attachIcon(a)}</span>` +
+      `<span class="attach-chip-ico" aria-hidden="true">${iconSvgString(attachIcon(a), 'ico ico-sm')}</span>` +
       `<span class="attach-chip-name">${escapeHtml(a.name || baseName(a.path))}</span>`;
     row.appendChild(chip);
   }
@@ -2592,9 +2626,12 @@ function wireAttach() {
   });
   const runPicker = async (btn, mode) => {
     if (!btn) return;
-    const was = btn.textContent;
+    // Icon-aware label swap: these buttons carry file/folder SVGs beside
+    // .ic-label, and a textContent write would erase the icon on every
+    // outcome — loading, success, cancel, and error alike.
+    const was = btn.querySelector(':scope > .ic-label')?.textContent ?? btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'กำลังเปิด…';
+    updateIconLabel(btn, 'กำลังเปิด…');
     try {
       const r = await api(`/api/pick-files?mode=${mode}`, { method: 'POST' });
       if (r?.ok && Array.isArray(r.paths) && r.paths.length) {
@@ -2607,7 +2644,7 @@ function wireAttach() {
       showError(`เปิดตัวเลือกไฟล์ไม่สำเร็จ: ${err.message}`);
     } finally {
       btn.disabled = false;
-      btn.textContent = was;
+      updateIconLabel(btn, was);
     }
   };
   el.attachBrowse?.addEventListener('click', () => runPicker(el.attachBrowse, 'file'));
@@ -2737,8 +2774,16 @@ async function hydrateTurnView(chatId) {
   seedTurnView(turnView(chatId, true), turn);
 }
 
+/** Monotonic select generation — a slow chat fetch that resolves after a
+ * newer select started must not paint its stale transcript over the new
+ * chat (rapid switches, turn_done refetch racing a click). */
+let selectSeq = 0;
+
 async function selectChat(chatId, { keepScroll = false } = {}) {
   const prevId = state.activeId;
+  const mySeq = ++selectSeq;
+  /** False once a newer select started or the active chat moved on. */
+  const fresh = () => mySeq === selectSeq && state.activeId === chatId;
   if (prevId && prevId !== chatId) {
     drafts.set(prevId, el.prompt.value);
   }
@@ -2777,6 +2822,7 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
     paintApTitle(el.title, 'Muse Desktop');
     el.cwd.textContent = '';
     rightbar.showChat(null);
+    if (overview.isOpen()) overview.close();
     renderTranscript();
     updateRunningChrome();
     updateConfigPills();
@@ -2785,6 +2831,7 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
   }
 
   const { chat } = await api(`/api/chats/${encodeURIComponent(chatId)}`);
+  if (!fresh()) return; // superseded — the newer select owns the paint now
   state.chat = chat;
   state.chatConfig = chat.config || null; // BUG-074 snapshot feeds the pills
   // Opening a session to look at it never reorders: the queue moves only
@@ -2815,38 +2862,64 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
   // renderTranscript() below then paints partial text + tool rows + plan, and
   // updateRunningChrome() starts spinner/Stop/elapsed from turn.startedAt.
   if (chat.running) await hydrateTurnView(chatId);
+  if (!fresh()) return;
   // The goal outlives the turn — seed the chip from the server's memory so a
-  // chat switch shows it without waiting for the next goalChanged.
+  // chat switch shows it without waiting for the next goalChanged. The
+  // revision capture is the point: an SSE frame landing mid-fetch is newer
+  // than this snapshot, and applying the snapshot would resurrect a goal
+  // the agent just cleared.
   if (!wireGoals.has(chatId)) {
+    const rev = wireRevs.revOf(chatId, 'goal');
     const { goal } = await api(`/api/chats/${encodeURIComponent(chatId)}/goal`)
       .catch(() => ({ goal: null }));
-    wireGoals.set(chatId, goal ?? null);
+    if (!fresh()) return;
+    if (!wireRevs.stale(chatId, 'goal', rev)) {
+      wireGoals.set(chatId, goal ?? null);
+      wireRevs.bump(chatId, 'goal');
+    }
   }
   // Same for context usage — the pill must show the chat's window the
   // moment it opens, not after the next contextUsage triple-change.
   if (!wireCtx.has(chatId)) {
+    const rev = wireRevs.revOf(chatId, 'ctx');
     const snap = await api(`/api/chats/${encodeURIComponent(chatId)}/ctx`)
       .catch(() => ({ ctx: null, tokens: null }));
-    wireCtx.set(chatId, { ctx: snap?.ctx ?? null, tokens: snap?.tokens ?? null, baseChars: 0 });
+    if (!fresh()) return;
+    if (!wireRevs.stale(chatId, 'ctx', rev)) {
+      wireCtx.set(chatId, { ctx: snap?.ctx ?? null, tokens: snap?.tokens ?? null, baseChars: 0 });
+      wireRevs.bump(chatId, 'ctx');
+    }
   }
-  // Same for the subagent registry — the rail must list the chat's children
-  // the moment it opens, not only children born while the page watches.
+  // Same for the subagent registry — the popup must list the chat's
+  // children the moment it opens, not only children born while the page watches.
   if (!wireSubagents.has(chatId)) {
+    const rev = wireRevs.revOf(chatId, 'subagents');
     const { subagents } = await api(`/api/chats/${encodeURIComponent(chatId)}/subagents`)
       .catch(() => ({ subagents: [] }));
-    wireSubagents.set(chatId, new Map(
-      (Array.isArray(subagents) ? subagents : []).map((s) => [s.itemId, s]),
-    ));
+    if (!fresh()) return;
+    const list = Array.isArray(subagents) ? subagents : [];
+    if (!wireRevs.stale(chatId, 'subagents', rev)) {
+      wireSubagents.set(chatId, new Map(list.map((s) => [s.itemId, s])));
+    } else {
+      // Live frames won the race — backfill only what SSE hasn't touched,
+      // never overwrite a newer child update with snapshot state.
+      if (!wireSubagents.has(chatId)) wireSubagents.set(chatId, new Map());
+      const mirror = wireSubagents.get(chatId);
+      for (const s of list) {
+        if (s?.itemId != null && !mirror.has(s.itemId)) mirror.set(s.itemId, s);
+      }
+    }
+    wireRevs.bump(chatId, 'subagents');
   }
-  // Point the right rail at the incoming chat: cost inputs, goal/plan state
-  // and the SCB re-detect (its title may have gained [APxxxx] since).
+  // Point the right rail at the incoming chat: cost inputs only (goal, tasks
+  // and subagents live in the overview popup). An open popup rebinds to the
+  // incoming chat — including the same-chat turn_done refetch, which is what
+  // rehydrates its tasks from the persisted transcript plan.
   rightbar.showChat(chatId);
   rightbar.showSession(chatId, chat.mspSessionId ?? null);
   rightbar.applyTurn(chatId, liveTurnIdFor(chatId));
-  rightbar.applyGoal(chatId, wireGoals.get(chatId) ?? null);
-  rightbar.applyPlan(chatId, state.turnViews.get(chatId)?.plan);
-  rightbar.applyAgents(chatId, wireSubagents.get(chatId));
   rightbar.applyCtx(chatId, wireCtx.get(chatId)?.tokens ?? null, costModelFor(chatId));
+  if (overview.isOpen()) overview.rebind(chatId, overviewSnap(chatId));
 
   renderTranscript({ stick: !keepScroll || state.pinned });
   if (keepScroll) {
@@ -3010,9 +3083,10 @@ async function sendPromptText(chatId, text, { queueItem = null, attachments = []
 // --------------------------------------------------------- prompt queue
 
 /**
- * Quiet chip above the composer: "⏳ รอส่ง N ข้อความ" — click expands the
- * per-item list with ✕ remove (grok-desktop renderPromptQueue,
- * app.js:6997-7050).
+ * Quiet chip above the composer: clock icon + "รอส่ง N ข้อความ" — click
+ * expands the per-item list with x remove (grok-desktop renderPromptQueue,
+ * app.js:6997-7050). The label span owns the count text; writing
+ * textContent on the chip would erase its SVG.
  */
 function renderPromptQueue() {
   const items = state.activeId ? promptQueue.list(state.activeId) : [];
@@ -3020,13 +3094,13 @@ function renderPromptQueue() {
   if (!n) {
     el.promptQueue.hidden = true;
     el.promptQueue.classList.remove('is-expanded');
-    el.promptQueueChip.textContent = '⏳ รอส่ง 0 ข้อความ';
+    updateIconLabel(el.promptQueueChip, 'รอส่ง 0 ข้อความ');
     el.promptQueueList.hidden = true;
     el.promptQueueList.replaceChildren();
     return;
   }
   el.promptQueue.hidden = false;
-  el.promptQueueChip.textContent = `⏳ รอส่ง ${n} ข้อความ`;
+  updateIconLabel(el.promptQueueChip, `รอส่ง ${n} ข้อความ`);
   el.promptQueueChip.setAttribute('aria-label', `รอส่ง ${n} ข้อความในคิว — คลิกเพื่อดูรายการ`);
   if (!el.promptQueue.classList.contains('is-expanded')) {
     el.promptQueueList.hidden = true;
@@ -3040,13 +3114,20 @@ function renderPromptQueue() {
     const preview = document.createElement('span');
     preview.className = 'prompt-queue-preview';
     const t = item.text.replace(/\s+/g, ' ').trim();
-    const attBit = item.attachments?.length ? `📎${item.attachments.length} ` : '';
-    preview.textContent = attBit + (t.length > 72 ? `${t.slice(0, 72)}…` : t);
+    preview.replaceChildren();
+    if (item.attachments?.length) {
+      const att = document.createElement('span');
+      att.className = 'prompt-queue-att';
+      att.setAttribute('aria-hidden', 'true');
+      setIcon(att, 'clip', 'ico ico-sm');
+      preview.append(att, document.createTextNode(`${item.attachments.length} `));
+    }
+    preview.append(document.createTextNode(t.length > 72 ? `${t.slice(0, 72)}…` : t));
     preview.title = item.text;
     const rm = document.createElement('button');
     rm.type = 'button';
     rm.className = 'prompt-queue-remove';
-    rm.textContent = '✕';
+    setIcon(rm, 'x', 'ico ico-sm');
     rm.title = 'ลบออกจากคิว';
     rm.setAttribute('aria-label', `ลบข้อความคิวลำดับ ${idx + 1}`);
     rm.addEventListener('click', (ev) => {
@@ -3198,11 +3279,11 @@ async function refreshVersionBadge() {
 // its resolver so the switcher and the boot path can never disagree.
 const THEME_BOOT = window.__museTheme;
 const THEME_OPTIONS = [
-  { pref: 'moonlight', label: 'Moonlight', icon: '☾' },
-  { pref: 'claude-dark', label: 'Claude Dark', icon: '🌘' },
-  { pref: 'claude-light', label: 'Claude Light', icon: '☕' },
-  { pref: 'daylight', label: 'Daylight', icon: '☀' },
-  { pref: 'auto', label: 'Auto (ตามระบบ)', icon: '◐' },
+  { pref: 'moonlight', label: 'Moonlight', icon: 'moon' },
+  { pref: 'claude-dark', label: 'Claude Dark', icon: 'moonFilled' },
+  { pref: 'claude-light', label: 'Claude Light', icon: 'cup' },
+  { pref: 'daylight', label: 'Daylight', icon: 'sun' },
+  { pref: 'auto', label: 'Auto (ตามระบบ)', icon: 'contrast' },
 ];
 
 function currentThemePref() {
@@ -3249,8 +3330,9 @@ function openThemeMenu(anchor) {
   openMenu(
     anchor,
     THEME_OPTIONS.map((opt) => ({
-      label: opt.pref === active ? `${opt.label} ✓` : opt.label,
+      label: opt.label,
       icon: opt.icon,
+      checked: opt.pref === active,
       action: () => applyTheme(opt.pref),
     })),
   );
@@ -3442,12 +3524,11 @@ function wireUi() {
   el.effortChip.addEventListener('click', () => openConfigMenu('thinking', el.effortChip));
 
   el.mcpBtn?.addEventListener('click', () => mcpPanel.open(el.mcpBtn));
-  // Head-bar chips open the right rail at their section (the old floating
-  // popovers are gone — one rail instead of stacked popups).
-  el.agentsChip.addEventListener('click', () => rightbar.reveal('agents'));
-  el.tasksChip.addEventListener('click', () => rightbar.reveal('tasks'));
-  el.goalChip.addEventListener('click', () => rightbar.reveal('goal'));
-  if (el.overviewBtn) el.overviewBtn.addEventListener('click', openThreadOverview);
+  // Goal/tasks/agents chips open the live overview popup at the active chat.
+  el.agentsChip.addEventListener('click', () => openThreadOverview(el.agentsChip));
+  el.tasksChip.addEventListener('click', () => openThreadOverview(el.tasksChip));
+  el.goalChip.addEventListener('click', () => openThreadOverview(el.goalChip));
+  if (el.overviewBtn) el.overviewBtn.addEventListener('click', () => openThreadOverview(el.overviewBtn));
   if (el.goalBarBtn) el.goalBarBtn.addEventListener('click', sendGoalBarCommand);
   el.rightbarToggle?.addEventListener('click', () => rightbar.toggle());
 

@@ -14,21 +14,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/icon.png" />
     <!-- Blocking on purpose: sets data-theme before the first paint. -->
-    <script src="/theme-boot.js?v=1.1.29"></script>
-    <link rel="stylesheet" href="/style.css?v=1.1.29" />
-    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.29" />
-    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.29" />
+    <script src="/theme-boot.js?v=1.1.32"></script>
+    <link rel="stylesheet" href="/style.css?v=1.1.32" />
+    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.32" />
+    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.32" />
   </head>
   <body>
     <div id="app">
       <aside id="sidebar">
         <header class="side-head">
           <div class="brand">
-            <span class="brand-mark">◗</span>
+            <span class="brand-mark"><svg class="ico ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="brand"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5A8.5 8.5 0 0 1 20.5 12H12Z" fill="currentColor" stroke="none"/></svg></span>
             <span class="brand-name">Muse Desktop</span>
           </div>
-          <button id="new-chat" class="btn primary" type="button" title="Session ใหม่ (⌘N)">＋</button>
-          <button id="new-group" class="btn" type="button" title="Group ใหม่ (⇧⌘N)">▤</button>
+          <button id="new-chat" class="btn primary" type="button" title="Session ใหม่ (⌘N)" aria-label="Session ใหม่"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="plus"><path d="M12 5v14M5 12h14"/></svg></button>
+          <button id="new-group" class="btn" type="button" title="Group ใหม่ (⇧⌘N)" aria-label="Group ใหม่"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="groupAdd"><rect x="3.5" y="3.5" width="17" height="17" rx="3.5"/><path d="M12 8.5v7M8.5 12h7"/></svg></button>
         </header>
         <!-- Cross-chat search (power-user: find work across rooms) -->
         <div class="session-search" id="session-search">
@@ -47,7 +47,7 @@
         <footer class="side-foot">
           <div id="agent-badge" class="agent-badge" title="Muse">agent…</div>
           <div id="version-badge" class="version-badge" title="version">…</div>
-          <button id="theme-toggle" class="btn ghost" type="button" title="Toggle theme">◐</button>
+          <button id="theme-toggle" class="btn ghost" type="button" title="Toggle theme" aria-label="เปลี่ยนธีม"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="contrast"><circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 0 1 0 17Z" fill="currentColor" stroke="none"/></svg></button>
         </footer>
       </aside>
 
@@ -60,6 +60,10 @@
             <button id="chat-cwd" class="cwd" type="button" title="Working directory — click to change"></button>
           </div>
           <div class="head-right">
+           <!-- Chips vs actions split for the narrow wrap: display:contents
+                at wide widths (zero visual change), separate flex lines
+                below 900px so title + actions stay reachable. -->
+           <div class="head-chips">
             <span id="agent-state" class="pill muted">cold</span>
             <button id="tasks-chip" class="pill" type="button" title="tasks ในเทิร์นนี้" hidden>tasks 0/0</button>
             <button id="mcp-btn" class="pill mode" type="button" title="MCP servers">
@@ -75,10 +79,13 @@
             <button id="model-chip" class="pill mode" type="button" title="โมเดล — คลิกเพื่อเปลี่ยน" hidden>—</button>
             <button id="effort-chip" class="pill mode" type="button" title="Effort การคิด — คลิกเพื่อเปลี่ยน" hidden>—</button>
             <button id="mode-chip" class="pill mode" type="button" title="Mode (Shift+Tab)">yolo</button>
-            <button id="btn-session-find" class="btn ghost" type="button" title="ค้นหาในแชทนี้ (⌘F)" aria-expanded="false" aria-label="ค้นหาในแชทนี้">⌕</button>
-            <button id="release-agent" class="btn ghost" type="button" title="Stop this chat's agent">⏻</button>
-            <button id="overview-btn" class="btn ghost" type="button" title="ภาพรวมเทิร์น: subagents · tasks · goal (แบบ ChatGPT Desktop)" aria-label="ภาพรวมเทิร์น">▦</button>
-            <button id="rightbar-toggle" class="btn ghost" type="button" title="แผงขวา: ค่าใช้จ่าย · goal/tasks · subagents · SCB (ซ่อนเป็นค่าเริ่มต้น)" aria-expanded="false" aria-label="แผงขวา" aria-controls="rightbar">☰</button>
+           </div>
+           <div class="head-actions">
+            <button id="btn-session-find" class="btn ghost" type="button" title="ค้นหาในแชทนี้ (⌘F)" aria-expanded="false" aria-label="ค้นหาในแชทนี้"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="search"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg></button>
+            <button id="release-agent" class="btn ghost" type="button" title="Stop this chat's agent" aria-label="Stop this chat's agent"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="power"><path d="M12 4v8"/><path d="M6.3 6.5a8 8 0 1 0 11.4 0"/></svg></button>
+            <button id="overview-btn" class="btn ghost" type="button" title="ภาพรวมเทิร์น: subagents · tasks · goal (แบบ ChatGPT Desktop)" aria-label="ภาพรวมเทิร์น"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="grid"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 12h16M12 4v16"/></svg></button>
+            <button id="rightbar-toggle" class="btn ghost" type="button" title="แผงขวา: session · ค่าใช้จ่าย (ซ่อนเป็นค่าเริ่มต้น) — goal/tasks/subagents อยู่ในป๊อปอัปภาพรวม" aria-expanded="false" aria-label="แผงขวา" aria-controls="rightbar"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="panel"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9.5 4v16"/></svg></button>
+           </div>
           </div>
         </header>
 
@@ -100,7 +107,7 @@
 
         <!-- Find-in-chat: generated content of THIS chat only -->
         <div class="session-find" id="session-find" hidden>
-          <span class="session-find-icon" aria-hidden="true">⌕</span>
+          <span class="session-find-icon" aria-hidden="true"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="search"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg></span>
           <input
             type="search"
             id="session-find-input"
@@ -111,9 +118,9 @@
             title="ค้นเฉพาะเนื้อหาที่ AI generate ในแชทนี้ (ไม่รวมคำสั่ง/prompt ของเรา · ไม่ข้ามแชท)"
           />
           <span class="session-find-count" id="session-find-count" aria-live="polite"></span>
-          <button type="button" id="session-find-prev" class="session-find-nav" title="ผลก่อนหน้า (Shift+Enter)" aria-label="Previous match">↑</button>
-          <button type="button" id="session-find-next" class="session-find-nav" title="ผลถัดไป (Enter)" aria-label="Next match">↓</button>
-          <button type="button" id="session-find-close" class="session-find-close" title="ปิด (Esc)" aria-label="Close find">✕</button>
+          <button type="button" id="session-find-prev" class="session-find-nav" title="ผลก่อนหน้า (Shift+Enter)" aria-label="Previous match"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="chevUp"><path d="M6 14.5l6-6 6 6"/></svg></button>
+          <button type="button" id="session-find-next" class="session-find-nav" title="ผลถัดไป (Enter)" aria-label="Next match"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="chevDown"><path d="M6 9.5l6 6 6-6"/></svg></button>
+          <button type="button" id="session-find-close" class="session-find-close" title="ปิด (Esc)" aria-label="Close find"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="x"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
           <div class="session-find-hits" id="session-find-hits" hidden role="listbox" aria-label="matches in this chat"></div>
         </div>
 
@@ -134,23 +141,23 @@
         <!-- Recovery affordance once the user unpins (scrolls up): jump back
              to the live tail. Shown from app.js when new content lands while
              unpinned (BUG-047; grok-desktop ensureJumpButton). -->
-        <button id="jump-latest" class="jump-latest" type="button" hidden>↓ ล่าสุด</button>
+        <button id="jump-latest" class="jump-latest" type="button" hidden><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="arrowDown"><path d="M12 5v14M5.5 12.5L12 19l6.5-6.5"/></svg><span class="ic-label">ล่าสุด</span></button>
 
         <div id="status-line" class="status-line" hidden>
-          <span class="spark">✳</span>
+          <span class="spark"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="spark"><path d="M12 3.5c.7 4.6 2.9 6.8 7.5 7.5-4.6.7-6.8 2.9-7.5 7.5-.7-4.6-2.9-6.8-7.5-7.5 4.6-.7 6.8-2.9 7.5-7.5Z" fill="currentColor" stroke="none"/></svg></span>
           <span id="status-text">กำลังคิด…</span>
           <span id="status-timer" class="timer"></span>
         </div>
 
         <!-- Queued prompts (per-chat FIFO, in-memory only): quiet chip above
-             the composer, click expands per-item list with ✕ (BUG-051). -->
+             the composer, click expands per-item list with x remove (BUG-051). -->
         <div id="prompt-queue" class="prompt-queue" hidden>
           <button
             type="button"
             class="prompt-queue-chip"
             id="prompt-queue-chip"
             title="ข้อความรอส่งเมื่อเทิร์นจบ (ไม่บันทึกข้าม restart)"
-          >⏳ รอส่ง 0 ข้อความ</button>
+          ><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="clock"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg><span class="ic-label">รอส่ง 0 ข้อความ</span></button>
           <ul class="prompt-queue-list" id="prompt-queue-list" hidden></ul>
         </div>
 
@@ -163,7 +170,7 @@
              the composer, never a flex item inside it — inside the row it
              shared the prompt line and overflowed the edge (1.1.28). -->
         <div id="goal-bar" hidden>
-          <span class="goal-glyph" aria-hidden="true">◎</span>
+          <span class="goal-glyph" aria-hidden="true"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="target"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg></span>
           <span class="goal-objective"></span>
           <span class="goal-meta"></span>
           <button id="goal-bar-btn" class="goal-btn" type="button"></button>
@@ -190,14 +197,14 @@
             aria-label="แนบไฟล์"
             aria-haspopup="dialog"
             aria-expanded="false"
-          >📎</button>
-          <button id="send" class="btn send" type="submit" title="Send (⏎)">↑</button>
+          ><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="clip"><path d="M20.5 11.5l-8.8 8.8a5.5 5.5 0 0 1-7.8-7.8l8.2-8.2a3.7 3.7 0 0 1 5.2 5.2l-8.2 8.2a1.9 1.9 0 0 1-2.7-2.7l8-8"/></svg></button>
+          <button id="send" class="btn send" type="submit" title="Send (⏎)" aria-label="ส่งข้อความ"><svg class="ico ico-lg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="arrowUp"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg></button>
           <!-- Attach popover: native picker + paste-paths fallback -->
           <div id="attach-pop" class="attach-pop" hidden role="dialog" aria-label="แนบไฟล์ให้ Muse">
             <div class="attach-pop-head">แนบไฟล์ / โฟลเดอร์ให้ Muse อ่าน</div>
             <div class="attach-browse-row">
-              <button type="button" id="attach-browse" class="btn ghost attach-browse-btn">📄 เลือกไฟล์</button>
-              <button type="button" id="attach-browse-folder" class="btn ghost attach-browse-btn">📁 เลือกโฟลเดอร์</button>
+              <button type="button" id="attach-browse" class="btn ghost attach-browse-btn"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="file"><path d="M6 3.5h7l4 4v13H6Z"/><path d="M13 3.5V8h4"/></svg><span class="ic-label">เลือกไฟล์</span></button>
+              <button type="button" id="attach-browse-folder" class="btn ghost attach-browse-btn"><svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="folder"><path d="M3.5 6.5A1.5 1.5 0 0 1 5 5h5l2 2.5h7A1.5 1.5 0 0 1 20.5 9v9.5a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 18.5Z"/></svg><span class="ic-label">เลือกโฟลเดอร์</span></button>
             </div>
             <div class="attach-pop-or">หรือวาง absolute path (บรรทัดละไฟล์/โฟลเดอร์)</div>
             <textarea id="attach-paste" class="attach-paste" rows="3" spellcheck="false" placeholder="/Users/s89061/…/file1.py&#10;/Users/s89061/…/notes.md"></textarea>
@@ -212,7 +219,7 @@
       <div id="rightbar-gutter" role="separator" aria-orientation="vertical" aria-controls="rightbar" aria-label="ปรับความกว้างแผงขวา" tabindex="0" title="ลากเพื่อปรับความกว้าง (ดับเบิลคลิกเพื่อรีเซ็ต)" hidden></div>
 
       <!-- Right rail: cost · goal/tasks · subagents · SCB projects.
-           Hidden by default (Codex Desktop parity) — the ☰ button, or the
+           Hidden by default (Codex Desktop parity) — the panel button, or the
            goal/tasks/agents chips, opens it. Rendered by rightbar.js. -->
       <aside id="rightbar" aria-label="แผงขวา" hidden></aside>
     </div>
@@ -220,7 +227,7 @@
     <!-- Standalone version paint: runs even when app.js fails to load, so a
          dead boot never leaves a silent shell (BUG-066). External file rather
          than an inline script because the CSP is script-src 'self'. -->
-    <script src="/version-boot.js?v=1.1.29"></script>
-    <script type="module" src="/app.js?v=1.1.29"></script>
+    <script src="/version-boot.js?v=1.1.32"></script>
+    <script type="module" src="/app.js?v=1.1.32"></script>
   </body>
 </html>

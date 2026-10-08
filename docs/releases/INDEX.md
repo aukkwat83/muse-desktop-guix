@@ -5,6 +5,7 @@
 
 | Tag | Date | One-liner | Previous | Note |
 |-----|------|-----------|----------|------|
+| **v1.1.32** | 2026-10-08 | Popup-only goal/task/subagent overview (live union drill-down, native transcripts, persisted goals) + shared 44-icon SVG family, Inter/Sarabun type rebalance, sanitized chrome, safe diagram export, narrow header wrap. `npm test` 45/45, e2e 78/78, contrast AA | v1.1.29 | [v1.1.32-activity-overview-and-icons.md](./v1.1.32-activity-overview-and-icons.md) |
 | **v1.1.23-result-stack** | 2026-10-07 | ChatGPT-like result stack: quiet divider lines between turn blocks (activity → answer → cards), one CSS rule covering live + history. Tag cut after Guix QC | v1.1.22-child-activity | [v1.1.23-result-stack.md](./v1.1.23-result-stack.md) |
 | **v1.1.22-child-activity** | 2026-10-07 | Inline child activity in transcript agent rows (nested delegate view): server `agentLink` per row + new child-activity.js block fed by the drill endpoint, live tail while running. Reference repo has no UI source — approximation, disclosed in note. Tag cut after Guix QC | v1.1.21-guix-sync | [v1.1.22-child-activity.md](./v1.1.22-child-activity.md) |
 | **v1.1.21-guix-sync** | 2026-10-07 | Forward-port mac v1.1.1–v1.1.21 (queue, right rail, subagent drill-down, reminder live windows, BUG-081–084) onto the Guix stack; 8 overlap files 3-way merged, `?v=`=1.1.21, `test:guix` version pin relaxed to ≥1.1.0. Tag cut after Guix QC | v1.1.0-guix-parity | [v1.1.21-guix-sync.md](./v1.1.21-guix-sync.md) |

@@ -1,16 +1,19 @@
-// Standalone live view for one child session — the ⧉ pop-out target from
-// the rail's drill header. Same data as the inline drill (the drill
+// Standalone live view for one child session — the pop-out target from
+// the overview popup's drill header. Same data as the popup drill (the drill
 // endpoint + the registry list for live status), polling on the same 2.5s
 // clock while the child runs. No app boot: this page owns its own fetch +
-// paint and only borrows the rail's pure view-model.
+// paint and only borrows the shared pure view-model.
 
 import {
+  childKindLabel,
   drillItemPreview,
   drillKindTag,
+  nativeRunStatus,
   subagentDotClass,
   subagentStatusWord,
   subagentTitle,
-} from './rightbar.js?v=1.1.4';
+} from './rightbar.js?v=1.2.0';
+import { setIcon } from './icons.js?v=1.0.0';
 
 const root = document.getElementById('child-root');
 const params = new URLSearchParams(location.search);
@@ -45,19 +48,31 @@ function drillUrl() {
 }
 
 function titleFor(drill, rec) {
+  // The child session's own title is the best heading when the binary gives
+  // one — it names what the child actually did, not the spawn brief. The
+  // registry title trails, then the raw id. (subagentTitle itself never
+  // returns the wire's generic reminder line, so no extra guard here.)
+  const sessionTitle = typeof drill?.session?.title === 'string' ? drill.session.title.trim() : '';
+  if (sessionTitle) return sessionTitle;
   if (rec) return subagentTitle(rec);
   if (drill?.record) return subagentTitle(drill.record);
-  if (drill?.session?.title) return drill.session.title;
   return (sessionId || itemId || 'child').slice(0, 24);
 }
 
 function statusOf(drill, rec) {
+  // A native-log run envelope decides when present — active reads running,
+  // terminal reads its outcome, either way over a stale record. Same
+  // helper as the popup drill, so both surfaces headline the same run.
+  const native = nativeRunStatus(drill?.nativeRun);
+  if (native) return native;
   return rec?.status || drill?.record?.status
     || (drill?.session?.status === 'running' ? 'inProgress' : drill?.record?.status || '');
 }
 
 function paintHead(head, drill, rec) {
   head.replaceChildren();
+  const kind = rec?.kind || drill?.record?.kind || null;
+  if (kind) head.append(el('span', 'kind-tag', childKindLabel(kind)));
   const title = el('div', 'agent-drill-title', titleFor(drill, rec));
   head.append(title);
   const st = statusOf(drill, rec);
@@ -66,9 +81,11 @@ function paintHead(head, drill, rec) {
     head.append(el('span', subagentDotClass(st)), pill);
   }
   document.title = `${titleFor(drill, rec)} · ${subagentStatusWord(st) || '—'} — Muse Desktop`;
-  const refresh = el('button', 'btn ghost sm', '⟳');
+  const refresh = el('button', 'btn ghost sm');
+  setIcon(refresh, 'refresh', 'ico ico-sm');
   refresh.type = 'button';
   refresh.title = 'อ่านใหม่';
+  refresh.setAttribute('aria-label', 'อ่านใหม่');
   refresh.addEventListener('click', () => void load({ quiet: false }));
   head.append(refresh);
 }
@@ -78,8 +95,11 @@ function paintBody(body, drill, rec) {
   if (drill?.readError) {
     body.append(el('div', 'panel-sub warn', `อ่าน session ไม่ได้ (${drill.readError}) — แสดงข้อมูลที่เหลืออยู่`));
   }
+  if (drill?.notice) {
+    body.append(el('div', 'panel-sub', drill.notice));
+  }
   // No separate verdict line: the server already unshifts the verdict card
-  // as items[0] (same as the rail drill) — a second copy reads like a bug.
+  // as items[0] (same as the popup drill) — a second copy reads like a bug.
   if (drill?.session) {
     const s = drill.session;
     const bits = [
@@ -131,12 +151,17 @@ function stopPoll() {
   }
 }
 
-/** Same stay-alive rule as the rail's armAgentPoll: any running signal
+/** Same stay-alive rule as the popup's drill poll: any running signal
  * keeps the 2.5s clock, a landed drill stops it. */
 function stillRunning(drill, rec) {
   if (!drill) return true;
   if ((drill.items || []).some((it) => it.status === 'inProgress')) return true;
   if (drill.session?.status === 'running') return true;
+  // A native-log run with no tool rows yet is still live work — the run
+  // state (not the item list) keeps this poll alive. A terminal run stops
+  // unless the registry still claims liveness: that refresh discovers a
+  // resumed run no transition relayed yet.
+  if (drill.nativeRun?.state === 'running') return true;
   return String(rec?.status || drill?.record?.status || '') === 'inProgress';
 }
 
@@ -186,7 +211,7 @@ async function load({ quiet = true } = {}) {
 }
 
 if (!chatId || (!itemId && !sessionId)) {
-  paintError('ลิงก์ไม่ครบ — เปิดจากปุ่ม ⧉ ในแผง subagents');
+  paintError('ลิงก์ไม่ครบ — เปิดจากปุ่มเปิดหน้าต่างใหม่ในแผง subagents');
 } else {
   void load({ quiet: false });
 }

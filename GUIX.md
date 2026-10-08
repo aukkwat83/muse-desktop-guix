@@ -190,8 +190,9 @@ Then open UI only:
 
 ## Thai typography — the clipped-tone-mark trap
 
-Linux renders the UI in **Sarabun** (in the `--font-ui` stack); mac uses
-SF + Thonburi. Sarabun's raised tone marks (`่ ้ ๊ ๋ ์` over an upper vowel:
+Linux renders Latin in **Inter** and Thai in **Sarabun** (both in the
+`--font-ui` stack, Latin faces first); mac uses SF + Thonburi.
+Sarabun's raised tone marks (`่ ้ ๊ ๋ ์` over an upper vowel:
 ที่, สั่ง, แล้ว) paint above the line box, so anywhere the UI combines
 `white-space: nowrap` with `overflow: hidden`, the clip box slices them off and
 Thai silently reads wrong (`สั่ง` → `สัง`). mac never reproduces it.
@@ -204,7 +205,7 @@ class grok-desktop fixed as R57-guix) — a bare `overflow: hidden` + tight
 
 - Card drag-out: the `cardDrag` bridge is registered but dormant — neither the
   mac shell nor the renderer implements the sender yet. Diagrams use the in-page
-  ↓ SVG / ↓ PNG buttons everywhere.
+  download SVG / download PNG buttons everywhere.
 - `diagramSave` is macOS-only; the renderer feature-detects it and falls back
   to the in-page download on Linux.
 - `better-sqlite3` must compile against this Node (`npm install` does so; on a

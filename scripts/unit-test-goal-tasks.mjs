@@ -183,6 +183,142 @@ test('todoFoldLabel picks Mcode’s four cases', () => {
   assert.equal(todoFoldLabel(mixed, 'following'), 'ถัดไป 2 รายการ');
 });
 
+test('goal snapshot persists and rehydrates after a host restart (1.1.30)', () => {
+  const file = tmpFile();
+  const wire = fakeWire();
+  const store = new SessionStore({ file, debounceMs: 5 });
+  const mgr = new SessionManager({ store, wire, searchDbPath: tmpSearchDb() });
+  const chat = mgr.createChat({ title: 'goal-persist' });
+  const slot = { client: null, turn: null, goal: null, subagents: new Map() };
+  mgr.slots.set(chat.id, slot);
+  mgr._onUpdate(chat.id, {
+    sessionUpdate: 'msp:goal',
+    goal: {
+      objective: 'Ship it', percentComplete: 42, status: 'running',
+      currentWork: 'wiring', nextWork: 'tests',
+    },
+  });
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Ship it');
+  assert.equal(store.get(chat.id)?.goal?.percentComplete, 42, 'msp:goal mirrors to the store');
+  const before = store.get(chat.id).updatedAt;
+  mgr._onUpdate(chat.id, {
+    sessionUpdate: 'msp:goal',
+    goal: { objective: 'Ship it', percentComplete: 43, status: 'running' },
+  });
+  assert.equal(store.get(chat.id).updatedAt, before, 'goal ticks never reshuffle queue order');
+  store.flushNow();
+
+  // Fresh host, same disk: cold chat still shows the last known goal.
+  const store2 = new SessionStore({ file, debounceMs: 5 });
+  const mgr2 = new SessionManager({ store: store2, wire: fakeWire(), searchDbPath: tmpSearchDb() });
+  const g = mgr2.getGoal(chat.id);
+  assert.equal(g?.objective, 'Ship it');
+  assert.equal(g?.percentComplete, 43);
+  assert.equal(g?.status, 'running');
+});
+
+test('goal snapshot binds to its session: rotation retires, resume retains', () => {
+  const file = tmpFile();
+  const store = new SessionStore({ file, debounceMs: 5 });
+  const mgr = new SessionManager({ store, wire: fakeWire(), searchDbPath: tmpSearchDb() });
+  const chat = mgr.createChat({ title: 'goal-bound' });
+  store.update(chat.id, { mspSessionId: 'sess-one' });
+  const slot = { client: { sessionId: 'sess-one' }, turn: null, goal: null, subagents: new Map() };
+  mgr.slots.set(chat.id, slot);
+  mgr._onUpdate(chat.id, {
+    sessionUpdate: 'msp:goal',
+    goal: { objective: 'Bound', percentComplete: 10, status: 'running' },
+  });
+  assert.equal(store.get(chat.id)?.goal?.sessionId, 'sess-one', 'snapshot stamps the origin');
+  mgr.slots.delete(chat.id); // cold from here on — store fallback decides
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Bound', 'resume (same id) retains');
+  store.update(chat.id, { mspSessionId: 'sess-two' }); // rotation swaps the id
+  assert.equal(mgr.getGoal(chat.id), null, 'rotation retires the stale snapshot');
+  // Legacy snapshots without a stamp keep the old retain behavior.
+  store.update(chat.id, { goal: { objective: 'Legacy', percentComplete: 5, status: 'running' } });
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Legacy');
+});
+
+test('goal snapshot validation: malformed disk state reads as no goal', () => {
+  const file = tmpFile();
+  fs.writeFileSync(file, JSON.stringify({ chats: [{ id: 'c1', goal: 'bogus' }] }));
+  const store = new SessionStore({ file, debounceMs: 5 });
+  assert.equal(store.get('c1')?.goal, null);
+});
+
+test('live goal retires on actual session rotation, retains on same-id resume', () => {
+  const { store, wire, mgr } = manager();
+  const chat = mgr.createChat({ title: 'goal-live-bound' });
+  // Live slot with a goal ingested under session A.
+  const slot = { client: { sessionId: 'sess-A' }, turn: null, goal: null, subagents: new Map() };
+  mgr.slots.set(chat.id, slot);
+  mgr._onUpdate(chat.id, {
+    sessionUpdate: 'msp:goal',
+    goal: { objective: 'Live', percentComplete: 10, status: 'running' },
+  });
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Live');
+  assert.equal(slot.goalSessionId, 'sess-A', 'live goal stamps its origin session');
+
+  // Exit + respawn under the SAME id (ordinary resume): retained, silent.
+  slot.client = null; // agent exit
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Live', 'cold slot keeps last-known');
+  slot.client = { sessionId: 'sess-A' }; // resume
+  assert.equal(mgr._retireGoalOnRotation(chat.id, slot, 'sess-A'), false);
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Live', 'same-id resume retains');
+  assert.equal(
+    wire.of('goal').filter((e) => e.goal == null).length,
+    0,
+    'no invalidation broadcast on ordinary resume',
+  );
+
+  // Exit + respawn under a NEW id (rotation / resume miss): retired loudly.
+  slot.client = null;
+  slot.client = { sessionId: 'sess-B' };
+  assert.equal(mgr._retireGoalOnRotation(chat.id, slot, 'sess-B'), true);
+  assert.equal(mgr.getGoal(chat.id), null, 'rotated goal reads null');
+  assert.equal(store.get(chat.id)?.goal, null, 'persisted snapshot retires too');
+  const nulls = wire.of('goal').filter((e) => e.chatId === chat.id && e.goal == null);
+  assert.equal(nulls.length, 1, 'one authoritative goal:null invalidates renderer mirrors');
+
+  // Backstop: a session swap that bypassed the hook still reads null.
+  slot.goal = { objective: 'Smuggled', percentComplete: 1, status: 'running' };
+  slot.goalSessionId = 'sess-A';
+  slot.client = { sessionId: 'sess-C' };
+  assert.equal(mgr.getGoal(chat.id), null, 'a live goal bound to another session never leaks');
+});
+
+test('persisted-only goal retires on a new session id, retains on same id', () => {
+  const { store, wire, mgr } = manager();
+  const chat = mgr.createChat({ title: 'goal-persisted-only' });
+  // Pre-restart goal persisted under session A, then a host restart (or
+  // slot eviction): a FRESH slot with no live goal at all (undefined),
+  // booting under a new client id B. The saved goal must retire loudly.
+  store.saveGoal(chat.id, { objective: 'Persisted', percentComplete: 20, status: 'running' }, 'sess-A');
+  store.update(chat.id, { mspSessionId: 'sess-A' });
+  const slot = { client: { sessionId: 'sess-B' }, turn: null, subagents: new Map() };
+  mgr.slots.set(chat.id, slot);
+  assert.equal(mgr._retireGoalOnRotation(chat.id, slot, 'sess-B'), true);
+  assert.equal(mgr.getGoal(chat.id), null, 'rotated persisted goal reads null');
+  assert.equal(store.get(chat.id)?.goal, null, 'saved snapshot retires too');
+  const nulls = () => wire.of('goal').filter((e) => e.chatId === chat.id && e.goal == null);
+  assert.equal(nulls().length, 1, 'exactly one authoritative goal:null');
+  // Idempotent: a second pass finds nothing to retire and stays silent.
+  assert.equal(mgr._retireGoalOnRotation(chat.id, slot, 'sess-B'), false);
+  assert.equal(nulls().length, 1, 'no duplicate invalidation');
+
+  // Same-id persisted-only resume: retained, silent.
+  store.saveGoal(chat.id, { objective: 'Persisted', percentComplete: 20, status: 'running' }, 'sess-A');
+  const slot2 = { client: { sessionId: 'sess-A' }, turn: null, subagents: new Map() };
+  mgr.slots.set(chat.id, slot2);
+  assert.equal(mgr._retireGoalOnRotation(chat.id, slot2, 'sess-A'), false);
+  assert.equal(mgr.getGoal(chat.id)?.objective, 'Persisted', 'same-id resume retains the snapshot');
+  assert.equal(nulls().length, 1, 'no invalidation on same-id resume');
+
+  // No proven new id, no proven rotation: an unknown boot id never wipes.
+  assert.equal(mgr._retireGoalOnRotation(chat.id, slot2, null), false);
+  assert.equal(store.get(chat.id)?.goal?.objective, 'Persisted');
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {

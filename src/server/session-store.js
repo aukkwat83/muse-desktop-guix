@@ -381,6 +381,47 @@ export class SessionStore {
     this.persistSoon();
     return chat.subagents;
   }
+
+  /**
+   * Persist the session goal snapshot (msp:goal is memory + this mirror).
+   * Metadata-only like saveSubagents(): never bumps updatedAt, so a goal
+   * percent tick does not reshuffle sidebar queue order. Debounced — losing
+   * the newest tick to a crash only shows a slightly stale percent until
+   * the next goalChanged. Null clears (agent cleared the goal).
+   */
+  saveGoal(id, goal, sessionId = null) {
+    const chat = this.get(id);
+    if (!chat) return null;
+    chat.goal = goal == null ? null : normalizeGoalSnapshot({ ...goal, sessionId });
+    this.persistSoon();
+    return chat.goal;
+  }
+}
+
+/**
+ * Validate a stored goal snapshot (disk → memory and memory → disk share
+ * this one shape). Malformed → null, never repaired: a half-parsed goal
+ * block is worse than a missing one.
+ */
+export function normalizeGoalSnapshot(goal) {
+  if (goal == null) return null;
+  if (typeof goal !== 'object' || Array.isArray(goal)) return null;
+  const str = (v, max) => {
+    if (v == null) return null;
+    const s = String(v);
+    return s.length > max ? `${s.slice(0, max)}…` : s;
+  };
+  return {
+    objective: str(goal.objective, 4000) ?? '',
+    percentComplete: Number.isFinite(goal.percentComplete) ? goal.percentComplete : 0,
+    status: String(goal.status ?? ''),
+    currentWork: str(goal.currentWork, 4000),
+    nextWork: str(goal.nextWork, 4000),
+    // The originating MSP session this snapshot belongs to. A rotation
+    // swaps mspSessionId, which retires the snapshot; an ordinary resume
+    // keeps the id, which retains it. Legacy snapshots lack it (null).
+    sessionId: typeof goal.sessionId === 'string' ? goal.sessionId : null,
+  };
 }
 
 /** Cap per chat — the rail lists newest-first, the tail is unreachable. */
@@ -432,6 +473,7 @@ function normalizeChat(raw) {
     createdAt: Number(raw.createdAt) || Date.now(),
     updatedAt: Number(raw.updatedAt) || Date.now(),
     subagents: normalizeSubagents(raw.subagents),
+    goal: normalizeGoalSnapshot(raw.goal),
     messages: Array.isArray(raw.messages)
       ? raw.messages.map((m) => ({
           id: String(m.id || randomUUID()),

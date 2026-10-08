@@ -152,7 +152,7 @@ export function buildEchartsSoftBlockHtml(body, title = null) {
     chromeTitle +
     `</div>` +
     `<div class="md-viz-softblock-body">` +
-    `<p class="md-viz-softblock-msg"><strong>ไม่ paint ECharts</strong> — Desktop แสดงแผนภาพเป็น <strong>Mermaid → SVG</strong> เท่านั้น</p>` +
+    `<p class="md-viz-softblock-msg"><strong>ไม่ paint ECharts</strong> — Desktop แสดงแผนภาพ Mermaid เป็น <strong>SVG</strong> เท่านั้น</p>` +
     `<p class="md-viz-softblock-hint">ใช้ <code class="md-codespan">${fenceHint}</code> (flowchart / sequence / state / mindmap) แล้วปิดด้วย <strong>สรุปคือ</strong></p>` +
     pre +
     `</div>` +
@@ -190,15 +190,11 @@ export function buildVizFigureHtml(opts) {
   // Per-diagram actions — top-right of chrome. Mermaid diagrams also get a
   // "Copy Mermaid" button whose clipboard payload is a ```mermaid fenced block
   // that pastes into GitLab / gitdop markdown and renders identically.
-  const copyMermaidBtn =
-    kind === 'mermaid'
-      ? `<button type="button" class="md-diagram-dl-btn md-diagram-copy-btn" data-dl="mermaid" title="คัดลอกเป็น Mermaid (วางใน GitLab / gitdop แล้ว render เหมือนกัน)">⧉ Mermaid</button>`
-      : '';
+  // Single source: markdown.js reuses diagramActionButtonsHtml for the same
+  // chrome it injects post-sanitize, so the two can never drift apart.
   const dl =
     `<div class="md-diagram-dl" role="group" aria-label="Diagram actions">` +
-    copyMermaidBtn +
-    `<button type="button" class="md-diagram-dl-btn" data-dl="svg" title="Download SVG">↓ SVG</button>` +
-    `<button type="button" class="md-diagram-dl-btn" data-dl="png" title="Download PNG (low quality)">↓ PNG</button>` +
+    diagramActionButtonsHtml(kind === 'mermaid') +
     `</div>`;
 
   return (
@@ -210,6 +206,26 @@ export function buildVizFigureHtml(opts) {
     `</div>` +
     `<div class="${bodyClass}">${escapeHtml(opts.body)}</div>` +
     `</figure>\n`
+  );
+}
+
+/**
+ * Per-diagram action buttons (copy Mermaid / download SVG / download PNG).
+ * Text-only by design — same trust rule as codeBlockHtml: the sanitizer
+ * strips all svg, and markdown.js rebuilds the trusted registry icons onto
+ * these buttons after sanitization (from data-dl, which survives the walk).
+ * Pure — the node suite pins the buttons and their labels.
+ * @param {boolean} withMermaid
+ * @returns {string}
+ */
+export function diagramActionButtonsHtml(withMermaid) {
+  const copyMermaidBtn = withMermaid
+    ? `<button type="button" class="md-diagram-dl-btn md-diagram-copy-btn" data-dl="mermaid" title="คัดลอกเป็น Mermaid (วางใน GitLab / gitdop แล้ว render เหมือนกัน)">Mermaid</button>`
+    : '';
+  return (
+    copyMermaidBtn +
+    `<button type="button" class="md-diagram-dl-btn" data-dl="svg" title="Download SVG">SVG</button>` +
+    `<button type="button" class="md-diagram-dl-btn" data-dl="png" title="Download PNG (low quality)">PNG</button>`
   );
 }
 

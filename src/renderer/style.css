@@ -52,22 +52,42 @@ html[data-theme='moonlight'] {
   /* Right rail: same idea, a touch wider for cost tables + insight cards. */
   --rightbar-w: clamp(16rem, 22%, 22rem);
   /* Type ladder: every font-size below is one of these tokens, so a size
-     change is a token edit rather than a hunt through twenty rules. Values
-     are exactly the px sizes that were hardcoded — rendering does not change.
+     change is a token edit rather than a hunt through twenty rules.
      (grok-desktop computes its ladder from --type-step; muse keeps fixed
-     values until there is a size preference to feed one.) */
-  --fs-caption-2: 10px; /* counts, timers */
-  --fs-caption-1: 10.5px; /* meta labels */
-  --fs-footnote: 11px; /* badges, small buttons */
-  --fs-subhead: 11.5px; /* meta rows, mono captions */
-  --fs-callout: 12px; /* sidebar rows, code chrome */
-  --fs-body-sm: 12.5px; /* secondary controls, menu items */
-  --fs-lead: 13px; /* group names, emphasised labels */
+     values until there is a size preference to feed one.)
+     Restrained Codex-like scale: 13–14px controls, 14px body, 16px headings,
+     and a readable 11px floor for secondary labels instead of the old 10px
+     density. --fs-caption-1/--fs-body stay on the pinned 3:4 console ratio. */
+  --fs-caption-2: 11px; /* counts, timers, kind tags, micro headers */
+  --fs-caption-1: 10.5px; /* tool console ONLY (3:4 of body, pinned) */
+  --fs-footnote: 11.5px; /* badges, small buttons, pills, fine print */
+  --fs-subhead: 12px; /* meta rows, mono captions */
+  --fs-callout: 12.5px; /* sidebar rows, code chrome */
+  --fs-body-sm: 13px; /* secondary controls, menu items */
+  --fs-lead: 13.5px; /* group names, emphasised labels */
   --fs-body: 14px; /* default type */
-  --fs-headline: 15px; /* chat title */
-  --fs-title-3: 17px; /* send glyph */
-  --fs-title-2: 18px; /* brand mark */
+  --fs-headline: 16px; /* chat title */
+  --fs-title-3: 18px; /* cost total */
+  --fs-title-2: 20px; /* brand mark */
   --fs-display: 34px; /* empty-state mark */
+  /* One UI stack, one mono stack. Latin resolves to the platform face or
+     Inter; Thai falls through to Sarabun/Thonburi (Inter has no Thai, so it
+     never captures Thai text) — Sarabun must stay ahead of system-ui, which
+     on Guix resolves to DejaVu Sans and would otherwise win the Thai range.
+     DejaVu Sans covers the symbol remainder (arrows, middots, key hints). */
+  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Inter, 'Sarabun', 'Thonburi', system-ui, 'DejaVu Sans', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  /* Line-height ladder: tight for one-line chrome, snug for dense meta,
+     body for prose. Thai tone marks paint above the line box — one-line
+     ellipsised rows must never go below snug without top padding. */
+  --lh-tight: 1.25;
+  --lh-snug: 1.4;
+  --lh-body: 1.6;
+  /* Weight ladder: semibold carries headings and emphasised labels. */
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
 }
 
 html[data-theme='daylight'] {
@@ -119,8 +139,7 @@ body {
 body {
   background: var(--bg);
   color: var(--ink);
-  font: var(--fs-body)/1.6 -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'Sarabun',
-    system-ui, sans-serif;
+  font: var(--fs-body)/var(--lh-body) var(--font-ui);
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
 }
@@ -297,12 +316,139 @@ button.drill-row:focus-visible,
   box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
+/* ---------------------------------------------------- shared icon family
+   Every UI-owned glyph is one of the icons.js vectors: 24px viewBox, ~1.8
+   rounded stroke, currentColor. Rendered 16px in UI chrome, 14px in dense
+   rows and menus, 20px for prominent controls (send, brand). Icon-only
+   buttons hold a 28–32px hit area; icon + label buttons are inline-flex
+   with a 6px gap and centred baselines. The vertical-align fallback only
+   matters in non-flex inline contexts (ix buttons, queue previews) — flex
+   and grid parents ignore it. */
+svg.ico {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  vertical-align: -3px;
+}
+
+svg.ico-sm {
+  width: 14px;
+  height: 14px;
+}
+
+svg.ico-lg {
+  width: 20px;
+  height: 20px;
+}
+
+.ic-label {
+  min-width: 0;
+}
+
+/* Icon + label buttons share one row shape: centred, 6px gap, labels may
+   ellipsise (goal strip) but never wrap. */
+.btn.sm,
+.attach-browse-btn,
+.goal-btn,
+.ca-open,
+.jump-latest,
+.prompt-queue-chip,
+.md-copy-btn,
+.md-diagram-dl-btn,
+.rb-goal-done {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+/* Icon-only buttons: centred grid, 28px minimum hit area. */
+.icon-btn,
+.group-btn,
+.group-expand,
+.s-del,
+.session-find-nav,
+.session-find-close,
+.rb-copy,
+.prompt-queue-remove,
+.attach-chip-x {
+  display: grid;
+  place-items: center;
+  min-width: 28px;
+  min-height: 28px;
+}
+
+/* Dense-list exceptions: remove buttons inside chips and queue rows stay
+   compact (24px) so rows keep their rhythm — still well above the old
+   16px targets. */
+.prompt-queue-remove,
+.attach-chip-x {
+  min-width: 24px;
+  min-height: 24px;
+}
+
+/* Decorative icon hosts inside text rows: centred, never shrink. */
+.brand-mark,
+.goal-glyph,
+.session-find-icon,
+.spark,
+.attach-chip-ico,
+.prompt-queue-att,
+.marker-ico,
+.glyph,
+.child-chev,
+.task-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+/* Code and diagram chrome buttons scale their icons off their own small
+   type instead of the fixed ladder, so icon and label stay proportional. */
+.msg-assistant .md-copy-btn .ico,
+.msg-assistant .md-diagram-dl-btn .ico {
+  width: 1.15em;
+  height: 1.15em;
+}
+
+/* Empty states: the brand vector at display size above the guidance line. */
+.empty .empty-mark {
+  width: 40px;
+  height: 40px;
+  color: var(--accent-text);
+  margin-bottom: 6px;
+}
+
+/* Icon-only .btn controls (sidebar head, chat head, composer): centred row
+   so the vector sits optically middle at any button size. */
+#new-chat,
+#new-group,
+#theme-toggle,
+.head-actions > .btn.ghost,
+#btn-attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Sidebar header actions are fixed 32px squares: predictable budget, so the
+   brand name keeps its ~108px and 'Muse Desktop' fits the default 230px. */
+#new-chat,
+#new-group {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  padding: 0;
+}
+
 /* Row actions are hover-revealed with opacity — focus must reveal them too,
    or the ring lands on an invisible button. */
 .icon-btn:focus-visible,
 .group-btn:focus-visible,
 .s-del:focus-visible {
   opacity: 1;
+  pointer-events: auto;
 }
 
 /* ------------------------------------------------------------- sidebar */
@@ -322,22 +468,21 @@ button.drill-row:focus-visible,
 .side-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 12px 10px;
+  gap: 6px;
+  padding: 10px 10px 8px;
   border-bottom: 1px solid var(--line-soft);
 }
 
 .brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex: 1;
   min-width: 0;
 }
 
 .brand-mark {
   color: var(--accent-text);
-  font-size: var(--fs-title-2);
   line-height: 1;
 }
 
@@ -377,16 +522,14 @@ button.drill-row:focus-visible,
 
 .icon-btn {
   flex: none;
-  width: 20px;
-  height: 20px;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
   border: 1px solid transparent;
   background: transparent;
   color: var(--muted);
   border-radius: 5px;
-  font-size: var(--fs-lead);
-  line-height: 1;
   padding: 0;
   opacity: 0;
 }
@@ -434,19 +577,71 @@ button.drill-row:focus-visible,
   gap: 3px;
   padding: 4px 6px;
   min-width: 0;
+  position: relative;
+}
+
+/* Row actions overlay the title instead of squeezing it: three 28px targets
+   in flow stole ~90px and 'Group 1' rendered 'Gro...' at the default 230px.
+   The buttons keep their 28px hit area but reserve zero flex width, floating
+   over the row end VS-Code-tree style. At rest they are pointer-transparent
+   (opacity:0 alone would still swallow title clicks); hover or focus within
+   the row — or on the button itself — brings them back. The count/badge in
+   flow ducks under the overlay while it is visible. */
+.group-row .group-btn,
+.group-row > .group-menu {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.group-row > .group-menu {
+  right: 6px;
+}
+
+.group-row .group-btn.del {
+  right: 36px;
+}
+
+.group-row .group-btn.add {
+  right: 66px;
 }
 
 .group-row:hover .icon-btn,
-.group-row:hover .group-btn {
+.group-row:hover .group-btn,
+.group-row:focus-within .icon-btn,
+.group-row:focus-within .group-btn {
   opacity: 1;
+  pointer-events: auto;
+}
+
+.group-row:hover .group-count,
+.group-row:hover .group-pending,
+.group-row:focus-within .group-count,
+.group-row:focus-within .group-pending {
+  opacity: 0;
+}
+
+.group-row:hover > .group-menu,
+.group-row:focus-within > .group-menu {
+  background: var(--panel);
+  border-color: var(--line);
+}
+
+.group-block.active .group-row:hover > .group-menu,
+.group-block.active .group-row:focus-within > .group-menu {
+  background: var(--panel-2);
 }
 
 .group-handle {
   flex: none;
-  width: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 28px;
   color: var(--muted);
-  font-size: var(--fs-caption-2);
-  letter-spacing: -1px;
   cursor: grab;
   opacity: 0.45;
   user-select: none;
@@ -462,13 +657,13 @@ button.drill-row:focus-visible,
 
 .group-expand {
   flex: none;
-  width: 16px;
-  height: 18px;
+  width: 28px;
+  height: 28px;
   border: none;
   background: none;
   color: var(--muted);
-  font-size: var(--fs-caption-2);
   padding: 0;
+  border-radius: 5px;
 }
 
 .group-expand:hover {
@@ -490,8 +685,10 @@ button.drill-row:focus-visible,
   border: none;
   background: none;
   padding: 2px 2px;
+  padding-top: 3px; /* Thai tone marks paint above the line box — pad the clip */
   font-size: var(--fs-body-sm);
   font-weight: 650;
+  line-height: var(--lh-snug);
   color: var(--ink);
   white-space: nowrap;
   overflow: hidden;
@@ -504,8 +701,8 @@ button.drill-row:focus-visible,
 
 .group-btn {
   flex: none;
-  width: 16px;
-  height: 16px;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
   padding: 0;
@@ -513,9 +710,6 @@ button.drill-row:focus-visible,
   border: 1px solid var(--line);
   background: var(--panel);
   color: var(--muted);
-  font-size: var(--fs-footnote);
-  font-weight: 700;
-  line-height: 1;
   opacity: 0;
 }
 
@@ -531,7 +725,7 @@ button.drill-row:focus-visible,
 
 .group-count {
   flex: none;
-  font-size: var(--fs-caption-1);
+  font-size: var(--fs-caption-2);
   color: var(--muted);
   font-variant-numeric: tabular-nums;
   padding: 0 2px;
@@ -610,10 +804,6 @@ button.drill-row:focus-visible,
   background: var(--accent-soft);
 }
 
-.dashed-tab .plus {
-  font-weight: 700;
-}
-
 .add-group {
   padding: 2px 0;
 }
@@ -633,15 +823,55 @@ button.drill-row:focus-visible,
   border: 1px solid transparent;
   min-width: 0;
   cursor: pointer;
+  position: relative;
 }
 
 .session-item:hover {
   background: var(--panel-2);
 }
 
+/* Same overlay contract as .group-row: the delete/menu pair floats over the
+   row end with zero flex width, so session titles use the full 230px. */
+.session-item .s-del,
+.session-item > .s-menu {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.session-item > .s-menu {
+  right: 6px;
+}
+
+.session-item .s-del {
+  right: 36px;
+}
+
 .session-item:hover .icon-btn,
-.session-item:hover .s-del {
+.session-item:hover .s-del,
+.session-item:focus-within .icon-btn,
+.session-item:focus-within .s-del {
   opacity: 1;
+  pointer-events: auto;
+}
+
+.session-item:hover .s-badge,
+.session-item:focus-within .s-badge {
+  opacity: 0;
+}
+
+.session-item:hover > .s-menu,
+.session-item:focus-within > .s-menu {
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+
+.session-item.active:hover > .s-menu,
+.session-item.active:focus-within > .s-menu {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
 }
 
 .session-item.active {
@@ -726,14 +956,17 @@ button.drill-row:focus-visible,
 }
 
 .s-title {
-  font-size: var(--fs-callout);
+  font-size: var(--fs-body-sm);
+  line-height: var(--lh-snug);
+  padding-top: 1px; /* Thai clip guard — see .group-name */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .s-meta {
-  font-size: var(--fs-caption-1);
+  font-size: var(--fs-subhead);
+  line-height: var(--lh-snug);
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -752,8 +985,8 @@ button.drill-row:focus-visible,
 
 .s-del {
   flex: none;
-  width: 16px;
-  height: 16px;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
   padding: 0;
@@ -761,9 +994,6 @@ button.drill-row:focus-visible,
   border: 1px solid var(--line);
   background: var(--panel);
   color: var(--muted);
-  font-size: var(--fs-footnote);
-  font-weight: 700;
-  line-height: 1;
   opacity: 0;
 }
 
@@ -823,11 +1053,31 @@ button.drill-row:focus-visible,
 }
 
 .pop-ico {
-  width: 14px;
-  text-align: center;
-  opacity: 0.8;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.85;
   flex: none;
-  font-size: var(--fs-footnote);
+}
+
+.pop-ico:empty {
+  width: 16px; /* icon-less rows keep the label column aligned */
+}
+
+.pop-text-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
+}
+
+.pop-check {
+  margin-left: auto;
+  color: var(--accent-text);
 }
 
 .pop-sep {
@@ -838,6 +1088,7 @@ button.drill-row:focus-visible,
 
 .pop-label {
   padding: 4px 8px 2px;
+  padding-top: 5px; /* Thai clip guard — see .group-name */
   font-size: var(--fs-caption-2);
   font-weight: 700;
   color: var(--muted);
@@ -892,6 +1143,7 @@ button.drill-row:focus-visible,
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .agent-badge.bad {
@@ -913,10 +1165,11 @@ button.drill-row:focus-visible,
 }
 
 /* ------------------------------------------------------- right rail ----
-   Cost · goal/tasks · subagents · SCB projects (Codex Desktop parity).
-   Hidden by default; body.rb-open adds the grid column. Sections are
-   <details> blocks; the rail reuses the popover panel classes (.panel-sect,
-   .goal-block, .task-row, …) for identical rows without duplicate CSS. */
+   Session identity + cost (1.1.30: goal, tasks and subagents moved to the
+   live overview popup — the rail holds no turn children). Hidden by
+   default; body.rb-open adds the grid column. Sections are <details>
+   blocks; the rail reuses the popover panel classes (.panel-sect, …) for
+   identical rows without duplicate CSS. */
 
 #rightbar {
   display: flex;
@@ -980,14 +1233,23 @@ button.drill-row:focus-visible,
   display: none;
 }
 
+/* Details markers are registry chevrons (icons.js chevDown/chevRight) as
+   alpha masks over a muted disc — pseudo-elements cannot host real SVG, so
+   the shapes live here as data-URIs. unit-test-icons extracts the path data
+   and fails when any drifts from the registry. */
 .rb-summary::before {
-  content: '▾';
-  color: var(--muted);
+  content: '';
+  width: 12px;
+  height: 12px;
   flex: none;
+  background: var(--muted);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 9.5l6 6 6-6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 9.5l6 6 6-6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/contain no-repeat;
 }
 
 .rb-sect:not([open]) .rb-summary::before {
-  content: '▸';
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9.5 6l6 6-6 6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9.5 6l6 6-6 6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 .rb-summary:hover {
@@ -1077,8 +1339,8 @@ button.drill-row:focus-visible,
 .rb-id-val {
   flex: 1;
   min-width: 0;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-size: var(--fs-footnote);
+  font-family: var(--font-mono);
+  font-size: var(--fs-subhead);
   color: var(--ink-dim);
   white-space: nowrap;
   overflow: hidden;
@@ -1095,15 +1357,24 @@ button.drill-row:focus-visible,
   border: 1px solid var(--line-soft);
   background: none;
   color: var(--muted);
-  font-size: var(--fs-footnote);
   border-radius: 6px;
-  padding: 1px 7px;
+  padding: 0;
 }
 
 .rb-copy:hover {
   color: var(--accent-text);
   border-color: var(--accent-line);
   background: var(--accent-soft);
+}
+
+.rb-copy.is-ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 55%, transparent);
+}
+
+.rb-copy.is-fail {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
 }
 
 .rb-tags {
@@ -1242,7 +1513,7 @@ button.search-hit:hover {
 }
 .search-hit-group {
   display: block;
-  font-size: 0.72em;
+  font-size: 0.78em;
   color: var(--muted);
   letter-spacing: 0.02em;
   margin-bottom: 0.1rem;
@@ -1253,10 +1524,11 @@ button.search-hit:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 .search-hit-meta {
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-size: 0.72em;
+  font-family: var(--font-mono);
+  font-size: 0.78em;
   color: var(--muted);
 }
 .search-hit-snip {
@@ -1301,7 +1573,6 @@ button.search-hit:hover {
 .session-find-icon {
   flex: none;
   opacity: 0.65;
-  font-size: 0.9em;
 }
 .session-find-input {
   flex: 1 1 auto;
@@ -1320,8 +1591,8 @@ button.search-hit:hover {
 }
 .session-find-count {
   flex: none;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-size: 0.74em;
+  font-family: var(--font-mono);
+  font-size: 0.78em;
   color: var(--muted);
   min-width: 2.8rem;
   text-align: right;
@@ -1330,16 +1601,14 @@ button.search-hit:hover {
 .session-find-close {
   flex: none;
   cursor: pointer;
-  width: 1.55rem;
-  height: 1.55rem;
+  width: 28px;
+  height: 28px;
   display: grid;
   place-items: center;
   border-radius: 0.35rem;
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--muted);
-  font-size: 0.85em;
-  line-height: 1;
 }
 .session-find-nav:hover,
 .session-find-close:hover {
@@ -1388,8 +1657,8 @@ button.search-hit:hover {
   border-color: color-mix(in srgb, var(--accent) 45%, transparent);
 }
 .session-find-hit-meta {
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-size: 0.7em;
+  font-family: var(--font-mono);
+  font-size: 0.78em;
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.03em;
@@ -1487,6 +1756,8 @@ button.search-hit:hover {
   margin: 0;
   font-size: var(--fs-headline);
   font-weight: 650;
+  line-height: var(--lh-snug);
+  padding-top: 1px; /* Thai clip guard — see .group-name */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1496,7 +1767,7 @@ button.search-hit:hover {
   border: none;
   background: none;
   padding: 0;
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--muted);
   max-width: 100%;
   overflow: hidden;
@@ -1514,6 +1785,50 @@ button.search-hit:hover {
   align-items: center;
   gap: 8px;
   flex: none;
+}
+
+/* Chips/actions grouping for the narrow wrap only — display:contents at
+   wide widths keeps today's single-row rendering byte-identical. */
+.head-chips,
+.head-actions {
+  display: contents;
+}
+
+/* Narrow viewports (≤900px): the pills row used to shove the find / stop /
+   overview / panel buttons past the viewport edge (scrollWidth 1089px at
+   560px). The header wraps instead: line 1 keeps the ellipsising title +
+   all four actions; the chips drop to a wrapping second line. */
+@media (max-width: 900px) {
+  #chat-head {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .head-right {
+    display: contents;
+  }
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+    order: 1;
+  }
+  .head-chips {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    flex: 1 1 100%;
+    order: 2;
+    min-width: 0;
+  }
+  .head-chips .pill {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
 }
 
 .pill {
@@ -1606,7 +1921,7 @@ button.search-hit:hover {
 
 .auth-cmd {
   display: block;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: var(--fs-subhead);
   color: var(--muted);
   background: var(--code-bg);
@@ -1736,6 +2051,9 @@ button.search-hit:hover {
    (grok-desktop .turn-interrupted-marker). Reuses --muted: no new colour pair. */
 .turn-interrupted-marker {
   align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 0.82em;
   color: var(--muted);
   opacity: 0.85;
@@ -1774,7 +2092,7 @@ button.search-hit:hover {
 
 .msg-assistant code,
 .msg-assistant pre {
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
 }
 
 /* Fenced block with a chrome bar: language label left, copy button right
@@ -1800,7 +2118,7 @@ button.search-hit:hover {
 }
 
 .msg-assistant .md-code-label {
-  font-size: 0.72em;
+  font-size: 0.78em;
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1809,7 +2127,7 @@ button.search-hit:hover {
 
 .msg-assistant .md-copy-btn {
   flex: none;
-  font-size: 0.72em;
+  font-size: 0.78em;
   font-weight: 600;
   letter-spacing: 0.02em;
   line-height: 1;
@@ -2008,7 +2326,7 @@ button.search-hit:hover {
   min-height: 1.75rem;
 }
 .msg-assistant .md-diagram-label {
-  font-size: 0.72em;
+  font-size: 0.78em;
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -2018,7 +2336,7 @@ button.search-hit:hover {
   color: var(--accent-text);
 }
 
-/* Per-diagram actions (⧉ Mermaid / ↓ SVG / ↓ PNG) — top-right of each box */
+/* Per-diagram actions (copy Mermaid / download SVG / download PNG) — top-right of each box */
 .msg-assistant .md-diagram-dl {
   margin-left: auto;
   display: inline-flex;
@@ -2030,7 +2348,7 @@ button.search-hit:hover {
   appearance: none;
   margin: 0;
   padding: 0.12rem 0.38rem;
-  font-size: 0.65rem;
+  font-size: 0.7rem;
   font-weight: 600;
   letter-spacing: 0.04em;
   line-height: 1.2;
@@ -2080,7 +2398,7 @@ button.search-hit:hover {
 .msg-assistant .md-mermaid-pending {
   text-align: left;
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 0.82em;
   white-space: pre-wrap;
 }
@@ -2231,6 +2549,7 @@ button.search-hit:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .progress-group.pg-running .progress-head {
@@ -2323,8 +2642,7 @@ button.search-hit:hover {
 .tool-head .glyph {
   color: var(--muted);
   flex: none;
-  width: 0.9rem; /* grok .tool-glyph box (:4518) */
-  text-align: center;
+  width: 14px;
 }
 
 /* Processing marks (BUG-027), Grok CLI style: a live tool row's own left
@@ -2386,22 +2704,31 @@ button.search-hit:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
   color: var(--ink-dim);
 }
 
 .tool-head .status {
-  font-size: 0.75em; /* grok .act-status (:4601); case/weight stay muse's */
+  font-size: 0.78em; /* grok .act-status (:4601); case/weight stay muse's */
   letter-spacing: 0.04em;
   color: var(--muted);
   flex: none;
 }
 
 /* Agent rows (BUG-076): pinned above plain tool rows in the live turn and
-   marked with a ◈ glyph + a quiet subtitle (subagent type / swarm fan-out).
-   --accent-text and --muted are audited pairs — no new colours. */
+   marked with the registry spark (mask, like the details markers above) +
+   a quiet subtitle (subagent type / swarm fan-out). --accent-text and
+   --muted are audited pairs — no new colours. */
 .tool-row.agent .name::before {
-  content: '◈ ';
-  color: var(--accent-text);
+  content: '';
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  background: var(--accent-text);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 3.5c.7 4.6 2.9 6.8 7.5 7.5-4.6.7-6.8 2.9-7.5 7.5-.7-4.6-2.9-6.8-7.5-7.5 4.6-.7 6.8-2.9 7.5-7.5Z' fill='black'/%3E%3C/svg%3E") center/contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 3.5c.7 4.6 2.9 6.8 7.5 7.5-4.6.7-6.8 2.9-7.5 7.5-.7-4.6-2.9-6.8-7.5-7.5 4.6-.7 6.8-2.9 7.5-7.5Z' fill='black'/%3E%3C/svg%3E") center/contain no-repeat;
 }
 
 .tool-head .sub {
@@ -2431,7 +2758,7 @@ button.search-hit:hover {
   border-top: 1px solid var(--line-soft);
   background: var(--code-bg);
   padding: 0.35rem 0.45rem;
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
   /* Stays on the caption token: css-guards pins console at 3:4 of the answer
      (10.5px vs grok's rendered ~9.2px nested 0.82×0.78em — see report). */
   font-size: var(--fs-caption-1);
@@ -2471,7 +2798,7 @@ button.search-hit:hover {
 .ca-title {
   flex: 1 1 auto;
   color: var(--ink-dim);
-  font-size: var(--fs-caption-1);
+  font-size: var(--fs-subhead);
 }
 
 .ca-open {
@@ -2550,7 +2877,7 @@ button.search-hit:hover {
 }
 
 .ix-card .ix-summary {
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 0.8em; /* grok .ix-card-summary (:336) */
   line-height: 1.45;
   color: var(--ink-dim);
@@ -2629,8 +2956,6 @@ button.search-hit:hover {
 
 .status-line .spark {
   color: var(--accent-text);
-  font-size: 1.05em;
-  line-height: 1;
   animation: pulse 1.2s ease-in-out infinite;
 }
 
@@ -2754,6 +3079,7 @@ html.theme-switching .jump-latest {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 12rem;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 .attach-chip-x {
   appearance: none;
@@ -2761,8 +3087,6 @@ html.theme-switching .jump-latest {
   background: transparent;
   cursor: pointer;
   color: var(--muted);
-  font-size: 0.7rem;
-  line-height: 1;
   padding: 0 0.2rem;
   border-radius: 999px;
 }
@@ -2795,7 +3119,12 @@ html.theme-switching .jump-latest {
 .attach-browse-row { display: flex; gap: 0.4rem; }
 .attach-browse-row .attach-browse-btn { flex: 1; }
 .attach-browse-btn { align-self: stretch; text-align: center; }
-.attach-chip-ico { font-size: 0.85em; opacity: 0.85; }
+.attach-chip-ico { opacity: 0.85; }
+.attach-bar-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
 .attach-pop-or { font-size: 0.72rem; color: var(--muted); text-align: center; }
 .attach-paste {
   width: 100%;
@@ -2805,7 +3134,7 @@ html.theme-switching .jump-latest {
   border-radius: 0.4rem;
   background: var(--input-bg);
   color: var(--ink);
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
   font-size: 0.78rem;
   padding: 0.4rem 0.5rem;
   outline: none;
@@ -2839,6 +3168,10 @@ html.theme-switching .jump-latest {
   line-height: 1.35;
   cursor: pointer;
   max-width: 100%;
+}
+
+.prompt-queue-chip .ic-label,
+.goal-btn .ic-label {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2877,18 +3210,16 @@ html.theme-switching .jump-latest {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .prompt-queue-remove {
   margin: 0;
-  padding: 0.05rem 0.35rem;
+  padding: 0;
   border: 0;
   border-radius: 0.3rem;
   background: transparent;
   color: var(--muted);
-  font: inherit;
-  font-size: 0.78rem;
-  line-height: 1.2;
   cursor: pointer;
 }
 
@@ -2954,8 +3285,6 @@ html.theme-switching .jump-latest {
   border: 1px solid var(--accent);
   background: var(--accent);
   color: var(--accent-ink);
-  font-size: var(--fs-title-3);
-  line-height: 1;
   display: grid;
   place-items: center;
   transition: background 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
@@ -2982,11 +3311,10 @@ html.theme-switching .jump-latest {
   line-height: 2;
 }
 
-.empty .big {
+.empty .empty-mark {
   display: block;
-  font-size: var(--fs-display);
-  color: var(--accent-text);
-  margin-bottom: 6px;
+  margin-left: auto;
+  margin-right: auto;
 }
 
 ::-webkit-scrollbar {
@@ -3052,6 +3380,7 @@ html.theme-switching .jump-latest {
   padding: 3px 8px;
   font-size: var(--fs-footnote);
   border-radius: 6px;
+  min-height: 28px; /* small buttons keep the icon hit area */
 }
 
 .pop.panel {
@@ -3077,6 +3406,7 @@ html.theme-switching .jump-latest {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .panel-title-row {
@@ -3094,7 +3424,7 @@ html.theme-switching .jump-latest {
 }
 
 .panel-sub {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--muted);
   padding: 0 2px 6px;
 }
@@ -3123,7 +3453,7 @@ html.theme-switching .jump-latest {
 }
 
 .panel-foot {
-  font-size: var(--fs-caption-1);
+  font-size: var(--fs-caption-2);
   color: var(--muted);
   padding: 6px 2px 0;
   line-height: 1.45;
@@ -3152,10 +3482,11 @@ html.theme-switching .jump-latest {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .mcp-meta {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -3219,13 +3550,14 @@ html.theme-switching .jump-latest {
 
 .child-chev {
   color: var(--muted);
-  font-size: var(--fs-lead);
   flex: none;
-  padding-top: 1px;
+  gap: 2px;
+  font-size: var(--fs-footnote);
+  font-variant-numeric: tabular-nums;
 }
 
 .child-result {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--ink-dim);
   margin-top: 2px;
   display: -webkit-box;
@@ -3235,12 +3567,13 @@ html.theme-switching .jump-latest {
 }
 
 .child-live {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--muted);
   margin-top: 2px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .drill-row {
@@ -3285,16 +3618,16 @@ button.drill-row:hover {
 }
 
 .drill-tool {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--ink-dim);
-  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-family: var(--font-mono);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .drill-text {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--ink-dim);
   white-space: pre-wrap;
   word-break: break-word;
@@ -3336,6 +3669,7 @@ button.drill-row:hover {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
 }
 
 .agent-actions {
@@ -3404,7 +3738,7 @@ button.drill-row:hover {
 
 .panel-sect {
   padding: 8px 4px 4px;
-  font-size: var(--fs-caption-1);
+  font-size: var(--fs-caption-2);
   font-weight: 700;
   color: var(--muted);
 }
@@ -3443,7 +3777,7 @@ button.drill-row:hover {
 }
 
 .goal-work {
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   color: var(--ink-dim);
   line-height: 1.45;
 }
@@ -3475,10 +3809,7 @@ button.drill-row:hover {
    to 2 lines with the full content on hover, done rows struck through. */
 .task-glyph {
   flex: none;
-  width: 1.2em;
-  text-align: center;
-  font-size: var(--fs-callout);
-  line-height: 1.4;
+  width: 16px;
 }
 
 .task-glyph.done {
@@ -3517,7 +3848,7 @@ button.drill-row:hover {
   cursor: pointer;
   list-style: none;
   color: var(--muted);
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
   padding: 6px 4px;
   border-radius: 6px;
   white-space: nowrap;
@@ -3530,11 +3861,20 @@ button.drill-row:hover {
 }
 
 .todo-fold-summary::before {
-  content: '▸ ';
+  content: '';
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  background: var(--muted);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9.5 6l6 6-6 6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M9.5 6l6 6-6 6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/contain no-repeat;
 }
 
 .todo-fold[open] .todo-fold-summary::before {
-  content: '▾ ';
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 9.5l6 6 6-6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 9.5l6 6 6-6' fill='none' stroke='black' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
 }
 
 .todo-fold-summary:hover {
@@ -3623,19 +3963,22 @@ button.drill-row:hover {
    classes belong to the panel progress rows under `.goal-block`. The strip is
    a sibling above the composer form (own row, gutter-aligned card); the
    objective absorbs the squeeze with an ellipsis and the meta shrinks next,
-   so the row fits instead of overflowing the edge. */
+   so the row fits instead of overflowing the edge. The max-width backstop
+   keeps the 20px gutters inside #main at any width; below 480px the meta
+   hides and the gutters tighten so the pause/resume button stays intact. */
 #goal-bar {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+  max-width: calc(100% - 40px);
   padding: 6px 10px;
   margin: 0 20px 6px;
   overflow: hidden;
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  font-size: var(--fs-footnote);
+  font-size: var(--fs-subhead);
 }
 #goal-bar[hidden] {
   display: none;
@@ -3650,6 +3993,7 @@ button.drill-row:hover {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding-top: 1px; /* Thai clip guard — see .group-name */
   color: var(--ink);
 }
 #goal-bar .goal-meta {
@@ -3662,6 +4006,10 @@ button.drill-row:hover {
 }
 #goal-bar .goal-btn {
   flex: none;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   background: transparent;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -3669,6 +4017,20 @@ button.drill-row:hover {
   font-size: var(--fs-footnote);
   padding: 2px 8px;
   cursor: pointer;
+}
+
+/* Narrow screens: the meta (% + status word) drops out and the gutters
+   tighten from 20px to 12px, so the objective + pause/resume button keep
+   fitting instead of clipping at the edge. */
+@media (max-width: 480px) {
+  #goal-bar {
+    margin: 0 12px 6px;
+    max-width: calc(100% - 24px);
+    gap: 6px;
+  }
+  #goal-bar .goal-meta {
+    display: none;
+  }
 }
 #goal-bar .goal-btn:hover {
   border-color: var(--accent-line);
@@ -3679,71 +4041,94 @@ button.drill-row:hover {
   cursor: default;
 }
 
-/* Thread overview popup: sectioned Subagents / Tasks / Goal rows. */
-.thread-overview {
-  min-width: 300px;
+/* Thread overview popup (1.1.30): the live goal + tasks + subagents view.
+   Wider than .pop.panel's 348px — child titles need room — and capped to
+   the viewport so it never hangs off-screen. Sections stack in one scroll
+   column; a drill replaces the column, never stacks beside it. */
+.pop.panel.overview-panel {
+  width: min(600px, calc(100vw - 32px));
+  max-width: calc(100vw - 16px);
+  max-height: min(80vh, 640px);
 }
-.thread-overview h2 {
-  font-size: var(--fs-footnote);
-  font-weight: 700;
-  color: var(--muted);
-  margin: 8px 2px 4px;
+.ov-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-top: 1px solid var(--line-soft);
+  padding: 6px 0;
 }
-.thread-overview h2:first-child {
-  margin-top: 0;
+.ov-sect-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-right: 2px;
 }
-.thread-overview ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
+.ov-sect-head .panel-sect {
+  flex: 1;
+  min-width: 0;
+  padding-bottom: 0;
+}
+.ov-sect-head .btn {
+  flex: none;
+}
+.ov-agent-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
-.thread-overview .ov-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
-  background: transparent;
-  border: 0;
-  border-radius: 6px;
-  padding: 5px 6px;
-  color: var(--ink);
-  font-size: var(--fs-body);
-  text-align: left;
-  cursor: pointer;
-}
-.thread-overview .ov-row:hover {
-  background: var(--raised);
-}
-.thread-overview .ov-avatar {
-  flex: none;
-  width: 1.4em;
-  text-align: center;
-}
-.thread-overview .ov-label {
-  flex: 1 1 auto;
-  min-width: 0;
+/* Child titles clamp to two lines with breathing room for Thai tone marks
+   (line-height 1.5 — never a bare overflow:hidden + tight line-height);
+   the full title rides the title attribute. */
+.ov-child .ov-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
-.thread-overview .ov-trailing {
-  flex: none;
-  color: var(--muted);
-  font-size: var(--fs-footnote);
-  white-space: nowrap;
+.ov-child.is-static {
+  cursor: default;
 }
-.thread-overview .ov-empty {
-  color: var(--muted);
-  font-size: var(--fs-footnote);
-  padding: 2px 6px;
+.ov-child.is-static:hover {
+  background: transparent;
+}
+.overview-panel .agent-drill-title {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+/* Narrow screens: the popup is nearly full-width — tighten chrome so the
+   rows keep their room. */
+@media (max-width: 480px) {
+  .pop.panel.overview-panel {
+    width: calc(100vw - 16px);
+    padding: 8px 8px 6px;
+  }
+  .ov-sect-head .btn {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
 }
 
-/* Agent rows read as subagent chips: compact, tinted, ✳ marker. */
+/* Agent rows read as subagent chips: compact, tinted, registry-spark marker. */
 .tool-toggle.agent .t-name::before {
-  content: '✳ ';
-  color: var(--accent-text);
+  content: '';
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  background: var(--accent-text);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 3.5c.7 4.6 2.9 6.8 7.5 7.5-4.6.7-6.8 2.9-7.5 7.5-.7-4.6-2.9-6.8-7.5-7.5 4.6-.7 6.8-2.9 7.5-7.5Z' fill='black'/%3E%3C/svg%3E") center/contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 3.5c.7 4.6 2.9 6.8 7.5 7.5-4.6.7-6.8 2.9-7.5 7.5-.7-4.6-2.9-6.8-7.5-7.5 4.6-.7 6.8-2.9 7.5-7.5Z' fill='black'/%3E%3C/svg%3E") center/contain no-repeat;
 }

@@ -7,15 +7,16 @@
 // is all the wire offers).
 //
 // No top-level DOM touch — app.js mounts one block per row and forwards
-// the subagent SSE. One level only: deeper nesting lives in the rightbar
-// drill (the "แผงขวา" button opens it).
+// the subagent SSE. One level only: deeper nesting lives in the overview
+// popup drill (the "ดูเต็ม" button opens it, drilled into that child).
 
 import {
   drillItemPreview,
   drillKindTag,
   subagentDotClass,
   subagentStatusWord,
-} from './rightbar.js?v=1.1.4';
+} from './rightbar.js?v=1.2.0';
+import { setIconLabel } from './icons.js?v=1.0.0';
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -96,10 +97,13 @@ export function createChildActivity({ api, onOpenRail }) {
       head = el('div', 'ca-head');
       head.append(el('span', 'dot idle'));
       head.append(el('span', 'ca-title', ''));
-      const open = el('button', 'btn ghost sm ca-open', 'แผงขวา ›');
+      const open = el('button', 'btn ghost sm ca-open');
+      setIconLabel(open, 'chevRight', 'ดูเต็ม', 'ico ico-sm');
+      // Icon trails the word ("ดูเต็ม ›" shape): label first, chevron after.
+      open.appendChild(open.querySelector('svg'));
       open.type = 'button';
-      open.title = 'ดู child นี้แบบเต็มในแผงขวา';
-      open.addEventListener('click', () => onOpenRail?.());
+      open.title = 'ดู child นี้แบบเต็ม (ป๊อปอัปภาพรวม)';
+      open.addEventListener('click', () => onOpenRail?.(wrap.dataset.chatId, wrap.dataset.itemId, open));
       head.append(open);
       wrap.prepend(head);
     }

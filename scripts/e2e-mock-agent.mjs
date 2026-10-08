@@ -50,6 +50,9 @@ async function startHost({ authWall = false, museBin = MOCK, stateHome = null, c
       MUSE_DESKTOP_HOST: '127.0.0.1',
       XDG_STATE_HOME: stateDir,
       XDG_CONFIG_HOME: configDir,
+      // Isolate the native transcript adapter from the developer's real
+      // retained sessions — the native-log step below fixtures its own.
+      XDG_DATA_HOME: path.join(stateDir, 'xdg'),
       NO_OPEN: '1',
       MUSE_BIN: museBin,
       MUSE_DESKTOP_MODEL: 'mock-model-1',
@@ -858,6 +861,15 @@ await step('watchdog settles a deaf turn and the next prompt recovers (BUG-080)'
   const r = await req(host.base, 'POST', '/api/chats', { title: 'deaf', cwd: os.tmpdir() });
   assert.equal(r.status, 201);
   const deafId = r.chat.id;
+  // Warm-up first: on a cold start the mock's trailing config frames can
+  // land after the turn opens and mark activity, which would hold (not
+  // settle) the deaf turn below. One completed normal turn absorbs that.
+  const w = await req(host.base, 'POST', `/api/chats/${deafId}/prompt`, { text: 'warm up' });
+  assert.equal(w.status, 202);
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === w.turnId,
+    { label: 'deaf warm-up turn_done' },
+  );
   const p = await req(host.base, 'POST', `/api/chats/${deafId}/prompt`, { text: 'stay-deaf please' });
   assert.equal(p.status, 202, `deaf prompt must open a turn: ${JSON.stringify(p)}`);
   // Test-only clocks: 1.5s no-activity window, 400ms tick.
@@ -1267,6 +1279,49 @@ await step('native: drill shows the folded detail, verbs stay off', async () => 
   const cmd = await req(host.base, 'POST', `/api/chats/${chatId}/subagents/${encodeURIComponent('native:mock-nat-beta')}/command`, { action: 'stop' });
   assert.equal(cmd.status, 409);
   assert.equal(cmd.code, 'UNSUPPORTED');
+});
+
+await step('native: drill reads the retained child transcript when it verifies', async () => {
+  // Fixture a retained parent log + child log under the isolated XDG root,
+  // keyed by the chat's live MSP session (the owning parent stamp).
+  const full = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  const parent = full.chat.mspSessionId;
+  assert.ok(parent, 'chat carries its owning parent session');
+  const parentDir = path.join(host.stateHome, 'xdg', 'muse', 'sessions', '2026', '10', '08', parent);
+  fs.mkdirSync(path.join(parentDir, 'subagent', 'mock-nat-alpha'), { recursive: true });
+  const env = (seq, type, payload, streamId) => JSON.stringify({
+    schema_version: 1, id: `r${seq}`, stream: { kind: 'session', id: streamId }, sequence: seq,
+    recorded_at: 1771088000123456 + seq, payload_type: type, payload,
+  });
+  fs.writeFileSync(
+    path.join(parentDir, 'session.jsonl'),
+    [
+      env(1, 'runtime.session.metadata', { workspace_root: os.tmpdir() }, parent),
+      env(2, 'subagent.control.child_session_bound', {
+        kind: 'subagent_control',
+        record: { kind: 'child_session_bound', subagent_id: 'mock-nat-alpha', child_session_id: 'mock-nat-alpha' },
+      }, parent),
+    ].join('\n') + '\n',
+  );
+  fs.writeFileSync(
+    path.join(parentDir, 'subagent', 'mock-nat-alpha', 'session.jsonl'),
+    [
+      env(1, 'runtime.session', { kind: 'run', run_id: 'r1', event: { kind: 'started', prompt: 'probe the alpha cache' } }, 'mock-nat-alpha'),
+      env(2, 'runtime.session', { kind: 'run', run_id: 'r1', event: { kind: 'assistant_message_committed', text: 'alpha cache is warm' } }, 'mock-nat-alpha'),
+      env(3, 'runtime.session', { kind: 'run', run_id: 'r1', event: { kind: 'terminal', terminal: 'completed' } }, 'mock-nat-alpha'),
+    ].join('\n') + '\n',
+  );
+  const d = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/${encodeURIComponent('native:mock-nat-alpha')}`);
+  assert.equal(d.status, 200);
+  assert.equal(d.mode, 'native-log', 'verified transcript replaces the synthesized fold');
+  const texts = d.items.map((it) => it.text || '').join('\n');
+  assert.match(texts, /probe the alpha cache/);
+  assert.match(texts, /alpha cache is warm/);
+  assert.equal(d.terminal, 'completed');
+  assert.deepEqual(d.nativeRun, { state: 'terminal', terminal: 'completed' });
+  // Beta has no fixture — honest synthesized fallback, no cross-child bleed.
+  const beta = await req(host.base, 'GET', `/api/chats/${chatId}/subagents/${encodeURIComponent('native:mock-nat-beta')}`);
+  assert.equal(beta.mode, 'native');
 });
 
 await step('reminders: system children keep agent identity and drill reads', async () => {

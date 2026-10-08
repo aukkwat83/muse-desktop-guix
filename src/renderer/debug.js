@@ -8,6 +8,17 @@
   var counters = document.getElementById('counters');
   var smokeList = document.getElementById('smoke');
 
+  // This page is a classic script (no module imports), so the two smoke
+  // markers inline the shared family's check/x shapes by hand — same 24px
+  // grid, stroke 1.8, round caps. icons.js is canonical; unit-test-icons
+  // fails if these drift from the registry.
+  var SVG_OPEN = '<svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="';
+  function smokeIcon(name, body) {
+    return SVG_OPEN + name + '">' + body + '</svg>';
+  }
+  var CHECK_SVG = smokeIcon('check', '<path d="M4.5 12.5l5 5 10-11"/>');
+  var X_SVG = smokeIcon('x', '<path d="M6 6l12 12M18 6L6 18"/>');
+
   function row(k, v) {
     return '<tr><td class="k">' + k + '</td><td class="v">' + String(v == null ? '—' : v) + '</td></tr>';
   }
@@ -87,13 +98,14 @@
             var good = r.ok && j.ok !== false;
             li.className = good ? 'ok' : 'fail';
             li.innerHTML =
-              (good ? '✓ ' : '✗ ') + path +
+              (good ? CHECK_SVG : X_SVG) + '<span>' + path + '</span>' +
               ' <span class="ms">' + r.status + ' · ' + ms + 'ms</span>';
           });
         })
         .catch(function (err) {
           li.className = 'fail';
-          li.textContent = '✗ ' + path + ' — ' + err;
+          li.innerHTML = X_SVG + '<span></span>';
+          li.querySelector('span').textContent = path + ' — ' + err;
         });
     });
   }

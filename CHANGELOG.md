@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.32 — 2026-10-08
+
+Popup-only activity overview (goal + tasks + subagents union with live
+drill-down, native child transcripts, persisted session-tied goals) plus
+one shared 44-icon SVG family and a rebalanced Inter/Sarabun type scale.
+Markdown chrome icons rebuild post-sanitize, diagram export never ships a
+toolbar icon, sidebar rows overlay their actions, and the header wraps at
+narrow widths. No 1.1.30/1.1.31 releases; previous documented note is 1.1.29.
+Full note: [docs/releases/v1.1.32-activity-overview-and-icons.md](docs/releases/v1.1.32-activity-overview-and-icons.md).
+
 ## 1.1.29 — 2026-10-07
 
 Thread-overview Subagents section falls back to the server's wire

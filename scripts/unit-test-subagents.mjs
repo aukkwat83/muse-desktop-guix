@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Subagent rail: the renderer's pure view-model (status words, titles,
-// drill previews, owner-verb availability), the server's registry mirror
-// (persist/seed/fallback so rows survive a restart), and the owner-verb
-// guards + wire shape (stop/resume/send → subagent/* with a UUIDv7
-// commandId against the parent session).
+// Subagent panel: the renderer's pure view-model (status words, titles,
+// drill previews, owner-verb availability, the popup's union rows), the
+// server's registry mirror (persist/seed/fallback so rows survive a
+// restart), and the owner-verb guards + wire shape (stop/resume/send →
+// subagent/* with a UUIDv7 commandId against the parent session).
 
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -18,8 +18,9 @@ import { sanitizeChildItem } from '../src/server/msp-client.js';
 import { SessionStore, SUBAGENT_STORE_CAP, normalizeSubagents } from '../src/server/session-store.js';
 import { SUBAGENT_COMMANDS, agentRowLink, extractReminderDecision, nativeSubagentPatch, reminderDecisionLine, sanitizeDrillItem, SessionManager } from '../src/server/sessions.js';
 import {
-  OVERVIEW_WIRE_CAP,
   SUBAGENT_ACTION_LABEL,
+  childKindLabel,
+  childKindTag as childKindTagFromRail,
   childWindowUrl,
   drillItemPreview,
   drillKindTag,
@@ -30,7 +31,13 @@ import {
   subagentStatusWord,
   subagentSub,
   subagentTitle,
+  unionSubagentCounts,
 } from '../src/renderer/rightbar.js';
+import {
+  childKindTag,
+  latestPlanFromMessages,
+  resolvePlan,
+} from '../src/renderer/overview-panel.js';
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -85,12 +92,20 @@ test('subagent words + dots cover the MSP child states', () => {
   assert.equal(subagentDotClass('bogus'), 'dot idle');
 });
 
-test('subagent titles prefer role, subs fold workflow children', () => {
-  assert.equal(subagentTitle(kid()), 'research');
-  assert.equal(subagentTitle(kid({ role: null })), 'researcher');
+test('subagent titles prefer the human topic; subs dedupe + fold workflow children', () => {
+  assert.equal(subagentTitle(kid()), 'research caches');
+  assert.equal(subagentTitle(kid({ objective: null })), 'research');
+  assert.equal(subagentTitle(kid({ objective: null, role: null })), 'researcher');
+  assert.equal(subagentTitle(kid({ taskName: 'cache-probe' })), 'cache-probe');
+  assert.equal(subagentTitle(kid({ objective: null, role: null, agentPath: null, title: 'Cache call' })), 'Cache call');
   assert.equal(subagentTitle({ kind: 'workflow', entryId: 'e1' }), 'e1');
   assert.equal(subagentTitle({}), 'child');
-  assert.equal(subagentSub(kid()), 'depth 1 · running · research caches');
+  assert.equal(subagentSub(kid()), 'depth 1 · running');
+  assert.equal(
+    subagentSub(kid({ taskName: 'cache-probe' })),
+    'depth 1 · running · research caches',
+    'a task-named headline keeps the objective as its sub line',
+  );
   assert.equal(
     subagentSub({ kind: 'workflow', children: [{}, {}], message: 'done' }),
     '2 children · done',
@@ -120,7 +135,12 @@ test('native + reminder titles lead with the readable identity', () => {
     subagentTitle({ kind: 'reminderChild', reminderAgentId: 'skill-reminder', fallbackText: 'Reminder child session' }),
     'skill-reminder',
   );
-  assert.equal(subagentTitle({ kind: 'reminderChild', fallbackText: 'Reminder child session' }), 'Reminder child session');
+  assert.equal(
+    subagentTitle({ kind: 'reminderChild', fallbackText: 'Reminder child session' }),
+    'reminder',
+    'the generic wire line is never a title — a bare reminder says what it is',
+  );
+  assert.equal(subagentTitle({ kind: 'reminderChild' }), 'reminder');
   assert.equal(subagentTitle(null), 'child');
   // The wire's one-size line is never a topic — a bare row shows its gen
   // until the server folds the verdict (or the stream while it runs).
@@ -161,35 +181,102 @@ test('partitionReminders folds system noise below real children', () => {
   assert.deepEqual(partitionReminders(null), { main: [], reminders: [] });
 });
 
-test('overview rows prefer the live turn, else the wire children (1.1.29)', () => {
-  const tool = { id: 't1' };
-  assert.deepEqual(overviewSubagentRows([tool], [{ itemId: 'w1' }]), { kind: 'turn', tools: [tool] });
+test('overview rows union the live turn and the wire children (1.1.30)', () => {
   assert.deepEqual(overviewSubagentRows([], []), { kind: 'empty' });
   assert.deepEqual(overviewSubagentRows(null, null), { kind: 'empty' });
-  const wire = overviewSubagentRows([], [{ itemId: 'w1', kind: 'subagent', status: 'inProgress', updatedAt: 2 }]);
-  assert.equal(wire.kind, 'wire');
-  assert.deepEqual(wire.main.map((r) => r.itemId), ['w1']);
-  assert.equal(wire.hiddenMain, 0);
-  assert.equal(wire.reminders, 0);
-  assert.equal(wire.remindersRunning, 0);
+  const rec = { itemId: 'w1', kind: 'subagent', status: 'inProgress', updatedAt: 2 };
+  const linked = { id: 't1', title: 'w1 work', agentLink: 'w1' };
+  const s = overviewSubagentRows([linked], [rec]);
+  assert.equal(s.kind, 'union');
+  assert.equal(s.rows.length, 1, 'a linked tool dedupes onto its registry row');
+  assert.deepEqual(s.rows[0], { type: 'child', rec });
 });
 
-test('overview wire rows sort newest first, cap mains, fold reminders (1.1.29)', () => {
+test('overview union shows every child with no cap and no folding (1.1.30)', () => {
   const recs = [];
-  for (let i = 0; i < OVERVIEW_WIRE_CAP + 3; i++) {
+  for (let i = 0; i < 9; i++) {
     recs.push({ itemId: `sub-${i}`, kind: 'subagent', status: 'completed', updatedAt: 100 + i });
   }
   recs.push(
     { itemId: 'rem-run', kind: 'reminderChild', status: 'inProgress', updatedAt: 1 },
     { itemId: 'rem-done', kind: 'reminderChild', status: 'completed', updatedAt: 2 },
+    { itemId: 'native:x', kind: 'native', status: 'completed', updatedAt: 3 },
   );
-  const s = overviewSubagentRows([], recs);
-  assert.equal(s.kind, 'wire');
-  assert.equal(s.main.length, OVERVIEW_WIRE_CAP);
-  assert.deepEqual(s.main.map((r) => r.itemId)[0], `sub-${OVERVIEW_WIRE_CAP + 2}`);
-  assert.equal(s.hiddenMain, 3);
-  assert.equal(s.reminders, 2);
-  assert.equal(s.remindersRunning, 1);
+  const tools = [
+    { id: 't-link', title: 'linked', agentLink: 'sub-8' },
+    { id: 't-free', title: 'model-side agent', agentLink: null },
+    { id: 't-dangle', title: 'gone child', agentLink: 'no-such-child' },
+  ];
+  const s = overviewSubagentRows(tools, recs);
+  assert.equal(s.kind, 'union');
+  const kids = s.rows.filter((r) => r.type === 'child');
+  const free = s.rows.filter((r) => r.type === 'tool');
+  assert.equal(kids.length, 12, 'all 12 registry children list, past the old cap of 6');
+  assert.deepEqual(
+    kids.map((r) => r.rec.itemId).slice(0, 2),
+    ['sub-8', 'sub-7'],
+    'registry rows sort newest first',
+  );
+  assert.ok(kids.some((r) => r.rec.itemId === 'rem-run'), 'running reminders list individually');
+  assert.ok(kids.some((r) => r.rec.itemId === 'rem-done'), 'landed reminders list individually');
+  assert.deepEqual(
+    free.map((r) => r.tool.id),
+    ['t-free', 't-dangle'],
+    'the linked tool dedupes; unlinked + dangling links list honestly as tools',
+  );
+});
+
+test('childKindTag keeps provenance truthful on every union row', () => {
+  assert.equal(childKindTag('subagent'), 'subagent');
+  assert.equal(childKindTag('native'), 'native');
+  assert.equal(childKindTag('reminderChild'), 'reminder');
+  assert.equal(childKindTag('workflow'), 'workflow');
+  assert.equal(childKindTag('weird-future'), 'weird-future');
+  assert.equal(childKindTag(null), '?');
+  // The overview-panel re-export agrees with the rail canonical home.
+  // (Node loads `?v=` siblings as distinct modules, so compare behavior.)
+  for (const kind of ['subagent', 'native', 'reminderChild', 'workflow', 'x', null]) {
+    assert.equal(childKindTag(kind), childKindTagFromRail(kind));
+  }
+});
+
+test('childKindLabel localizes provenance; internal kinds stay English', () => {
+  assert.equal(childKindLabel('subagent'), 'เอเจนต์ย่อย');
+  assert.equal(childKindLabel('native'), 'เนทีฟ');
+  assert.equal(childKindLabel('reminderChild'), 'งานระบบ');
+  assert.equal(childKindLabel('workflow'), 'เวิร์กโฟลว์');
+  assert.equal(childKindLabel('weird-future'), 'weird-future');
+  assert.equal(childKindLabel(null), '?');
+});
+
+test('unionSubagentCounts is the one chip/popup count over the union', () => {
+  assert.deepEqual(unionSubagentCounts({ kind: 'empty' }), { running: 0, total: 0 });
+  assert.deepEqual(unionSubagentCounts(null), { running: 0, total: 0 });
+  const sec = overviewSubagentRows(
+    [
+      { id: 't-link', title: 'linked', running: true, agentLink: 'sub-1' },
+      { id: 't-free', title: 'free', running: true, agentLink: null },
+      { id: 't-done', title: 'done', running: false, agentLink: null },
+    ],
+    [
+      { itemId: 'sub-1', kind: 'subagent', status: 'inProgress', updatedAt: 2 },
+      { itemId: 'sub-2', kind: 'native', status: 'completed', updatedAt: 1 },
+    ],
+  );
+  assert.deepEqual(
+    unionSubagentCounts(sec),
+    { running: 2, total: 4 },
+    'linked tool dedupes; running = live child + live unlinked tool',
+  );
+  // Foreign tool shapes without a captured flag fall back to raw status.
+  assert.deepEqual(
+    unionSubagentCounts({ kind: 'union', rows: [{ type: 'tool', tool: { status: 'in_progress' } }] }),
+    { running: 1, total: 1 },
+  );
+});
+
+test('drillKindTag labels the native-log terminal marker', () => {
+  assert.equal(drillKindTag('terminal'), 'จบ');
 });
 
 test('nativeSubagentPatch folds the probed spawn/wait shapes', () => {
@@ -359,6 +446,28 @@ test('tracker merges results and never lets nulls wipe topics', async () => {
   assert.equal(drill.mode, 'native');
   assert.ok(drill.items.length >= 2);
   assert.ok(drill.items.some((it) => (it.fallbackText || '').includes('alpha-probe')));
+});
+
+test('native records stamp the owning parent and keep it across rotation (1.1.30)', () => {
+  const { mgr } = manager();
+  const chat = mgr.createChat({ title: 'owning-parent' });
+  const slot = { client: { sessionId: 'parent-one' }, turn: null, subagents: new Map() };
+  mgr.slots.set(chat.id, slot);
+  mgr._trackNativeSubagent(chat.id, 'turn-1', slot, {
+    id: 'tc-1', kind: 'subagent_spawn', status: 'completed',
+    rawInput: JSON.stringify({ task_name: 'alpha-probe' }),
+    output: JSON.stringify({ status: 'accepted', subagent_id: 'sub-a' }),
+  });
+  assert.equal(slot.subagents.get('native:sub-a').parentSessionId, 'parent-one');
+  // Rotation swaps the live session — the next fold for the same child must
+  // NOT re-point the transcript mapping at the new parent.
+  slot.client = { sessionId: 'parent-two' };
+  mgr._trackNativeSubagent(chat.id, 'turn-2', slot, {
+    id: 'tc-2', kind: 'subagent_wait', status: 'completed',
+    rawInput: JSON.stringify({ subagent_id: 'sub-a' }),
+    output: JSON.stringify({ status: 'ready', subagent_id: 'sub-a', summary: 'did it' }),
+  });
+  assert.equal(slot.subagents.get('native:sub-a').parentSessionId, 'parent-one');
 });
 
 test('subagentActions gates verbs on kind + id + status', () => {
@@ -623,6 +732,21 @@ test('sanitizeChildItem + sanitizeDrillItem cap text and keep drill keys', () =>
   assert.equal(child.result.truncated, true);
   assert.equal(child.childSessionId, 'c1');
   assert.equal(sanitizeChildItem(null), null);
+  // Human headings survive the projection — titles used to arrive blank
+  // because the sanitizer dropped them (1.1.30).
+  const titled = sanitizeChildItem({
+    itemId: 'sub-2', kind: 'subagent', status: 'inProgress',
+    taskName: 'cache-probe', title: 'Cache call', topic: 'caches',
+    objective: 'research caches', role: 'research',
+  });
+  assert.equal(titled.taskName, 'cache-probe');
+  assert.equal(titled.title, 'Cache call');
+  assert.equal(titled.topic, 'caches');
+  assert.equal(titled.objective, 'research caches');
+  const snake = sanitizeChildItem({
+    itemId: 'sub-3', kind: 'subagent', status: 'inProgress', task_name: 'snake-probe',
+  });
+  assert.equal(snake.taskName, 'snake-probe', 'snake_case normalizes onto taskName');
   const drill = sanitizeDrillItem({
     itemId: 'm1', kind: 'agentMessage', status: 'completed', text: big,
   });
@@ -787,6 +911,55 @@ test('readSubagent summarizes a running native child from its stream tail', asyn
   const running = drill.items.find((it) => it.itemId === 'native:sub-b:running');
   assert.match(running.text, /กำลังรัน \d+\.\ds/, 'elapsed rides the state line');
   assert.match(running.text, /ล่าสุด: halfway there/);
+});
+
+test('latestPlanFromMessages rehydrates the checklist from the transcript (1.1.30)', () => {
+  const settled = [
+    { content: 'a', status: 'completed' },
+    { content: 'b', status: 'in_progress', activeForm: 'Doing b' },
+    { content: 'c', status: 'pending' },
+    { content: 'd', status: 'cancelled' },
+  ];
+  const messages = [
+    { role: 'user', text: 'go', meta: {} },
+    { role: 'assistant', text: 'old', meta: { plan: [{ content: 'stale', status: 'completed' }] } },
+    { role: 'assistant', text: 'new', meta: { plan: settled } },
+    { role: 'notice', text: 'turn note', meta: {} },
+  ];
+  assert.deepEqual(latestPlanFromMessages(messages), settled, 'newest persisted plan wins');
+  assert.deepEqual(latestPlanFromMessages(messages).find((t) => t.content === 'b').activeForm, 'Doing b');
+  assert.equal(latestPlanFromMessages([{ role: 'user', text: 'x' }]), null);
+  assert.equal(latestPlanFromMessages(null), null);
+  // A persisted [] is authoritative — the agent cleared the list, so older
+  // plans stay buried instead of resurrecting.
+  assert.deepEqual(
+    latestPlanFromMessages([
+      { role: 'assistant', text: 'old', meta: { plan: [{ content: 'stale', status: 'completed' }] } },
+      { role: 'assistant', text: 'new', meta: { plan: [] } },
+    ]),
+    [],
+  );
+});
+
+test('resolvePlan prefers the live plan, falls back only when it is gone (1.1.30)', () => {
+  const live = [{ content: 'live', status: 'in_progress' }];
+  const messages = [{ role: 'assistant', text: 'x', meta: { plan: [{ content: 'old', status: 'completed' }] } }];
+  assert.deepEqual(resolvePlan(live, messages), live, 'a running turn shows its own plan');
+  assert.deepEqual(
+    resolvePlan(null, messages),
+    [{ content: 'old', status: 'completed' }],
+    'a settled turn (no live plan) rehydrates from the transcript',
+  );
+  assert.deepEqual(
+    resolvePlan(undefined, messages),
+    [{ content: 'old', status: 'completed' }],
+    'no turn view at all also rehydrates',
+  );
+  // An explicit live [] is the agent clearing the list — it clears, never
+  // resurrects persisted history.
+  assert.deepEqual(resolvePlan([], messages), []);
+  assert.deepEqual(resolvePlan(null, []), []);
+  assert.deepEqual(resolvePlan(null, null), []);
 });
 
 let failed = 0;

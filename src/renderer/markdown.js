@@ -7,6 +7,7 @@
 
 import { marked } from '/vendor/marked.esm.js';
 import {
+  chromeRestingIcon,
   codeBlockHtml,
   prepareStreamingMarkdown,
   safeUrl,
@@ -14,9 +15,10 @@ import {
   plainFallbackHtml,
   COPY_OK_TEXT,
   COPY_FAIL_TEXT,
-} from './markdown-core.js?v=0.4.1';
+} from './markdown-core.js?v=0.5.1';
 import {
   renderVizFence,
+  diagramActionButtonsHtml,
   applyHeroFromSourceComment,
   parseEchartsOption,
   applyEchartsTheme,
@@ -25,7 +27,8 @@ import {
   buildEchartsSoftBlockHtml,
   VIZ_HERO_CLASS,
   VIZ_MERMAID_ONLY,
-} from './viz-contract.js?v=1.0.0';
+} from './viz-contract.js?v=1.1.1';
+import { iconElement } from './icons.js?v=1.0.0';
 
 marked.setOptions({ gfm: true, breaks: true });
 // Viz fences (mermaid / mermaid-hero / viz …) become diagram cards, every
@@ -177,6 +180,9 @@ export function sanitizeHtml(html) {
     card.appendChild(m);
   }
 
+  // Last: rebuild our own trusted chrome icons (code copy, diagram actions)
+  // from the closed registry — the only svg that may be in this output.
+  decorateChromeIcons(tpl.content);
   return tpl.innerHTML;
 }
 
@@ -228,13 +234,63 @@ export async function copyTextToClipboard(text) {
   }
 }
 
-/** Flash copy feedback on the button, then restore the resting label. */
+/**
+ * Resting icon for a chrome button: its own data-icon first (set by the
+ * decoration pass below), else the pure class/data-dl mapping — the same
+ * input the sanitizer cannot strip, so the chain restores correctly even on
+ * older DOM or foreign markup without the attr.
+ */
+function restingIconFor(btn) {
+  const named = btn?.dataset?.icon;
+  if (named) return named;
+  return chromeRestingIcon({ dl: btn?.dataset?.dl });
+}
+
+/**
+ * Rebuild trusted registry icons onto chrome buttons AFTER sanitization.
+ * Builders emit text-only buttons — the walk strips every svg, so untrusted
+ * model output can never smuggle shapes through the allowlist — and this
+ * pass mounts real registry vectors (viewBox intact) onto our own buttons
+ * only. Idempotent: buttons already carrying an icon (copy/download
+ * flashes, repeat decoration) are skipped. Runs at the end of sanitizeHtml
+ * and after every direct-DOM chrome insert.
+ */
+export function decorateChromeIcons(root) {
+  if (!root?.querySelectorAll) return;
+  for (const btn of root.querySelectorAll('.md-copy-btn, .md-diagram-dl-btn')) {
+    if (btn.querySelector?.('svg')) continue;
+    const icon = restingIconFor(btn);
+    try {
+      btn.setAttribute('data-icon', icon);
+    } catch { /* ignore */ }
+    const svg = iconElement(icon, 'ico');
+    if (svg && btn.insertBefore) btn.insertBefore(svg, btn.firstChild || null);
+  }
+}
+
+/** Paint a chrome button as icon + text without ever wiping the pair apart. */
+function paintChromeBtn(btn, icon, text) {
+  if (!btn) return;
+  btn.replaceChildren();
+  const svg = iconElement(icon, 'ico');
+  if (svg) btn.appendChild(svg);
+  const label = document.createElement('span');
+  label.className = 'ic-label';
+  label.textContent = String(text ?? '');
+  btn.appendChild(label);
+}
+
+/** Flash copy feedback on the button, then restore icon + resting label. */
 function flashCopyBtn(btn, ok, restore) {
   const was = restore ?? btn.textContent;
-  btn.textContent = ok ? COPY_OK_TEXT : COPY_FAIL_TEXT;
+  // The constants keep their leading ✓ (pinned); beside the vector check it
+  // would paint twice, so the flash shows the icon + the words only.
+  const label = ok ? COPY_OK_TEXT.replace(/^✓\s*/, '') : COPY_FAIL_TEXT; // tofu-ok: strips the constant's pinned prefix
+  paintChromeBtn(btn, ok ? 'check' : 'alert', label);
   btn.classList.toggle('is-copied', !!ok);
   setTimeout(() => {
-    btn.textContent = was;
+    if (!btn.isConnected) return;
+    paintChromeBtn(btn, restingIconFor(btn), was);
     btn.classList.remove('is-copied');
   }, 1300);
 }
@@ -446,7 +502,7 @@ export async function applyMermaidTheme(theme) {
       const svg = typeof out === 'string' ? out : out?.svg;
       if (!svg) continue;
       el.innerHTML = svg;
-      const svgEl = el.querySelector('svg');
+      const svgEl = el.querySelector('svg:not(.ico)');
       if (svgEl) {
         svgEl.removeAttribute('height');
         svgEl.style.maxWidth = '100%';
@@ -640,7 +696,7 @@ export async function paintMermaidDiagrams(root) {
       el.dataset.rendered = 'ok';
       el.classList.add('md-mermaid-done');
       el.classList.remove('md-mermaid-pending', 'md-mermaid-error');
-      const svgEl = el.querySelector('svg');
+      const svgEl = el.querySelector('svg:not(.ico)');
       if (svgEl) {
         svgEl.removeAttribute('height');
         svgEl.style.maxWidth = '100%';
@@ -664,13 +720,12 @@ export async function paintMermaidDiagrams(root) {
   ensureDiagramDownloadUi(root);
 }
 
-/** Inline HTML for diagram download controls (chrome top-right). */
+/** Inline HTML for diagram download controls (chrome top-right). The buttons
+ * come from viz-contract's single source — this wrapper only adds the group. */
 export function diagramDownloadChromeHtml() {
   return (
     `<div class="md-diagram-dl" role="group" aria-label="Diagram actions">` +
-    `<button type="button" class="md-diagram-dl-btn md-diagram-copy-btn" data-dl="mermaid" title="คัดลอกเป็น Mermaid (วางใน GitLab / gitdop แล้ว render เหมือนกัน)">⧉ Mermaid</button>` +
-    `<button type="button" class="md-diagram-dl-btn" data-dl="svg" title="Download SVG">↓ SVG</button>` +
-    `<button type="button" class="md-diagram-dl-btn" data-dl="png" title="Download PNG (low quality)">↓ PNG</button>` +
+    diagramActionButtonsHtml(true) +
     `</div>`
   );
 }
@@ -691,13 +746,17 @@ export function ensureDiagramDownloadUi(root) {
       chrome.innerHTML =
         `<span class="md-diagram-label">Diagram</span>${diagramDownloadChromeHtml()}`;
       fig.insertBefore(chrome, fig.firstChild);
-      continue;
+      // Fall through to decorate the fresh text-only buttons below.
     }
-    if (chrome.querySelector('.md-diagram-dl')) continue;
-    const wrap = document.createElement('div');
-    wrap.innerHTML = diagramDownloadChromeHtml();
-    const dl = wrap.firstElementChild;
-    if (dl) chrome.appendChild(dl);
+    if (!chrome.querySelector('.md-diagram-dl')) {
+      const wrap = document.createElement('div');
+      wrap.innerHTML = diagramDownloadChromeHtml();
+      const dl = wrap.firstElementChild;
+      if (dl) chrome.appendChild(dl);
+    }
+    // Direct-DOM insert, so the sanitize tail never saw it: decorate here
+    // (idempotent — figures that already carry icons are skipped).
+    decorateChromeIcons(fig);
   }
   installDiagramDownloadDelegation();
 }
@@ -813,11 +872,19 @@ function serializeDiagramSvg(svgEl) {
  * @param {Element} card
  * @returns {SVGElement | null}
  */
-function diagramSvgInCard(card) {
+/**
+ * The exportable diagram SVG inside a card: painted diagram content only.
+ * Never the chrome toolbar icons — the old bare-`svg` fallback grabbed the
+ * first toolbar vector whenever the real diagram was pending, failed, or
+ * missing, and downloads cheerfully exported a 16px copy arrow. Both
+ * content containers are scoped and toolbar shapes are excluded outright,
+ * so a missing diagram yields null and the download reports failure.
+ */
+export function diagramSvgInCard(card) {
   return (
-    card.querySelector('.md-mermaid svg') ||
-    card.querySelector('.md-echarts svg') ||
-    card.querySelector('svg')
+    card.querySelector('.md-mermaid svg:not(.ico)') ||
+    card.querySelector('.md-echarts svg:not(.ico)') ||
+    null
   );
 }
 
@@ -880,7 +947,7 @@ function loadSvgAsImage(svgText) {
     const tryNext = () => {
       if (i >= urls.length) {
         revokeAll();
-        reject(new Error('svg→image failed (all strategies)'));
+        reject(new Error('svg-to-image failed (all strategies)'));
         return;
       }
       const url = urls[i++];
@@ -950,7 +1017,7 @@ async function svgTextToPngBlob(svgText, opts = {}) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data?.ok || !data.path) {
       throw new Error(
-        data?.error || err?.message || 'svg→png failed (browser + host)',
+        data?.error || err?.message || 'svg-to-png failed (browser + host)',
       );
     }
     // File already in Downloads — fetch bytes back only if we need Blob;
@@ -984,11 +1051,13 @@ async function blobToBase64(blob) {
  * @param {'svg'|'png'} kind
  * @param {{ forceDownload?: boolean }} [opts]
  */
-async function downloadDiagramFromCard(card, kind, opts = {}) {
+export async function downloadDiagramFromCard(card, kind, opts = {}) {
   const svgEl = diagramSvgInCard(card);
   if (!svgEl) {
-    console.warn('[diagram-dl] no SVG in card');
-    return;
+    // A missing diagram is a failure, full stop: the delegation flash reads
+    // result.ok, and an undefined return used to fall into the success path.
+    console.warn('[diagram-dl] no diagram SVG in card');
+    return { ok: false, error: 'no diagram to export yet' };
   }
   const stamp = new Date().toISOString().replace(/[:.]/g, '').slice(0, 15);
   const label =
@@ -1052,7 +1121,7 @@ function mermaidSourceFromCard(card) {
   const body = card.querySelector('.md-mermaid');
   if (body?.dataset?.mermaidSrc) return body.dataset.mermaidSrc;
   // Not yet rendered → the text node still holds the source
-  if (body && body.dataset?.rendered !== 'ok' && !body.querySelector('svg')) {
+  if (body && body.dataset?.rendered !== 'ok' && !body.querySelector('svg:not(.ico)')) {
     return (body.textContent || '').trim();
   }
   return '';
@@ -1091,28 +1160,28 @@ export function installDiagramDownloadDelegation() {
 
       const kind = btn.getAttribute('data-dl') === 'png' ? 'png' : 'svg';
       const was = btn.textContent;
+      const restLabel = was || (kind === 'png' ? 'PNG' : 'SVG');
+      const restore = () => {
+        if (btn.isConnected) paintChromeBtn(btn, 'download', restLabel);
+      };
       btn.disabled = true;
-      btn.textContent = '…';
+      paintChromeBtn(btn, 'ellipsis', '…');
       void downloadDiagramFromCard(card, kind)
         .then((result) => {
           if (result?.ok === false) {
             btn.title = result.error || 'download failed';
-            btn.textContent = '!';
-            setTimeout(() => {
-              btn.textContent = was || (kind === 'png' ? '↓ PNG' : '↓ SVG');
-            }, 1200);
+            paintChromeBtn(btn, 'alert', '! ลองใหม่');
+            setTimeout(restore, 1200);
             return;
           }
           const where = result?.filename || result?.path?.split?.('/')?.pop?.() || 'Downloads';
           btn.title = result?.path
             ? `บันทึกแล้ว: ${result.path}`
             : `บันทึกแล้ว (${result?.mode || 'ok'})`;
-          btn.textContent = '✓';
+          paintChromeBtn(btn, 'check', 'บันทึกแล้ว');
           // Brief toast via title + label
           console.info('[diagram-dl] ok', result);
-          setTimeout(() => {
-            btn.textContent = was || (kind === 'png' ? '↓ PNG' : '↓ SVG');
-          }, 1400);
+          setTimeout(restore, 1400);
           // Optional: surface path in status bar if present
           try {
             const pill = document.getElementById('status-pill');
@@ -1128,10 +1197,8 @@ export function installDiagramDownloadDelegation() {
         .catch((err) => {
           console.error('[diagram-dl]', err);
           btn.title = err?.message || 'download failed';
-          btn.textContent = '!';
-          setTimeout(() => {
-            btn.textContent = was || (kind === 'png' ? '↓ PNG' : '↓ SVG');
-          }, 1200);
+          paintChromeBtn(btn, 'alert', '! ลองใหม่');
+          setTimeout(restore, 1200);
         })
         .finally(() => {
           btn.disabled = false;

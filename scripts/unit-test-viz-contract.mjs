@@ -56,7 +56,13 @@ test('renderVizFence builds a mermaid figure with actions', () => {
   assert.ok(html.includes('data-dl="mermaid"'));
   assert.ok(html.includes('data-dl="svg"'));
   assert.ok(html.includes('data-dl="png"'));
-  assert.ok(html.includes('⧉ Mermaid'));
+  // Text-only by trust design: the sanitizer strips all svg, and markdown.js
+  // rebuilds the registry icons onto these buttons after the walk — the
+  // buttons must carry readable labels and no baked shapes or glyphs.
+  assert.ok(html.includes('>Mermaid</button>'));
+  assert.ok(html.includes('>SVG</button>'));
+  assert.ok(html.includes('>PNG</button>'));
+  assert.ok(!html.includes('<svg'), 'no baked svg past the sanitizer');
   assert.ok(!html.includes(VIZ_HERO_CLASS));
 });
 

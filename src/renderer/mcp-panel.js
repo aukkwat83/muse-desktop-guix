@@ -5,7 +5,8 @@
 // POSTs probe/toggle intents. First open auto-probes (statuses start as
 // `unknown`); the panel never blocks the rest of the UI on that.
 
-import { closePopover, openPanel } from './popover.js?v=0.4.2';
+import { closePopover, openPanel } from './popover.js?v=0.5.1';
+import { setIcon, setIconLabel } from './icons.js?v=1.0.0';
 
 const STATUS_DOT = {
   connected: 'ok',
@@ -60,17 +61,20 @@ export function createMcpPanel({ api, onSnapshot }) {
     } else if (snapshot?.probedAt) {
       sub.textContent = `ตรวจล่าสุด ${timeAgo(snapshot.probedAt)}`;
     } else {
-      sub.textContent = 'ยังไม่เคยตรวจ — กด ⟳ เพื่อตรวจ';
+      sub.textContent = 'ยังไม่เคยตรวจ — กดปุ่มตรวจใหม่เพื่อตรวจ';
     }
     const actions = el('div', 'panel-actions');
-    const reload = el('button', 'btn ghost sm', '⟳ ตรวจใหม่');
+    const reload = el('button', 'btn ghost sm');
+    setIconLabel(reload, 'refresh', 'ตรวจใหม่', 'ico ico-sm');
     reload.type = 'button';
     reload.title = 'Probe ทุก server ใหม่';
     reload.disabled = probing;
     reload.addEventListener('click', () => void probeAll());
-    const close = el('button', 'btn ghost sm', '✕');
+    const close = el('button', 'btn ghost sm');
+    setIcon(close, 'x', 'ico ico-sm');
     close.type = 'button';
     close.title = 'ปิด';
+    close.setAttribute('aria-label', 'ปิด');
     close.addEventListener('click', () => closePopover());
     actions.append(reload, close);
     head.append(title, actions);
@@ -173,10 +177,10 @@ export function createMcpPanel({ api, onSnapshot }) {
       root = el('div', 'panel mcp-panel');
       root.setAttribute('role', 'dialog');
       root.setAttribute('aria-label', 'MCP servers');
+      render(); // real content first — placement measures this box, not an empty node
       handle = openPanel(anchor, root, {
         onClose: () => { handle = null; },
       });
-      render();
       // Statuses start `unknown` — probe on first open so the panel earns
       // its keep immediately, without probing at app boot.
       if (!snapshot?.probedAt && !probing) void probeAll();

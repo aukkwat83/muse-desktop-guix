@@ -12,7 +12,7 @@ export function escapeHtml(s) {
 
 // Copy-button feedback (BUG-035). UI strings are Thai; the constants live
 // here so the unit suite can pin them without loading the DOM module.
-export const COPY_OK_TEXT = '✓ คัดลอกแล้ว';
+export const COPY_OK_TEXT = '✓ คัดลอกแล้ว'; // tofu-ok: pinned constant, flash paints icon + words
 export const COPY_FAIL_TEXT = '! ลองใหม่';
 
 /**
@@ -50,6 +50,10 @@ export function plainFallbackHtml(text) {
 export function codeBlockHtml({ text, lang }) {
   const langKey = String(lang || '').trim().toLowerCase();
   const cls = langKey ? ` class="language-${escapeHtml(langKey)}"` : '';
+  // Text-only by design: the sanitizer strips ALL svg (untrusted model
+  // output must never smuggle shapes through), and markdown.js rebuilds the
+  // trusted registry icon onto this button after sanitization. The resting
+  // `>คัดลอก</button>` shape is pinned; the flash swaps icon + text together.
   return (
     `<div class="md-code-block">` +
     `<div class="md-code-chrome">` +
@@ -59,6 +63,19 @@ export function codeBlockHtml({ text, lang }) {
     `<pre class="md-pre"><code${cls}>${escapeHtml(text)}</code></pre>` +
     `</div>\n`
   );
+}
+
+/**
+ * Which registry icon a chrome button carries, from its trusted class /
+ * data-dl alone — the input the sanitizer cannot strip. Code copy and
+ * Mermaid copy share the copy vector; SVG/PNG downloads share download.
+ * Pure — the node suite pins the mapping.
+ * @param {{ dl?: string|null }} [opts]
+ * @returns {string} icons.js registry name
+ */
+export function chromeRestingIcon({ dl = null } = {}) {
+  if (dl === 'svg' || dl === 'png') return 'download';
+  return 'copy';
 }
 
 /**

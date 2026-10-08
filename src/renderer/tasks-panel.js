@@ -2,7 +2,8 @@
 // work) above the live todo checklist. Both halves refresh in place while
 // open — `goal` broadcasts feed the top, `plan` broadcasts the list.
 
-import { closePopover, openPanel } from './popover.js?v=0.4.2';
+import { closePopover, openPanel } from './popover.js?v=0.5.1';
+import { setIcon } from './icons.js?v=1.0.0';
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -61,9 +62,11 @@ export function createTasksPanel() {
     const head = el('div', 'panel-head');
     head.append(el('div', 'panel-title', `tasks · ${chatTitle || 'แชทนี้'}`));
     const actions = el('div', 'panel-actions');
-    const close = el('button', 'btn ghost sm', '✕');
+    const close = el('button', 'btn ghost sm');
+    setIcon(close, 'x', 'ico ico-sm');
     close.type = 'button';
     close.title = 'ปิด';
+    close.setAttribute('aria-label', 'ปิด');
     close.addEventListener('click', () => closePopover());
     actions.append(close);
     head.append(actions);

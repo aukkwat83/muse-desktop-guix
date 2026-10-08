@@ -12,7 +12,7 @@
  *   plan purple #9a6bb8 → #6b4a8a   (3.97 → ≥4.5)
  *
  * Two more came out of auditing this port itself: the accent *fill* had to
- * drop to #b5573a for the white ＋/Send glyphs, and --danger to #9e5147 to
+ * drop to #b5573a for the white new-chat/Send icons, and --danger to #9e5147 to
  * survive as text on paper. A later pass darkened --warn to #7d5f24 for the
  * panel-2 pills (4.17 → 4.92) and lifted six faded states/overlays to solid
  * or near-solid. `npm run test:contrast` pins all of it.
@@ -43,8 +43,8 @@ html[data-theme='claude-light'] {
   --muted: #666057;
 
   /* Terracotta: fill for surfaces, darker ink for type.
-     The fill is #b5573a rather than the brighter #c15f3c because the ＋ and
-     Send buttons put white glyphs on it — #c15f3c measures 4.23 against white,
+     The fill is #b5573a rather than the brighter #c15f3c because the new-chat and
+     Send buttons put white icons on it — #c15f3c measures 4.23 against white,
      just under AA; #b5573a is 4.78 and still reads as the same colour. */
   --accent: #b5573a;
   --accent-text: #9c4a2c;

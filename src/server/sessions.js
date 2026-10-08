@@ -24,6 +24,7 @@ import { ConfigCatalog } from './config-catalog.js';
 import { classifyPendingUserInputs, formatDiffPreview } from './hosts.js';
 import { normalizeSessionMode } from './session-mode.js';
 import { SearchIndex, turnForMessageIndex } from './search-index.js';
+import { readNativeChildTranscript } from './native-transcript.js';
 import { stateDir } from './session-store.js';
 import { cutEllipsis } from './text.js';
 import { normalizeAttachmentInput, resolveAttachments } from './attachments.js';
@@ -345,8 +346,8 @@ export function sanitizeDrillItem(item) {
     status: String(item.status || ''),
   };
   const str = (v) => (v == null ? null : String(v));
-  for (const k of ['subagentId', 'agentPath', 'role', 'objective', 'controlStatus', 'childSessionId',
-    'tool', 'title', 'fallbackText', 'entryId', 'scriptId', 'message']) {
+  for (const k of ['subagentId', 'agentPath', 'role', 'objective', 'taskName', 'controlStatus', 'childSessionId',
+    'tool', 'title', 'topic', 'fallbackText', 'entryId', 'scriptId', 'message']) {
     if (item[k] != null) out[k] = str(item[k]);
   }
   if (typeof item.text === 'string' && item.text) {
@@ -917,6 +918,9 @@ export class SessionManager extends EventEmitter {
       if (client.sessionId && client.sessionId !== chat.mspSessionId) {
         this.store.update(chatId, { mspSessionId: client.sessionId });
       }
+      // A resume miss boots a NEW session id under the old slot — retire
+      // the previous session's live goal (same-id resume retains).
+      this._retireGoalOnRotation(chatId, slot, client.sessionId);
       this._learnConfig(client); // fresh configOptions feed the catalog (BUG-079)
       slot.lastUsed = Date.now();
       slot.bootedAt = Date.now();
@@ -1901,6 +1905,18 @@ export class SessionManager extends EventEmitter {
       case 'msp:goal': {
         if (!slot) return;
         slot.goal = update.goal ?? null;
+        // The live goal is bound to the session it arrived under, exactly
+        // like the persisted snapshot — the slot outlives agent exits, so
+        // without this the old goal leaks into the next session id.
+        slot.goalSessionId = slot.client?.sessionId ?? null;
+        // Mirror to disk so the goal rehydrates after a host restart
+        // (getGoal falls back to the store on a cold chat). Bound to the
+        // originating MSP session — a rotation retires it, a resume keeps
+        // it. Controls stay live-only — goalCommand 409s without a
+        // running agent.
+        try {
+          this.store.saveGoal(chatId, slot.goal, slot.client?.sessionId ?? null);
+        } catch { /* a persist hiccup must never break the turn path */ }
         this.wire.emit(chatId, 'goal', { turnId, goal: slot.goal });
         return;
       }
@@ -2094,6 +2110,10 @@ export class SessionManager extends EventEmitter {
       kind: 'native',
       chatId,
       turnId: turnId || prev.turnId || null,
+      // The MSP session that owns this child — stamped at fold time and
+      // kept across rotation, so the native transcript adapter always
+      // resolves the log under the OWNING parent, never the current one.
+      parentSessionId: prev.parentSessionId ?? slot?.client?.sessionId ?? null,
       startedAt: prev.startedAt || Date.now(),
       updatedAt: Date.now(),
     };
@@ -2149,6 +2169,26 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Read-only native transcript for one child record, or null when no
+   * verified mapping exists (unstamped record, missing log, workspace
+   * mismatch, ambiguous parent — every miss falls back to the synthesized
+   * fold, never throws into the drill path).
+   */
+  _readNativeLog(chatId, rec) {
+    try {
+      const parentId = rec?.parentSessionId;
+      const childId = rec?.subagentId;
+      const chatCwd = this.store.get(chatId)?.cwd;
+      if (!parentId || !childId || !chatCwd) return null;
+      const res = readNativeChildTranscript({ parentId, childId, chatCwd });
+      if (!res?.ok) return null;
+      return res;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Drill into one child: point-in-time `session/read` of its own session
    * (no attach, no lease — a pure read). Warms the chat's agent when cold.
    * Throws NOT_FOUND / NO_SESSION / Error (RPC failure) for the route.
@@ -2160,16 +2200,18 @@ export class SessionManager extends EventEmitter {
       e.code = 'NOT_FOUND';
       throw e;
     }
-    // Native children have no MSP session (session/read rejects their id) —
-    // the drill is a detail view synthesized from the folded tool I/O: the
-    // spawn brief, the wait result, and the evidence refs. Same item shape
-    // as a session drill so the rail renders both identically.
+    // Native children have no MSP session (session/read rejects their id),
+    // but a delegated child keeps its own durable log under the owning
+    // parent's session dir — the drill reads that transcript when the
+    // mapping verifies, and falls back to the synthesized fold when it
+    // does not (unstamped record, pruned log, another workspace).
     if (rec.kind === 'native') {
       const items = [];
       const brief = [
         rec.taskName ? `task: ${rec.taskName}` : null,
-        rec.role ? `role: ${rec.role}` : null,
+        rec.title ? `title: ${rec.title}` : null,
         rec.objective ? `objective: ${rec.objective}` : null,
+        rec.role ? `role: ${rec.role}` : null,
         rec.agentPath ? `path: ${rec.agentPath}` : null,
         rec.subagentId ? `id: ${rec.subagentId}` : null,
       ].filter(Boolean).join('\n');
@@ -2180,6 +2222,45 @@ export class SessionManager extends EventEmitter {
         tool: 'subagent_spawn',
         fallbackText: brief || 'spawned',
       }));
+      const nativeLog = this._readNativeLog(chatId, rec);
+      if (nativeLog) {
+        for (const it of nativeLog.items) {
+          const clean = sanitizeDrillItem({ ...it, itemId: `${rec.itemId}:${it.itemId}` });
+          if (clean) items.push(clean);
+        }
+        if (rec.failureReason) {
+          items.push(sanitizeDrillItem({
+            itemId: `${rec.itemId}:failure`,
+            kind: 'agentMessage',
+            status: 'failed',
+            text: rec.failureReason,
+          }));
+        }
+        // Latest-run state drives drill polling + status: an active run with
+        // no tool rows yet must still poll, and a terminal run must stop.
+        const notices = [];
+        if (nativeLog.malformed) {
+          notices.push(`${nativeLog.malformed} บรรทัดใน log อ่านไม่ได้ — ข้ามไป`);
+        }
+        if (nativeLog.byteTruncated) {
+          const kb = nativeLog.bytesSkipped >= 1024
+            ? `${Math.round(nativeLog.bytesSkipped / 1024)} KB`
+            : `${nativeLog.bytesSkipped} ไบต์`;
+          notices.push(`log ใหญ่ — ข้ามต้นไฟล์ไป ${kb}`);
+        }
+        return {
+          record: rec,
+          session: null,
+          sessionId: rec.subagentId || null,
+          mode: 'native-log',
+          terminal: nativeLog.terminal,
+          nativeRun: { state: nativeLog.runState, terminal: nativeLog.terminal },
+          ...(notices.length ? { notice: notices.join(' · ') } : {}),
+          items,
+          droppedFromHead: nativeLog.droppedFromHead,
+          readAt: Date.now(),
+        };
+      }
       if (rec.result?.summary || rec.result?.text) {
         items.push(sanitizeDrillItem({
           itemId: `${rec.itemId}:result`,
@@ -2254,6 +2335,8 @@ export class SessionManager extends EventEmitter {
         rec.reminderAgentId ? `agent: ${rec.reminderAgentId}` : null,
         rec.generationId != null ? `generation: ${rec.generationId}` : null,
         rec.taskId ? `task: ${rec.taskId}` : null,
+        rec.taskName ? `taskName: ${rec.taskName}` : null,
+        rec.title ? `title: ${rec.title}` : null,
         rec.role ? `role: ${rec.role}` : null,
         rec.objective ? `objective: ${rec.objective}` : null,
         `status: ${rec.status || '—'}`,
@@ -2424,8 +2507,69 @@ export class SessionManager extends EventEmitter {
     return { action, subagentId: params.subagentId };
   }
 
+  /**
+   * Retire the goal when a fresh agent session id proves a rotation — the
+   * slot (and its goal) survives exits, so an exit + respawn under a NEW
+   * id would otherwise leak the old session's goal into the new one. The
+   * persisted snapshot retires too: after a restart the slot is fresh (no
+   * live goal) but the disk copy is still bound to the old session.
+   * Same-id resume retains silently; an actual change clears live + disk
+   * and emits one authoritative goal:null so renderers invalidate their
+   * mirrors instead of showing the fossil. Returns true when it retired.
+   */
+  _retireGoalOnRotation(chatId, slot, sessionId) {
+    // No proven new id, no proven rotation — a boot that never learned
+    // its session id must never wipe either copy.
+    if (sessionId == null) return false;
+    const liveBound = slot?.goal != null ? (slot.goalSessionId ?? null) : null;
+    const liveStale = liveBound != null && liveBound !== sessionId;
+    // Fresh slot after a host restart or slot eviction: no live goal, but
+    // the persisted snapshot may still be bound to the old session — it
+    // retires exactly like a live goal. (A live retire already clears the
+    // disk copy below, so this read is only needed when live is absent.)
+    let snapStale = false;
+    if (!liveStale) {
+      try {
+        const snap = this.store.get(chatId)?.goal ?? null;
+        snapStale = snap != null && snap.sessionId != null && snap.sessionId !== sessionId;
+      } catch { snapStale = false; }
+    }
+    if (!liveStale && !snapStale) return false;
+    if (slot) {
+      slot.goal = null;
+      slot.goalSessionId = null;
+    }
+    try {
+      this.store.saveGoal(chatId, null);
+    } catch { /* the live clear is what matters; disk follows best-effort */ }
+    // Clearing first makes the retire idempotent — a second pass finds
+    // nothing stale, so the invalidation emits exactly once per rotation.
+    this.wire.emit(chatId, 'goal', { goal: null });
+    return true;
+  }
+
+  /** Live slot first, persisted snapshot second — a cold chat (or a fresh
+   * host boot) still shows the last known goal until the next goalChanged.
+   * Both must belong to the chat's CURRENT agent session: a rotation
+   * retires them (stale goal cleared), an ordinary resume retains them.
+   * Display-only either way: goalCommand needs a live agent. */
   getGoal(chatId) {
-    return this.slots.get(chatId)?.goal ?? null;
+    const slot = this.slots.get(chatId);
+    const live = slot?.goal;
+    if (live !== undefined) {
+      // Backstop behind the eager rotation hook: a live goal bound to a
+      // different session than the attached client never leaks through,
+      // whichever path swapped the id. A cold slot (no client) keeps
+      // showing last-known — that is the rehydration behavior.
+      if (live != null && slot.goalSessionId != null && slot.client?.sessionId != null
+          && slot.client.sessionId !== slot.goalSessionId) return null;
+      return live ?? null;
+    }
+    const chat = this.store.get(chatId);
+    const snap = chat?.goal ?? null;
+    if (!snap) return null;
+    if (snap.sessionId != null && snap.sessionId !== chat.mspSessionId) return null;
+    return snap;
   }
 
   /**

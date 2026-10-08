@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, formatElapsed, turnHeaderLabel } from '../src/renderer/turn-view.js';
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from '../src/renderer/turn-view.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -676,6 +676,36 @@ test('agentCounts: swarm is one row, background-done leaves the running count (B
   assert.deepEqual(agentCounts(tv), { running: 1, total: 2 }, 'background-done is excluded from running');
   tv.tools.get('a2').status = 'failed';
   assert.deepEqual(agentCounts(tv), { running: 0, total: 2 }, 'failed agents are not running');
+});
+
+test('agentToolRows reads RAW tools: linked + unlinked agent rows survive (1.1.30)', () => {
+  assert.deepEqual(agentToolRows(null), []);
+  assert.deepEqual(agentToolRows(createTurnView()), []);
+  const tv = createTurnView();
+  tv.tools.set('t1', { id: 't1', title: 'npm test', kind: 'execute', status: 'in_progress' });
+  tv.tools.set('a1', {
+    id: 'a1', kind: 'subagent_spawn', status: 'in_progress',
+    title: 'spawn alpha', agentLink: 'native:sub-a',
+    rawInput: { subagent_type: 'explore' },
+  });
+  tv.tools.set('a2', {
+    id: 'a2', status: 'completed', kind: 'Agent',
+    title: 'model-side agent', agentLink: null,
+    rawInput: { subagent_type: 'general', description: 'free agent' },
+  });
+  const rows = agentToolRows(tv);
+  assert.equal(rows.length, 2, 'plain tools excluded, both agent rows kept');
+  assert.equal(rows[0].id, 'a1');
+  assert.equal(rows[0].agentLink, 'native:sub-a', 'durable link rides along for union dedupe');
+  assert.ok(rows[0].title && rows[0].title.length > 0);
+  assert.equal(rows[1].id, 'a2');
+  assert.equal(rows[1].agentLink, null, 'unlinked rows list honestly undrillable');
+  // The regression this pins: mapping `.tool` off raw values yields
+  // undefined rows and the whole live side of the union disappears.
+  assert.ok(rows.every((r) => r && typeof r === 'object'), 'no undefined rows');
+  // Liveness is captured at extraction for the union count.
+  assert.equal(rows[0].running, true, 'in-progress agent row counts running');
+  assert.equal(rows[1].running, false, 'completed agent row counts idle');
 });
 
 test('formatElapsed: compact clock for turn headers (1.1.26)', () => {

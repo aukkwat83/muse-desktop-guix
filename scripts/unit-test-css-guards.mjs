@@ -290,6 +290,69 @@ test('goal strip styles are id-scoped, panel rows under .goal-block (1.1.28)', (
   assert.ok(!/^\.goal-objective\s*\{/m.test(styleCss), 'unscoped .goal-objective block rule — panel/strip text rules collide again');
 });
 
+test('goal strip never overflows at any width: squeeze order + narrow fallback', () => {
+  const noComments = styleCss.replace(/\/\*[^]*?\*\//g, '');
+  const rule = (sel) => {
+    const m = noComments.match(new RegExp(`${sel}\\s*\\{([^}]*)\\}`));
+    assert.ok(m, `missing ${sel} rule`);
+    return m[1];
+  };
+  // Container: shrinkable, gutter-capped, clipped — margins can never push it
+  // past #main no matter how narrow the window gets.
+  const bar = rule('#goal-bar');
+  assert.ok(/min-width:\s*0/.test(bar), '#goal-bar needs min-width: 0');
+  assert.ok(/max-width:\s*calc\(100%\s*-\s*40px\)/.test(bar), '#goal-bar needs max-width: calc(100% - 40px)');
+  assert.ok(/overflow:\s*hidden/.test(bar), '#goal-bar needs overflow: hidden');
+  // Squeeze order: objective ellipsizes first, meta shrinks next, button intact.
+  const obj = rule('#goal-bar \\.goal-objective');
+  assert.ok(/flex:\s*1\s+1\s+auto/.test(obj), 'objective needs flex: 1 1 auto');
+  assert.ok(/min-width:\s*0/.test(obj), 'objective needs min-width: 0');
+  assert.ok(/text-overflow:\s*ellipsis/.test(obj), 'objective needs ellipsis');
+  const meta = rule('#goal-bar \\.goal-meta');
+  assert.ok(/flex:\s*0\s+1\s+auto/.test(meta), 'meta needs flex: 0 1 auto');
+  assert.ok(/min-width:\s*0/.test(meta), 'meta needs min-width: 0');
+  const btn = rule('#goal-bar \\.goal-btn');
+  assert.ok(/flex:\s*none/.test(btn), 'button must never shrink (flex: none)');
+  assert.ok(/white-space:\s*nowrap/.test(btn), 'button text must stay single-line');
+  // Narrow screens: meta drops out and gutters tighten so the button survives.
+  assert.ok(
+    /@media[^{]*max-width:\s*480px[^]*?#goal-bar\s+\.goal-meta[^]*?display:\s*none/.test(noComments),
+    'missing ≤480px fallback hiding #goal-bar .goal-meta',
+  );
+  assert.ok(
+    /@media[^{]*max-width:\s*480px[^]*?#goal-bar\s*\{[^}]*margin:\s*0\s+12px/.test(noComments),
+    'missing ≤480px fallback tightening #goal-bar margins',
+  );
+});
+
+test('overview popup stays inside narrow/short viewports (1.1.30)', () => {
+  const css = styleCss.replace(/\/\*[^]*?\*\//g, '');
+  // Viewport-relative width + a capped scroll column: placement clamps the
+  // box, CSS keeps the column usable once clamped.
+  assert.ok(
+    /\.pop\.panel\.overview-panel\s*\{[^}]*width:\s*min\(600px,\s*calc\(100vw - 32px\)\)/.test(css),
+    'missing viewport-relative .overview-panel width',
+  );
+  assert.ok(
+    /\.pop\.panel\.overview-panel\s*\{[^}]*max-height:\s*min\(80vh,\s*640px\)/.test(css),
+    'missing viewport-relative .overview-panel max-height',
+  );
+  assert.ok(
+    /\.ov-body\s*\{[^}]*overflow-y:\s*auto/.test(css),
+    'missing .ov-body scroll column',
+  );
+  assert.ok(
+    /@media[^{]*max-width:\s*480px[^]*?\.pop\.panel\.overview-panel\s*\{[^}]*width:\s*calc\(100vw - 16px\)/.test(css),
+    'missing ≤480px fallback widening the overview popup',
+  );
+  // Thai-safe clamped titles: 2-line clamp with breathing room, never a
+  // bare overflow:hidden + tight line-height on tone-marked text.
+  assert.ok(
+    /\.ov-child \.ov-title\s*\{[^}]*-webkit-line-clamp:\s*2[^}]*line-height:\s*1\.5/.test(css),
+    'missing Thai-safe 2-line overview child titles',
+  );
+});
+
 let failed = 0;
 for (const [name, fn] of tests) {
   try {

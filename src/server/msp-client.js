@@ -241,9 +241,13 @@ export function sanitizeChildItem(item) {
   const pick = (key) => {
     if (item[key] != null) out[key] = str(item[key]);
   };
-  for (const k of ['subagentId', 'agentPath', 'role', 'objective', 'controlStatus', 'childSessionId',
+  for (const k of ['subagentId', 'agentPath', 'role', 'objective', 'taskName', 'title', 'topic',
+    'controlStatus', 'childSessionId',
     'entryId', 'scriptId', 'message', 'fallbackText', 'reminderAgentId', 'taskId',
     'generationId', 'workflowRunId']) pick(k);
+  // The wire uses both casings for the per-topic header — normalize the snake
+  // case onto the camelCase the renderer titles on, never both, never none.
+  if (out.taskName == null && item.task_name != null) out.taskName = str(item.task_name);
   for (const k of ['depth', 'durationMs', 'revision']) {
     if (Number.isFinite(item[k])) out[k] = item[k];
   }

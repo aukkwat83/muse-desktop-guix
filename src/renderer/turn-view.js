@@ -69,9 +69,20 @@ export function bindTurnId(tv, data) {
  * transcript-model.js:168-176 `interruptedMarkerText`).
  */
 export function interruptedMarkerText(reason) {
-  if (reason === 'watchdog') return '⚠︎ ระบบหยุดให้ (เงียบเกินเพดาน watchdog)';
-  if (reason === 'interrupted') return '⏹ host หยุดระหว่างเทิร์น — prompt ใหม่เพื่อทำต่อ';
-  return '⏹ หยุดโดยผู้ใช้';
+  if (reason === 'watchdog') return '⚠︎ ระบบหยุดให้ (เงียบเกินเพดาน watchdog)'; // tofu-ok: persisted data string, paint strips the glyph
+  if (reason === 'interrupted') return '⏹ host หยุดระหว่างเทิร์น — prompt ใหม่เพื่อทำต่อ'; // tofu-ok: persisted data string, paint strips the glyph
+  return '⏹ หยุดโดยผู้ใช้'; // tofu-ok: persisted data string, paint strips the glyph
+}
+
+/**
+ * Display text for an interruption marker: the persisted string minus its
+ * leading icon glyph — the paint mounts the vector twin (warn/stop) beside
+ * the words instead. Pure — the node suite pins the strip rule.
+ */
+export function stripMarkerGlyph(text) {
+  // U+23F9 / U+26A0 + text-style VS15 U+FE0E — escapes, not literals,
+  // so the rule itself carries no tofu.
+  return String(text ?? '').replace(/^[\u23F9\u26A0\uFE0E\s]+/, '');
 }
 
 /**
@@ -426,6 +437,35 @@ export function agentCounts(tv) {
     if (ds === 'pending' || ds === 'running') running += 1;
   }
   return { running, total };
+}
+
+/**
+ * Live-turn agent rows as overview descriptors: human title + display state
+ * + the durable server link (tool.agentLink → registry itemId) the popup's
+ * union dedupes on. Rows without a link stay honestly undrillable.
+ *
+ * tv.tools holds RAW tool objects (the tool_call handler stores data.tool
+ * directly) — a `.map((n) => n.tool)` here reads undefined off every row
+ * and the whole live side of the union silently disappears (1.1.30).
+ */
+export function agentToolRows(tv) {
+  const out = [];
+  for (const tool of tv?.tools?.values?.() || []) {
+    if (!tool || !agentToolMeta(tool)) continue;
+    const ds = toolDisplayState(tool);
+    out.push({
+      id: tool.id,
+      title: agentSubtitle(tool),
+      state: ds === 'background' ? 'ทำงานเบื้องหลัง' : toolStatusLabel(tool.status),
+      // Captured liveness for the union count — the descriptor leaves the
+      // raw tool behind, so the chip/popup count from this, not status.
+      running: ds === 'pending' || ds === 'running',
+      status: tool.status,
+      kind: tool.kind,
+      agentLink: tool.agentLink ?? null,
+    });
+  }
+  return out;
 }
 
 /**

@@ -1,22 +1,24 @@
 // Sidebar: group blocks with nested chats, modelled on grok-desktop's.
 //
-// Layout of one row:
-//   ⋮⋮ drag handle · ▸/▾ expand · name (dbl-click renames) · ＋ · − · count · ⋯
-// and, when expanded, a dashed "＋ session" tab above the chats in that group.
+// Layout of one row (icons.js vectors throughout):
+//   grip drag handle · chevron expand · name (dbl-click renames) · plus ·
+//   minus · count · ellipsis menu; and, when expanded, a dashed "+ session"
+//   tab above the chats in that group.
 //
 // Two structural rules worth keeping:
-//   - only the ⋮⋮ handle drags a group; chat rows drag independently, so
+//   - only the grip handle drags a group; chat rows drag independently, so
 //     picking up a chat can never accidentally reorder its group
 //   - any group collapses, including the one holding the active chat —
-//     the ▸/▾ button is never disabled. Switching sessions re-expands
+//     the chevron button is never disabled. Switching sessions re-expands
 //     the incoming chat's group (app.js), but a same-chat refetch
 //     leaves a deliberate collapse alone.
 //
 // Rename and "new group" happen inline, and their in-progress text is kept
 // across re-renders — a stream event landing mid-typing must not wipe the box.
 
-import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.4.0';
+import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.5.1';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
+import { setIcon, setIconLabel } from './icons.js?v=1.0.0';
 
 /**
  * Commit an inline editor only when the user really left it.
@@ -47,7 +49,7 @@ export class Sidebar {
     this.renameValue = '';
     this.draftOpen = false;
     this.draftValue = '';
-    /** Where the open draft sits and lands: 'top' (header ▤) or 'bottom' (＋ group tab). */
+    /** Where the open draft sits and lands: 'top' (header new-group) or 'bottom' (dashed group tab). */
     this.draftAt = 'top';
     this.dragGroupId = null;
     this.dragChatId = null;
@@ -106,9 +108,9 @@ export class Sidebar {
       this.mount.append(empty);
     }
 
-    // The new-group draft sits where its button sits: the header ▤ drafts
-    // at the top and lands on top; the bottom tab drafts at the bottom and
-    // lands at the bottom.
+    // The new-group draft sits where its button sits: the header button
+    // drafts at the top and lands on top; the bottom tab drafts at the
+    // bottom and lands at the bottom.
     if (this.draftOpen && this.draftAt === 'top') this.mount.append(this.draftRow());
 
     for (const group of groups) this.mount.append(this.groupBlock(group));
@@ -139,7 +141,7 @@ export class Sidebar {
 
     const handle = document.createElement('span');
     handle.className = 'group-handle';
-    handle.textContent = '⋮⋮';
+    setIcon(handle, 'grip', 'ico ico-sm');
     handle.title = 'ลากเพื่อเรียงลำดับ group';
     handle.draggable = true;
     handle.setAttribute('aria-hidden', 'true');
@@ -148,8 +150,10 @@ export class Sidebar {
     const expand = document.createElement('button');
     expand.type = 'button';
     expand.className = 'group-expand';
-    expand.textContent = expanded ? '▾' : '▸';
+    setIcon(expand, expanded ? 'chevDown' : 'chevRight', 'ico ico-sm');
     expand.title = expanded ? 'ยุบ' : 'ขยาย';
+    expand.setAttribute('aria-label', `${expanded ? 'ยุบ' : 'ขยาย'} group ${group.name}`);
+    expand.setAttribute('aria-expanded', String(expanded));
     expand.addEventListener('click', (ev) => {
       ev.stopPropagation();
       this.toggleExpanded(group.id);
@@ -180,7 +184,7 @@ export class Sidebar {
     const add = document.createElement('button');
     add.type = 'button';
     add.className = 'group-btn add';
-    add.textContent = '＋';
+    setIcon(add, 'plus', 'ico ico-sm');
     add.title = 'เพิ่ม session ใน group นี้';
     add.setAttribute('aria-label', `เพิ่ม session ใน group ${group.name}`);
     add.addEventListener('click', (ev) => {
@@ -193,7 +197,7 @@ export class Sidebar {
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 'group-btn del';
-    del.textContent = '−';
+    setIcon(del, 'minus', 'ico ico-sm');
     del.title = 'ลบ group';
     del.setAttribute('aria-label', `ลบ group ${group.name}`);
     del.addEventListener('click', (ev) => {
@@ -220,8 +224,9 @@ export class Sidebar {
     const menu = document.createElement('button');
     menu.type = 'button';
     menu.className = 'icon-btn group-menu';
-    menu.textContent = '⋯';
+    setIcon(menu, 'ellipsis', 'ico ico-sm');
     menu.title = 'เมนู group';
+    menu.setAttribute('aria-label', `เมนู group ${group.name}`);
     menu.setAttribute('aria-haspopup', 'menu');
     menu.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -243,7 +248,7 @@ export class Sidebar {
       const addSess = document.createElement('button');
       addSess.type = 'button';
       addSess.className = 'dashed-tab';
-      addSess.innerHTML = '<span class="plus">＋</span><span>session</span>';
+      setIconLabel(addSess, 'plus', 'session', 'ico ico-sm');
       addSess.title = 'เพิ่ม session ใน group นี้';
       addSess.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -321,7 +326,7 @@ export class Sidebar {
     const del = document.createElement('button');
     del.type = 'button';
     del.className = 's-del';
-    del.textContent = '−';
+    setIcon(del, 'minus', 'ico ico-sm');
     del.title = 'ลบ session';
     del.setAttribute('aria-label', `ลบ session ${chat.title}`);
     del.addEventListener('click', async (ev) => {
@@ -334,8 +339,9 @@ export class Sidebar {
     const menu = document.createElement('button');
     menu.type = 'button';
     menu.className = 'icon-btn s-menu';
-    menu.textContent = '⋯';
+    setIcon(menu, 'ellipsis', 'ico ico-sm');
     menu.title = 'เมนู session';
+    menu.setAttribute('aria-label', `เมนู session ${chat.title}`);
     menu.setAttribute('aria-haspopup', 'menu');
     menu.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -437,10 +443,10 @@ export class Sidebar {
     const isLast = this.view.groups.length <= 1;
     openMenu(anchor, [
       { type: 'label', label: group.name },
-      { label: 'เปิด group', icon: '▶', action: () => this.actions.selectGroup(group.id) },
+      { label: 'เปิด group', icon: 'arrowRight', action: () => this.actions.selectGroup(group.id) },
       {
         label: 'Session ใหม่ใน group',
-        icon: '＋',
+        icon: 'plus',
         action: () => {
           this.ensureExpanded(group.id);
           this.actions.createChat(group.id);
@@ -448,7 +454,7 @@ export class Sidebar {
       },
       {
         label: 'เปลี่ยนชื่อ…',
-        icon: '✎',
+        icon: 'pencil',
         action: () => {
           this.renameId = group.id;
           this.renameValue = group.name;
@@ -459,13 +465,13 @@ export class Sidebar {
       },
       {
         label: this.isExpanded(group.id) ? 'ยุบ sessions' : 'ขยาย sessions',
-        icon: this.isExpanded(group.id) ? '▴' : '▾',
+        icon: this.isExpanded(group.id) ? 'chevUp' : 'chevDown',
         action: () => this.toggleExpanded(group.id),
       },
       { type: 'sep' },
       {
         label: `ลบ group (${chats.length} session)`,
-        icon: '−',
+        icon: 'minus',
         danger: true,
         disabled: isLast,
         action: () => void this.confirmDeleteGroup(group, anchor),
@@ -478,17 +484,17 @@ export class Sidebar {
     /** @type {any[]} */
     const items = [
       { type: 'label', label: chat.title },
-      { label: 'เปิด session', icon: '▶', action: () => this.actions.selectChat(chat.id) },
+      { label: 'เปิด session', icon: 'arrowRight', action: () => this.actions.selectChat(chat.id) },
       {
         label: 'คัดลอก session id',
-        icon: 'id',
+        icon: 'tag',
         action: () => void navigator.clipboard?.writeText(chat.id).catch(() => {}),
       },
       {
         // BUG-054: whole-transcript Markdown copy (grok-desktop's session
         // menu has "Copy all (Markdown)", app.js:6411-6418).
         label: 'คัดลอกทั้งหมด (Markdown)',
-        icon: '⎘',
+        icon: 'copy',
         action: () => this.actions.copyChatMarkdown(chat.id),
       },
     ];
@@ -497,7 +503,7 @@ export class Sidebar {
       for (const g of others) {
         items.push({
           label: g.name,
-          icon: '→',
+          icon: 'arrowRight',
           action: () => {
             this.ensureExpanded(g.id);
             this.actions.moveChat(chat.id, g.id);
@@ -509,7 +515,7 @@ export class Sidebar {
       { type: 'sep' },
       {
         label: 'ลบ session',
-        icon: '−',
+        icon: 'minus',
         danger: true,
         action: async () => {
           const ok = await miniConfirm(anchor, `ลบ “${chat.title}” ?`, { okLabel: 'ลบ' });
@@ -650,7 +656,7 @@ export class Sidebar {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'dashed-tab dashed-group';
-    btn.innerHTML = '<span class="plus">＋</span><span>group</span>';
+    setIconLabel(btn, 'plus', 'group', 'ico ico-sm');
     btn.title = 'เพิ่ม group ใหม่';
     btn.addEventListener('click', (ev) => {
       ev.stopPropagation();
