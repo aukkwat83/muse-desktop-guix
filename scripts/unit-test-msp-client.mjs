@@ -110,8 +110,16 @@ const multiParams = (id) => ({
     { id: 'q2', question: 'Second?', selection: { mode: 'single' }, options: [{ label: 'x' }] },
   ],
 });
+// Malformed: unknown selection mode — no form can answer it.
+const brokenParams = (id) => ({
+  userInputId: id,
+  toolName: 'AskUserQuestion',
+  questions: [
+    { id: 'q1', question: 'Bogus?', selection: { mode: 'fuzzy' }, options: [{ label: 'a' }] },
+  ],
+});
 
-test('recoverUserInput mounts single as card, cancels multi (BUG-084)', async () => {
+test('recoverUserInput mounts single AND multi as cards, cancels malformed (BUG-084)', async () => {
   const client = new MspClient({ cwd: os.tmpdir() });
   client.sessionId = 's-1';
   const sent = [];
@@ -127,12 +135,16 @@ test('recoverUserInput mounts single as card, cancels multi (BUG-084)', async ()
   assert.equal(perms.length, 1);
   assert.equal(perms[0].subtype, 'ask');
   assert.equal(client.hasInteractiveWaiter('u-1'), true);
-  assert.equal(client.recoverUserInput(multiParams('u-2'), 'poll'), 'cancelled');
-  assert.ok(updates.some((u) => u.sessionUpdate === 'msp:user_input_unsupported'), 'multi must leave the unsupported trace');
+  // Multi-question mounts since 1.1.33 — the form answers every question.
+  assert.equal(client.recoverUserInput(multiParams('u-2'), 'poll'), 'card');
+  assert.equal(perms.length, 2);
+  assert.deepEqual(perms[1].questions.map((q) => q.id), ['q1', 'q2']);
+  assert.equal(client.recoverUserInput(brokenParams('u-3'), 'poll'), 'cancelled');
+  assert.ok(updates.some((u) => u.sessionUpdate === 'msp:user_input_unsupported'), 'malformed must leave the unsupported trace');
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(sent.map(([m]) => m), ['userInput/cancel']);
-  assert.equal(sent[0][1].userInputId, 'u-2');
-  assert.ok(sent[0][1].reason?.includes('2'), 'the cancel must carry a reason (binary 1.4.2 rejects reason-less cancels)');
+  assert.equal(sent[0][1].userInputId, 'u-3');
+  assert.ok(sent[0][1].reason?.length > 0, 'the cancel must carry a reason (binary 1.4.2 rejects reason-less cancels)');
 });
 
 test('recoverUserInput dedupes repeats and nulls id-less frames (BUG-084)', async () => {
@@ -154,8 +166,8 @@ test('the cancel path dedupes the request + notification pair (BUG-084)', async 
   client.request = async () => { cancels++; return {}; };
   let traces = 0;
   client.on('update', (u) => { if (u.sessionUpdate === 'msp:user_input_unsupported') traces++; });
-  assert.equal(client.recoverUserInput(multiParams('u-pair')), 'cancelled');
-  assert.equal(client.recoverUserInput(multiParams('u-pair')), 'duplicate');
+  assert.equal(client.recoverUserInput(brokenParams('u-pair')), 'cancelled');
+  assert.equal(client.recoverUserInput(brokenParams('u-pair')), 'duplicate');
   await new Promise((r) => setImmediate(r));
   assert.equal(cancels, 1, 'exactly one cancel RPC for the pair');
   assert.equal(traces, 1, 'exactly one transcript notice for the pair');
@@ -167,11 +179,177 @@ test('a rejected userInput/cancel is loud, never swallowed (BUG-084)', async () 
   client.request = async () => { throw new Error('rejected by host'); };
   const stderr = [];
   client.on('stderr', (t) => stderr.push(t));
-  assert.equal(client.recoverUserInput(multiParams('u-loud')), 'cancelled');
+  assert.equal(client.recoverUserInput(brokenParams('u-loud')), 'cancelled');
   await new Promise((r) => setImmediate(r));
   assert.equal(stderr.length, 1);
   assert.match(stderr[0], /userInput\/cancel FAILED/);
   assert.match(stderr[0], /u-loud/);
+});
+
+test('decideApproval acks then drops the waiter; a rejection keeps it', async () => {
+  const waiter = () => ({
+    kind: 'approval', approvalId: 'a9', requirementId: 'req-1',
+    choices: [{ choiceId: 'approve_once', decision: 'approved', scope: 'once' }],
+    resolve: () => {}, reject: () => {},
+  });
+  const ok = new MspClient({ cwd: os.tmpdir() });
+  ok.sessionId = 's-1';
+  ok.request = async () => ({ status: 'accepted', terminal: true, approvalId: 'a9' });
+  ok._permWaiters.set('a9', waiter());
+  const res = await ok.decideApproval('a9', 'approve_once');
+  assert.equal(res.choiceId, 'approve_once');
+  assert.equal(ok.hasInteractiveWaiter('a9'), false, 'acked decide drops the waiter');
+  const bad = new MspClient({ cwd: os.tmpdir() });
+  bad.sessionId = 's-1';
+  bad.request = async () => { throw new Error('rejected by host'); };
+  bad.on('stderr', () => {});
+  bad._permWaiters.set('a9', waiter());
+  await assert.rejects(() => bad.decideApproval('a9', 'approve_once'), /rejected by host/);
+  assert.equal(bad.hasInteractiveWaiter('a9'), true, 'rejected decide keeps the waiter for the retry');
+  await assert.rejects(() => bad.decideApproval('a9', 'nope'), /unknown choice/);
+});
+
+test('decideApproval sends sessionId and staged terminal semantics', async () => {
+  const waiter = () => ({
+    kind: 'approval', approvalId: 'a9', requirementId: 'req-1',
+    choices: [{ choiceId: 'approve_once', decision: 'approved', scope: 'once' }],
+    resolve: () => {}, reject: () => {},
+  });
+  const sent = [];
+  const staged = new MspClient({ cwd: os.tmpdir() });
+  staged.sessionId = 's-1';
+  staged.request = async (method, params) => {
+    sent.push([method, params]);
+    return { status: 'accepted', terminal: false, approvalId: 'a9' };
+  };
+  staged._permWaiters.set('a9', waiter());
+  const res = await staged.decideApproval('a9', 'approve_once');
+  assert.equal(res.terminal, false);
+  assert.equal(sent[0][1].sessionId, 's-1', 'decide params require sessionId (schema)');
+  assert.equal(sent[0][1].requirementId, 'req-1');
+  assert.equal(staged.hasInteractiveWaiter('a9'), true, 'terminal:false keeps the waiter for the next stage');
+  const bad = new MspClient({ cwd: os.tmpdir() });
+  bad.sessionId = 's-1';
+  bad.request = async () => ({ status: 'accepted' });
+  bad.on('stderr', () => {});
+  bad._permWaiters.set('a9', waiter());
+  await assert.rejects(() => bad.decideApproval('a9', 'approve_once'), /ack invalid/);
+  assert.equal(bad.hasInteractiveWaiter('a9'), true, 'a malformed ack is a failure, never success');
+});
+
+test('sticky engages only after a validated approve ack (never deny, never pre-RPC)', async () => {
+  const waiter = (choices) => ({
+    kind: 'approval', approvalId: 'a9', requirementId: 'req-1', choices,
+    resolve: () => {}, reject: () => {},
+  });
+  // A session-scoped DENY must not arm approve-sticky.
+  const deny = new MspClient({ cwd: os.tmpdir() });
+  deny.sessionId = 's-1';
+  deny.request = async () => ({ status: 'accepted', terminal: true });
+  deny._permWaiters.set('a9', waiter([{ choiceId: 'deny_session', decision: 'denied', scope: 'session' }]));
+  await deny.decideApproval('a9', 'deny_session');
+  assert.equal(deny.permissionStickyApprove, false, 'a deny must never arm approve-sticky');
+  // A failed RPC must not arm it either.
+  const fail = new MspClient({ cwd: os.tmpdir() });
+  fail.sessionId = 's-1';
+  fail.request = async () => { throw new Error('down'); };
+  fail.on('stderr', () => {});
+  fail._permWaiters.set('a9', waiter([{ choiceId: 'approve_always', decision: 'approvedForSession', scope: 'session' }]));
+  await assert.rejects(() => fail.decideApproval('a9', 'approve_always'), /down/);
+  assert.equal(fail.permissionStickyApprove, false, 'sticky only after a validated ack');
+});
+
+test('answerUserInput keeps the waiter until the ack', async () => {
+  const waiter = () => ({ kind: 'userInput', userInputId: 'u9', resolve: () => {}, reject: () => {} });
+  const sent = [];
+  const client = new MspClient({ cwd: os.tmpdir() });
+  client.sessionId = 's-1';
+  client.request = async (method, params) => { sent.push([method, params]); return { status: 'accepted' }; };
+  client._permWaiters.set('u9', waiter());
+  const answers = [{ questionId: 'q1', selectedLabel: 'a' }];
+  const res = await client.answerUserInput('u9', answers, { commandId: 'cmd-1' });
+  assert.equal(res.commandId, 'cmd-1', 'caller-owned commandId rides the RPC');
+  assert.deepEqual(sent[0][1].answers, answers);
+  assert.equal(client.hasInteractiveWaiter('u9'), false);
+  const failing = new MspClient({ cwd: os.tmpdir() });
+  failing.sessionId = 's-1';
+  failing.request = async () => { throw new Error('boom'); };
+  failing.on('stderr', () => {});
+  failing._permWaiters.set('u9', waiter());
+  await assert.rejects(() => failing.answerUserInput('u9', answers), /boom/);
+  assert.equal(failing.hasInteractiveWaiter('u9'), true, 'the card stays answerable after a rejection');
+});
+
+test('userInput/settled forwards the authoritative outcome, not a blanket answered', () => {
+  const client = new MspClient({ cwd: os.tmpdir() });
+  client._permWaiters.set('u7', { kind: 'userInput', userInputId: 'u7', resolve: () => {}, reject: () => {} });
+  const perms = [];
+  client.on('permission', (p) => perms.push(p));
+  client._onNotification('userInput/settled', {
+    sessionId: 's-1', userInputId: 'u7', outcome: 'timedOut',
+    decidedByCommandId: 'cmd-9', reason: 'auto-resolution',
+  });
+  assert.equal(perms.length, 1);
+  assert.equal(perms[0].outcome, 'timedOut');
+  assert.equal(perms[0].optionId, null, 'the outcome enum is never the optionId');
+  assert.equal(perms[0].decidedByCommandId, 'cmd-9');
+  assert.equal(client.hasInteractiveWaiter('u7'), false);
+});
+
+test('approval/resolved carries the decision as outcome, never as optionId', () => {
+  const client = new MspClient({ cwd: os.tmpdir() });
+  client._permWaiters.set('a1', { kind: 'approval', approvalId: 'a1', resolve: () => {}, reject: () => {} });
+  const perms = [];
+  client.on('permission', (p) => perms.push(p));
+  client._onNotification('approval/resolved', {
+    sessionId: 's-1', approvalId: 'a1', decision: 'approvedForSession', decidedByCommandId: 'cmd-4',
+  });
+  assert.equal(perms.length, 1);
+  assert.equal(perms[0].resolved, true);
+  assert.equal(perms[0].outcome, 'approvedForSession', 'the enum stays the outcome');
+  assert.equal(perms[0].optionId, null, 'no choice identity on the wire — sessions attributes via winner match');
+  assert.equal(perms[0].decidedByCommandId, 'cmd-4');
+});
+
+test('engageUserInput notifies once per id and never throws', () => {
+  const client = new MspClient({ cwd: os.tmpdir() });
+  client.sessionId = 's-1';
+  const sent = [];
+  client.notify = (method, params) => sent.push([method, params]);
+  assert.equal(client.engageUserInput('u-e'), true);
+  assert.equal(client.engageUserInput('u-e'), true, 'repeat engage is a deduped no-op');
+  assert.deepEqual(sent.map(([m]) => m), ['userInput/engaged']);
+  assert.equal(sent[0][1].userInputId, 'u-e');
+  assert.ok(!('commandId' in sent[0][1]), 'engaged carries no commandId (schema)');
+  const dead = new MspClient({ cwd: os.tmpdir() });
+  dead.sessionId = 's-1';
+  dead.notify = () => { throw new Error('stdin gone'); };
+  dead.on('stderr', () => {});
+  assert.equal(dead.engageUserInput('u-e'), false);
+});
+
+test('cancelInteractive sweeps approvals to deny and questions to cancel', async () => {
+  const client = new MspClient({ cwd: os.tmpdir() });
+  client.sessionId = 's-1';
+  const sent = [];
+  client.request = async (method, params) => { sent.push([method, params]); return {}; };
+  client._permWaiters.set('a-s', {
+    kind: 'approval', approvalId: 'a-s', requirementId: 'req-1',
+    choices: [
+      { choiceId: 'approve_once', decision: 'approved', scope: 'once' },
+      { choiceId: 'reject', decision: 'denied', scope: 'once' },
+    ],
+    resolve: () => {}, reject: () => {},
+  });
+  client._permWaiters.set('u-s', { kind: 'userInput', userInputId: 'u-s', resolve: () => {}, reject: () => {} });
+  assert.equal(client.cancelInteractive('a-s', 'turn settled'), true);
+  assert.equal(client.cancelInteractive('u-s', 'turn settled'), true);
+  assert.equal(client.cancelInteractive('missing', 'turn settled'), false);
+  await new Promise((r) => setImmediate(r));
+  const decide = sent.find(([m]) => m === 'approval/decide');
+  assert.equal(decide[1].choiceId, 'reject', 'the sweep denies, never approves');
+  const cancel = sent.find(([m]) => m === 'userInput/cancel');
+  assert.equal(cancel[1].reason, 'turn settled');
 });
 
 test('listPending normalizes the snapshot to arrays (BUG-084)', async () => {

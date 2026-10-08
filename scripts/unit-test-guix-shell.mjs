@@ -137,6 +137,119 @@ test('binary is not older than main.c (stale-build guard)', () => {
   return `binary ${Math.round((bin - src) / 1000)}s newer than source`;
 });
 
+console.log(`\n${c.b}== question banners + click routing (1.1.33) ==${c.x}`);
+test('registers the `museNotify` script message handler', () => {
+  assert(
+    /webkit_user_content_manager_register_script_message_handler\(\s*ucm,\s*"museNotify"/.test(main),
+    'museNotify handler not registered — the renderer can never banner natively',
+  );
+  assert(/script-message-received::museNotify/.test(main), 'museNotify signal not connected');
+  return 'window.webkit.messageHandlers.museNotify exists';
+});
+test('exports a typed `open-question` (ss) GAction', () => {
+  assert(/g_simple_action_new\("open-question",\s*G_VARIANT_TYPE\("\(ss\)"\)\)/.test(main),
+    'open-question must carry (chatId, ixId) as a typed (ss) parameter');
+  assert(/"app\.open-question"/.test(main), 'banner default action must target app.open-question');
+  return 'banner taps route to the exact chat + question';
+});
+test('same notification id replaces; withdraw mirrors show', () => {
+  assert(/g_application_send_notification\(\s*g_app,\s*notif_id/.test(main),
+    'show must send through g_application_send_notification for replace-by-id dedupe');
+  assert(/g_application_withdraw_notification\(\s*g_app,\s*withdraw_id/.test(main),
+    'withdraw must target the same derived id or banners linger');
+  assert(!/notify-send|system\(.*notif|popen.*notif/i.test(main),
+    'no shell-spawned notifiers — ids must never cross a command line',
+  );
+});
+test('bridge is same-origin guarded and routing evals the typed ids', () => {
+  assert(/muse_notify_same_origin/.test(main), 'missing same-origin guard on the bridge');
+  assert(/__museQuestionRoute/.test(main), 'routing must call window.__museQuestionRoute(chatId, ixId)');
+  assert(!/g_strescape\(chat_id/.test(main) && !/g_strescape\(ix_id/.test(main),
+    'g_strescape octal escapes are not valid JS — ids must use JSON escaping');
+  assert(/js_string_escape\(g_route_chat\)/.test(main) && /js_string_escape\(g_route_ix\)/.test(main),
+    'ids must be JSON-escaped into the routing JS string (UTF-8 safe)');
+});
+test('actions register once at startup; activate reuses the window', () => {
+  assert(/g_signal_connect\(app, "startup", G_CALLBACK\(on_startup\)/.test(main),
+    'startup handler not connected — actions would miss cold-start taps');
+  assert(/g_simple_action_new\("open-question"[\s\S]{0,400}on_startup|on_startup[\s\S]{0,2000}g_simple_action_new\("open-question"/.test(main),
+    'open-question must be registered in on_startup, not per-window');
+  assert(/g_simple_action_new\("notify-question",\s*G_VARIANT_TYPE\("\(ss\)"\)\)/.test(main),
+    'host-origin notify-question (op, key) action missing');
+  assert(/gtk_application_get_active_window\(app\)/.test(main),
+    'on_activate must present the existing window instead of building a duplicate');
+});
+test('banner taps queue until the page is ready (never dropped)', () => {
+  assert(/"load-changed", G_CALLBACK\(on_webview_load_changed\)/.test(main),
+    'route flush needs the load-changed gate');
+  assert(/queue_question_route\(chat_id, ix_id\)/.test(main), 'taps must queue');
+  assert(/flush_pending_route\(\);/.test(main), 'queued taps must flush on ready');
+  assert(!/if \(!g_view\)\s*\n\s*return;/.test(main.split('on_open_question_action')[1] || ''),
+    'on_open_question must queue when the view is missing, not return');
+});
+test('routes wait for hydration and clear only on receipt', () => {
+  assert(/!g_view \|\| !g_page_ready \|\| !g_boot_ready/.test(main),
+    'flush must gate on the hydrated ready post, not load-finished alone');
+  assert(/g_strcmp0\(op, "ready"\) == 0/.test(main), 'missing {op:ready} hydration handler');
+  assert(/g_strcmp0\(op, "routed"\) == 0/.test(main), 'missing {op:routed} receipt handler');
+  assert(/clear_question_route\(\);/.test(main), 'receipt must clear the matching queued route');
+  assert(!/on_ready_timeout|g_ready_timer/.test(main),
+    'no timer may clear the queue without a receipt — a slow renderer is not legacy');
+});
+test('closed windows rebuild on tap instead of dangling', () => {
+  assert(/"destroy", G_CALLBACK\(on_shell_window_destroy\)/.test(main),
+    'window destroy must drop the dangling view');
+  assert(/if \(!g_view && g_app\)\s*\n\s*g_application_activate\(g_app\);/.test(main),
+    'a tap with no window must activate (create) one, not route nowhere');
+  assert(/GtkNative \*native = gtk_widget_get_native/.test(main),
+    'get_native returns GtkNative*, not GtkWidget* (Guix compile error)');
+});
+test('host payloads validate the key and parse JSON with JSC', () => {
+  assert(/muse_notify_key_valid\(key\)/.test(main), 'D-Bus keys must be validated (any local caller can send)');
+  assert(/jsc_context_evaluate\(ctx, expr/.test(main), 'payload JSON must parse via JSC (no new dep, UTF-8 safe)');
+  assert(/muse-desktop/.test(main) && /notify-%s\.json/.test(main),
+    'payload path must match the host notifier (runtime/muse-desktop/notify-<key>.json)');
+});
+test('installer hides the legacy entry; the app-id entry stays canonical', () => {
+  const inst = read('scripts/install-desktop.sh');
+  assert(/NoDisplay=true/.test(inst), 'legacy muse-desktop.desktop must install hidden');
+  assert(/applications\/com\.aukkwat83\.MuseDesktop\.desktop/.test(inst),
+    'canonical app-id entry must install visible');
+  assert(/NoDisplay=true"; \} >"\$HOME\/\.local\/share\/applications\/muse-desktop\.desktop"/.test(inst),
+    'the applications/ legacy entry must be the hidden one (no second visible duplicate)');
+});
+test('installer enables bus activation with a service file', () => {
+  const inst = read('scripts/install-desktop.sh');
+  assert(/^DBusActivatable=true$/m.test(inst), 'canonical entry must be D-Bus activatable');
+  assert(!/^DBusActivatable=false$/m.test(inst), 'no entry may carry DBusActivatable=false');
+  assert(/dbus-1\/services\/com\.aukkwat83\.MuseDesktop\.service/.test(inst),
+    'a same-app-id .service file must launch the closed shell on bus calls');
+  assert(/Name=com\.aukkwat83\.MuseDesktop/.test(inst), 'service Name must match the app id');
+});
+test('desktop entry ships under the app-id name (GAction dispatch)', () => {
+  assert(
+    fs.existsSync(path.join(ROOT, 'assets/com.aukkwat83.MuseDesktop.desktop')),
+    'assets/com.aukkwat83.MuseDesktop.desktop missing — GNOME may not dispatch open-question',
+  );
+  const inst = read('scripts/install-desktop.sh');
+  assert(/com\.aukkwat83\.MuseDesktop\.desktop/.test(inst),
+    'install-desktop.sh must install the app-id desktop file',
+  );
+  return 'banner taps dispatch under GNOME';
+});
+test('python fallback shell mirrors the notify contract', () => {
+  const py = read('linux/gtk-shell/muse_desktop_shell.py');
+  assert(/register_script_message_handler\("museNotify"/.test(py), 'python shell missing museNotify');
+  assert(/"open-question"/.test(py) && /"\(ss\)"/.test(py), 'python shell missing the typed action');
+  assert(/__museQuestionRoute/.test(py), 'python shell missing routing');
+  assert(/def do_startup/.test(py) && /"notify-question"/.test(py), 'python shell must register notify-question at startup');
+  assert(/_flush_route/.test(py) && /load-changed/.test(py), 'python shell must queue taps until the page is ready');
+  assert(/_notify_key_valid/.test(py), 'python shell must validate host keys');
+  assert(/_boot_ready/.test(py) && /op == "ready"/.test(py), 'python shell must wait for the hydration handshake');
+  assert(/op == "routed"/.test(py), 'python shell must clear routes only on receipt');
+  assert(/self\._win = None/.test(py) && /self\.activate\(\)/.test(py), 'python shell must rebuild closed windows on tap');
+});
+
 console.log(`\n${c.b}== launcher guards (mac never executes these) ==${c.x}`);
 test('native-launch.sh keeps the prebuilt fast path', () => {
   const sh = read('scripts/native-launch.sh');

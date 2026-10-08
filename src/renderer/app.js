@@ -18,7 +18,7 @@ import { Sidebar } from './sidebar.js?v=0.5.0';
 import { iconElement, iconSvgString, setIcon, setIconLabel, updateIconLabel } from './icons.js?v=1.0.0';
 import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
 import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
-import { closePopover, miniConfirm, openMenu } from './popover.js?v=0.5.1';
+import { closePopover, isPopoverOpen, miniConfirm, openMenu, openPanel } from './popover.js?v=0.5.1';
 import { createMcpPanel } from './mcp-panel.js?v=1.1.0';
 import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, unionSubagentCounts } from './rightbar.js?v=1.2.0';
 import { createChildActivity } from './child-activity.js?v=1.1.0';
@@ -32,7 +32,8 @@ import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.4.0';
 import { adaptiveHistoryDefaults, computeHistoryStartIndex, expandHistoryStartIndex, sliceHistoryMessages } from './history-window.js?v=0.4.0';
 import { parseSlashCommand } from './slash-commands.js?v=0.4.0';
 import { chatToMarkdown } from './transcript-markdown.js?v=0.4.0';
-import { createTurnView, bindTurnId, interruptedMarkerText, stripMarkerGlyph, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.4.26';
+import { createTurnView, bindTurnId, interruptedMarkerText, stripMarkerGlyph, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, outcomeLabel, applyIxSnapshot, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.5.0';
+import { createQuestionDraftStore, draftToAnswers, orderInboxItems, buildInboxPanel, buildQuestionForm, buildApprovalMini, updateInboxList, updateInboxSubmit, routeReceiptVerdict, applyQuestionRoute } from './question-inbox.js?v=1.0.0';
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -48,6 +49,7 @@ const el = {
   goalChip: $('#goal-chip'),
   liveCluster: $('#live-cluster'),
   overviewBtn: $('#overview-btn'),
+  inboxBtn: $('#inbox-btn'),
   goalBar: $('#goal-bar'),
   goalObjective: $('#goal-bar .goal-objective'),
   goalMeta: $('#goal-bar .goal-meta'),
@@ -133,6 +135,36 @@ const drafts = createComposerDraftStore();
 const promptQueue = createPromptQueue();
 /** Chats with a queue dispatch in flight — one POST per chat at a time. */
 const queueDispatching = new Set();
+
+/** ixId → per-question answer drafts, sessionStorage-backed (1.1.33). */
+const qDrafts = createQuestionDraftStore();
+/**
+ * ixId → submit UI state { submitting, error }, shared by the transcript
+ * card and the inbox form so both surfaces tell the same story. The
+ * server is still the truth — this only paints the POST flight.
+ */
+const ixSubmit = new Map();
+/**
+ * chatId → Map<ixId, turnId> of resolves this window has SEEN. A pending
+ * snapshot is server truth for ids we never met — but for an id whose
+ * resolve already landed here, the snapshot row is older wire and must
+ * not resurrect the card (GET-captured-pending → resolved-SSE → late-GET).
+ * A live `interaction` frame lifts the tombstone (same-ID recovery);
+ * turn_done drops the whole chat (turn clear is consistent by delete).
+ */
+const ixTombs = new Map();
+/** ixIds with a POST currently in flight from THIS window (adopt guard). */
+const ixPosting = new Set();
+/** Inbox popup session: open panel, selection, defers, focus return. */
+const inbox = {
+  panel: null,
+  handle: null,
+  selectedId: null,
+  /** ids the user deferred — auto-surface skips them, the badge keeps them. */
+  deferred: new Set(),
+  /** element that held focus when the popup opened (safe focus return). */
+  returnFocus: null,
+};
 /** Chats already focus-warmed — one warm POST per cold period (a release or
  * exit re-arms). The server single-flights anyway; this just saves the HTTP. */
 const warmedChats = new Set();
@@ -756,6 +788,110 @@ const DEFAULT_IX_OPTIONS = [
   { optionId: 'reject-once', name: 'ปฏิเสธ' },
 ];
 
+/** Submit UI state for one interaction, shared by card + inbox. */
+function ixSubmitState(ixId) {
+  return ixSubmit.get(ixId) || { submitting: false, error: null };
+}
+
+/**
+ * Merge one interaction's submit state and repaint every surface showing
+ * it (transcript card when its chat is active, inbox footer when open).
+ * Transitions ride the unit-tested reducer; server errors carry their own
+ * Thai text verbatim.
+ */
+function setIxSubmit(ixId, phase, errorText = null) {
+  const next = ixSubmitTransition(ixSubmitState(ixId), phase);
+  if (phase === 'fail' && errorText) next.error = errorText;
+  ixSubmit.set(ixId, next);
+  const chatId = state.activeId;
+  if (chatId && state.turnViews.get(chatId)?.interactions?.has(ixId)) paintLiveTurn();
+  repaintInboxSubmit(ixId);
+}
+
+/**
+ * Adopt the submit halves of a pending snapshot into the local submit
+ * map. A reconnecting window takes the server's submitting/failed state
+ * instead of staying blocked behind a submitting mirror whose POST died
+ * with the old connection — or missing a failure it never saw. Our own
+ * in-flight POST always wins locally (ixPosting): the snapshot only
+ * backfills what this window is not itself driving. A STALE snapshot
+ * only adopts present states, never clears — it may predate the flight.
+ */
+function adoptIxSubmits(list, authoritative) {
+  for (const ix of Array.isArray(list) ? list : []) {
+    const id = ix?.id == null ? null : String(ix.id);
+    if (!id || ixPosting.has(id)) continue;
+    const st = ix?.submit?.state;
+    if (st === 'submitting') {
+      ixSubmit.set(id, { submitting: true, error: null });
+    } else if (st === 'failed') {
+      ixSubmit.set(id, { submitting: false, error: String(ix.submit?.error || IX_SUBMIT_ERROR_TEXT) });
+    } else if (authoritative) {
+      ixSubmit.delete(id);
+    }
+  }
+}
+
+/** Thai submit-failure text: structured server errors verbatim, else fallback. */
+function submitErrorText(err) {
+  const serverText = err?.payload?.error;
+  if (typeof serverText === 'string' && serverText.trim()) return serverText.slice(0, 300);
+  if (err?.status === 409) return 'มีคำตอบอื่นแล้ว — รอดูสถานะล่าสุด';
+  return IX_SUBMIT_ERROR_TEXT;
+}
+
+/**
+ * The one POST funnel for answers, decisions and cancels — cards and the
+ * inbox share it, so a double-click, a card click racing an inbox submit,
+ * and a retry all funnel through one submitting flag per id. Resolves
+ * true on ack; the resolved paint itself always comes from SSE.
+ */
+/** True when any chat's live model already shows this id resolved. */
+function ixResolvedAnywhere(ixId) {
+  for (const tv of state.turnViews.values()) {
+    if (tv?.interactions?.get(ixId)?.resolved) return true;
+  }
+  return false;
+}
+
+async function submitIx(ixId, body) {
+  if (ixSubmitState(ixId).submitting) return false; // a double-click must not double-post
+  setIxSubmit(ixId, 'start');
+  ixPosting.add(ixId);
+  try {
+    await api(`/api/interactions/${encodeURIComponent(ixId)}`, { method: 'POST', body });
+    // Success paints via the interaction_resolved SSE event, which greys
+    // the card out — nothing to do locally (202-and-SSE-only rule).
+    setIxSubmit(ixId, 'ok');
+    return true;
+  } catch (err) {
+    // A late HTTP failure AFTER the resolved SSE landed (slow error page
+    // racing the fast event) must not reinstall a failed state over a
+    // resolved card — the resolve already cleaned up.
+    if (ixResolvedAnywhere(ixId)) return false;
+    // A failed submit hands the card back: buttons re-enabled plus an
+    // inline error — a dead card leaves the agent blocked on its reply
+    // forever (grok-desktop app.js:8769-8776). Drafts are untouched, so
+    // retry keeps everything typed.
+    setIxSubmit(ixId, 'fail', submitErrorText(err));
+    return false;
+  } finally {
+    ixPosting.delete(ixId);
+  }
+}
+
+/** True when the card can answer with one click (single single-select). */
+function ixHasQuickPick(ix) {
+  const qs = Array.isArray(ix?.questions) ? ix.questions : [];
+  return (
+    ix?.subtype === 'ask' &&
+    qs.length === 1 &&
+    qs[0].mode === 'single' &&
+    !qs[0].freeText &&
+    (ix.options || []).length > 0
+  );
+}
+
 function interactionNode(ix) {
   const card = document.createElement('div');
   card.className = 'ix-card';
@@ -792,51 +928,110 @@ function interactionNode(ix) {
 
   const actions = document.createElement('div');
   actions.className = 'ix-actions';
-  const options = ix.options?.length ? ix.options : DEFAULT_IX_OPTIONS;
-  // A failed submit (stale id → 404, network down) must hand the card back:
-  // buttons re-enabled plus an inline error — a dead card leaves the agent
-  // blocked on its permission reply forever (grok-desktop app.js:8769-8776).
+  const submit = ixSubmitState(ix.id);
   const errLine = document.createElement('div');
   errLine.className = 'ix-card-error';
   errLine.setAttribute('role', 'alert');
-  errLine.hidden = true;
-  let submitState = { submitting: false, error: null };
+  errLine.hidden = !submit.error;
+  errLine.textContent = submit.error || '';
   const paintSubmit = () => {
-    for (const b of actions.querySelectorAll('button')) b.disabled = submitState.submitting;
-    errLine.hidden = !submitState.error;
-    errLine.textContent = submitState.error || '';
+    const cur = ixSubmitState(ix.id);
+    for (const b of actions.querySelectorAll('button')) b.disabled = cur.submitting;
+    errLine.hidden = !cur.error;
+    errLine.textContent = cur.error || '';
+    let spin = actions.querySelector(':scope > .ix-sending');
+    if (cur.submitting && !spin) {
+      spin = document.createElement('span');
+      spin.className = 'ix-sending';
+      const svg = iconElement('refresh', 'ico ico-sm spin');
+      if (svg) spin.append(svg);
+      spin.append(document.createTextNode('กำลังส่ง…'));
+      actions.append(spin);
+    } else if (!cur.submitting && spin) {
+      spin.remove();
+    }
   };
-  // One primary per card (BUG-028): with canonical options both "once" and
-  // "for this session" used to render primary; with AskUserQuestion all N
-  // answers did.
-  const primaryId = ixPrimaryOptionId(options);
-  for (const opt of options) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = opt.optionId === primaryId ? 'btn primary' : 'btn';
-    btn.dataset.optionId = opt.optionId; // the keyboard map (BUG-030) finds buttons by this
-    btn.textContent = opt.name || opt.optionId;
-    btn.addEventListener('click', async () => {
-      if (submitState.submitting) return; // a double-click must not double-post
-      submitState = ixSubmitTransition(submitState, 'start');
-      paintSubmit();
-      try {
-        await api(`/api/interactions/${encodeURIComponent(ix.id)}`, {
-          method: 'POST',
-          body: { optionId: opt.optionId },
-        });
-        // Success paints via the interaction_resolved SSE event, which greys
-        // the card out — nothing to do locally (202-and-SSE-only rule).
-        submitState = ixSubmitTransition(submitState, 'ok');
-      } catch {
-        submitState = ixSubmitTransition(submitState, 'fail');
-        paintSubmit();
-      }
-    });
-    actions.append(btn);
+  if (ix.subtype === 'ask' && !ixHasQuickPick(ix) && !ix.resolved) {
+    // Multi-shape questions answer through the inbox form — the card is
+    // the doorway, not the form.
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'btn primary';
+    const n = Array.isArray(ix.questions) ? ix.questions.length : 0;
+    open.textContent = n > 1 ? `ตอบคำถาม (${n} ข้อ)` : 'ตอบคำถาม';
+    open.addEventListener('click', () => openInbox(ix.id));
+    actions.append(open);
+  } else if (!ix.resolved) {
+    const options = ix.options?.length ? ix.options : DEFAULT_IX_OPTIONS;
+    // One primary per card (BUG-028): with canonical options both "once" and
+    // "for this session" used to render primary; with AskUserQuestion all N
+    // answers did.
+    const primaryId = ixPrimaryOptionId(options);
+    for (const opt of options) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = opt.optionId === primaryId ? 'btn primary' : 'btn';
+      btn.dataset.optionId = opt.optionId; // the keyboard map (BUG-030) finds buttons by this
+      btn.textContent = opt.name || opt.optionId;
+      btn.addEventListener('click', () => {
+        if (ix.subtype === 'ask') {
+          const qid = Array.isArray(ix.questions) && ix.questions.length === 1
+            ? ix.questions[0].id
+            : ix.questionId;
+          void submitIx(ix.id, { answers: [{ questionId: qid, selectedLabel: opt.optionId }] });
+        } else {
+          void submitIx(ix.id, { optionId: opt.optionId });
+        }
+      });
+      actions.append(btn);
+    }
   }
+  if (ix.subtype === 'ask' && !ix.resolved) {
+    // Explicit cancel, separate from answering: the agent continues
+    // without an answer. ACK-safe like every other submit.
+    const skip = document.createElement('button');
+    skip.type = 'button';
+    skip.className = 'btn ghost ix-skip';
+    skip.textContent = 'ข้าม';
+    skip.title = 'ยกเลิกคำถาม — agent จะตอบต่อเองโดยไม่มีคำตอบ';
+    skip.addEventListener('click', () => void submitIx(ix.id, { cancel: true }));
+    actions.append(skip);
+  }
+  paintSubmit();
   card.append(actions, errLine);
+  if (ix.resolved) paintIxResolved(card, ix);
   return card;
+}
+
+/**
+ * Resolved dressing for a card: outcome label + landed answer summary.
+ * Idempotent — repaints (SSE duplicates, resync) must not stack rows.
+ */
+function paintIxResolved(card, ix) {
+  card.classList.add('resolved');
+  for (const b of card.querySelectorAll('button')) b.disabled = true;
+  const label = outcomeLabel(ix.outcome);
+  if (label && !card.querySelector(':scope > .ix-outcome')) {
+    const out = document.createElement('div');
+    out.className = 'ix-outcome';
+    out.textContent = label;
+    card.append(out);
+  }
+  const rows = Array.isArray(ix.answers) ? ix.answers : [];
+  if (rows.length && !card.querySelector(':scope > .ix-answers')) {
+    const box = document.createElement('div');
+    box.className = 'ix-answers';
+    for (const r of rows.slice(0, 8)) {
+      const line = document.createElement('div');
+      line.className = 'ix-answer-row';
+      line.append(document.createElement('span'));
+      line.firstChild.className = 'ix-answer-head';
+      line.firstChild.textContent = r.header || '';
+      line.append(document.createTextNode(` ${r.display || ''}`));
+      box.append(line);
+    }
+    card.append(box);
+  }
 }
 
 // The transcript mounts only the trailing window of a long chat (BUG-052) —
@@ -1019,14 +1214,26 @@ function paintLiveTurn(rebuild = false) {
 
   for (const ix of tv.interactions.values()) {
     const key = `ix:${ix.id}`;
-    const existing = liveChildren.get(key);
+    let existing = liveChildren.get(key);
+    if (!ix.resolved && existing?.classList.contains('resolved')) {
+      // Same-ID recovery: the model flipped back to unresolved (a rejected
+      // answer re-mounted, a snapshot refreshed) but the DOM still wears
+      // the resolved dressing — disabled buttons, chosen suffix, outcome
+      // rows. Rebuild the node or the card answers nothing (1.1.33 P1).
+      existing.remove();
+      liveChildren.delete(key);
+      existing = null;
+    }
     if (ix.resolved) {
-      existing?.classList.add('resolved');
-      existing?.querySelectorAll('button').forEach((b) => (b.disabled = true));
+      if (!existing) {
+        existing = interactionNode(ix);
+        liveChildren.set(key, existing);
+      }
+      paintIxResolved(existing, ix);
       // Mark the picked option (BUG-032): the card stays (muse keeps resolved
       // cards, grok dismounts), so the choice must remain readable on it.
       const chosen = ix.optionId
-        ? existing?.querySelector(`.ix-actions button[data-option-id="${CSS.escape(ix.optionId)}"]`)
+        ? existing.querySelector(`.ix-actions button[data-option-id="${CSS.escape(ix.optionId)}"]`)
         : null;
       if (chosen && !chosen.classList.contains('chosen')) {
         chosen.classList.add('chosen');
@@ -1039,6 +1246,31 @@ function paintLiveTurn(rebuild = false) {
       continue;
     }
     if (!existing) liveChildren.set(key, interactionNode(ix));
+    else {
+      // Submit flights repaint through here: keep the live buttons and
+      // the error line in sync without rebuilding the node.
+      const cur = ixSubmitState(ix.id);
+      for (const b of existing.querySelectorAll('.ix-actions button')) b.disabled = cur.submitting;
+      const errLine = existing.querySelector(':scope > .ix-card-error');
+      if (errLine) {
+        errLine.hidden = !cur.error;
+        errLine.textContent = cur.error || '';
+      }
+      let spin = existing.querySelector(':scope .ix-actions > .ix-sending');
+      if (cur.submitting && !spin) {
+        const actions = existing.querySelector(':scope > .ix-actions');
+        if (actions) {
+          spin = document.createElement('span');
+          spin.className = 'ix-sending';
+          const svg = iconElement('refresh', 'ico ico-sm spin');
+          if (svg) spin.append(svg);
+          spin.append(document.createTextNode('กำลังส่ง…'));
+          actions.append(spin);
+        }
+      } else if (!cur.submitting && spin) {
+        spin.remove();
+      }
+    }
   }
 
   // The progress group owns the tool + plan nodes; its header carries the
@@ -1475,6 +1707,30 @@ function hideAuthGate() {
  * Either may fail silently; the card in the transcript is the fallback that
  * never fails.
  */
+/** Banner text: the QUESTION first, plumbing last — never bare AskUserQuestion. */
+function ixNotifyDetail(ix) {
+  const qs = Array.isArray(ix?.questions) ? ix.questions : [];
+  const first = qs[0]?.question || qs[0]?.header || '';
+  return String(first || ix?.summary || ix?.body || ix?.toolName || 'ตอบหน่อย')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
+/**
+ * Native Linux shell bridge (window.webkit.messageHandlers.museNotify),
+ * or null outside the GTK shell. Structured payloads only — chatId/ixId
+ * ride as data for click routing, never interpolated into commands.
+ */
+function nativeNotifyBridge() {
+  try {
+    const h = window.webkit?.messageHandlers?.museNotify;
+    return h && typeof h.postMessage === 'function' ? h : null;
+  } catch {
+    return null;
+  }
+}
+
 function notifyAgentQuestion(ix, chatId) {
   const chat = chatId === state.activeId
     ? state.chat
@@ -1485,19 +1741,391 @@ function notifyAgentQuestion(ix, chatId) {
       : ix?.subtype === 'plan'
         ? 'Muse รอตรวจแผน'
         : 'Muse รอการอนุญาต';
-  const detail = String(ix?.toolName || ix?.summary || ix?.body || 'ตอบหน่อย')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 160);
-  const body = `${chat?.title || 'แชท'} — ${detail}`;
+  const body = `${chat?.title || 'แชท'} — ${ixNotifyDetail(ix)}`;
+  let channel = 'inapp';
+  // The host is the notification source on Linux (hostNotified rides the
+  // payload): a watching page must NOT banner again — one question, one
+  // banner, no host+renderer double. The inbox + card stay guaranteed.
+  if (ix?.hostNotified) channel = 'host';
+  // 1. Native Linux banner with click routing (only when the host did NOT
+  // take it — old hosts, or the /api/notify mac path below). postMessage
+  // success means the bridge ACCEPTED the payload (it throws when the
+  // handler is missing) — desktop delivery itself is unconfirmed, and
+  // the host log records this channel as posted, not proven.
+  const bridge = nativeNotifyBridge();
+  if (channel === 'inapp' && bridge && ix?.id) {
+    try {
+      bridge.postMessage({ op: 'show', id: `q-${ix.id}`, title, body, chatId, ixId: String(ix.id) });
+      channel = 'native';
+    } catch {
+      /* fall through to the browser/host paths */
+    }
+  }
+  // 2. Web Notification (real browsers with a grant).
+  if (channel === 'inapp') {
+    try {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        new Notification(title, { body, tag: String(ix?.id || chatId) });
+        channel = 'web';
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
+  // 3. Host banner (macOS osascript; delivered:false elsewhere). The POST
+  // also reports which channel actually fired, for honest bookkeeping.
+  if (ix) ix.notifyChannel = channel;
+  void api('/api/notify', {
+    method: 'POST',
+    body: { title, body, channel, interactionId: ix?.id || null, chatId },
+  }).then((r) => {
+    if (r?.delivered && ix) ix.notifyChannel = 'host';
+  }).catch(() => {});
+}
+
+/** Withdraw the native banner for a settled question (best-effort). */
+function withdrawNativeQuestion(ixId) {
+  const bridge = nativeNotifyBridge();
+  if (!bridge || !ixId) return;
   try {
-    if ('Notification' in window && Notification.permission === 'granted') {
-      new Notification(title, { body, tag: String(ix?.id || chatId) });
+    bridge.postMessage({ op: 'withdraw', id: `q-${ixId}`, ixId: String(ixId) });
+  } catch {
+    /* best-effort */
+  }
+}
+
+// ------------------------------------------------- question inbox popup
+// Non-modal anchored panel over the header badge: every unanswered
+// interaction queued (asks first, oldest first), the selected one as a
+// full form. Auto-surfaces once per question WITHOUT stealing focus;
+// Esc/outside-click defers (the badge keeps the question one click away).
+
+/** Every unresolved interaction across chats, queue-ordered, chatId attached. */
+function inboxItems() {
+  const out = [];
+  for (const [chatId, tv] of state.turnViews) {
+    for (const ix of tv.interactions?.values?.() || []) {
+      if (!ix || ix.resolved) continue;
+      out.push({ ...ix, chatId });
+    }
+  }
+  return orderInboxItems(out);
+}
+
+function chatTitleOf(chatId) {
+  if (chatId === state.activeId && state.chat) return state.chat.title || 'แชท';
+  return state.chats.find((c) => c.id === chatId)?.title || 'แชท';
+}
+
+/** ids the renderer already engaged this window (POST once per id). */
+const engagedSent = new Set();
+/** ids with an engage POST in flight (dedupes, not a success mark). */
+const engagedFlying = new Set();
+
+/**
+ * Tell the host the user is working a timed prompt (disarms countdown).
+ * Engaged marks AFTER a successful POST — a failed POST must allow a
+ * retry from the next real signal, and rendering a form is NOT a signal:
+ * auto-opening the inbox must never disarm a countdown the user never saw.
+ * Call only from real focus/input/pick/explicit-open handlers.
+ */
+function engageIx(ixId) {
+  if (!ixId || engagedSent.has(ixId) || engagedFlying.has(ixId)) return;
+  engagedFlying.add(ixId);
+  void api(`/api/interactions/${encodeURIComponent(ixId)}/engaged`, { method: 'POST' }).then(
+    () => {
+      engagedFlying.delete(ixId);
+      engagedSent.add(ixId);
+    },
+    () => {
+      engagedFlying.delete(ixId); // failed: the next real signal retries
+    },
+  );
+}
+
+/** Record a seen resolve so a late snapshot cannot resurrect the card. */
+function tombIx(chatId, ixId, turnId) {
+  if (!chatId || ixId == null) return;
+  if (!ixTombs.has(chatId)) ixTombs.set(chatId, new Map());
+  ixTombs.get(chatId).set(String(ixId), turnId ?? null);
+}
+
+function inboxCbs() {
+  return {
+    onSelect: (id) => {
+      inbox.selectedId = id;
+      engageIx(id); // explicit click on a queued item IS engagement
+      renderInboxForm();
+    },
+    onDraft: (ixId, qid, patch) => {
+      qDrafts.setQuestion(ixId, qid, patch);
+      // Footer-only refresh (completeness count) — inputs keep focus.
+      const item = inboxItems().find((i) => i.id === ixId);
+      if (inbox.panel && item) {
+        updateInboxSubmit(inbox.panel, item, qDrafts.get(ixId), ixSubmitState(ixId), inbox.cbs);
+      }
+    },
+    onSubmit: (ixId) => {
+      const item = inboxItems().find((i) => i.id === ixId);
+      if (!item) return;
+      const collected = draftToAnswers(item.questions || [], qDrafts.get(ixId));
+      if (!collected.ok) {
+        setIxSubmit(ixId, 'fail', collected.error);
+        return;
+      }
+      void submitIx(ixId, { answers: collected.answers });
+    },
+    onCancel: (ixId) => {
+      void submitIx(ixId, { cancel: true });
+    },
+    onApprove: (ixId, optionId) => {
+      void submitIx(ixId, { optionId });
+    },
+    onEngage: (ixId) => engageIx(ixId),
+    onClose: () => closeInbox(),
+  };
+}
+
+/** (Re)build the selected form wholesale — selection changes only. */
+function renderInboxForm() {
+  if (!inbox.panel) return;
+  const items = inboxItems();
+  let selected = items.find((i) => i.id === inbox.selectedId) || null;
+  if (!selected && items.length) {
+    selected = items[0];
+    inbox.selectedId = selected.id;
+  }
+  // No engage here: rendering is not engagement (see engageIx).
+  const formWrap = inbox.panel.querySelector(':scope > .qinbox-body > .qinbox-form');
+  if (!formWrap) return;
+  formWrap.replaceChildren();
+  if (!selected) {
+    const empty = document.createElement('div');
+    empty.className = 'qinbox-empty';
+    empty.textContent = 'ไม่มีคำถามค้างอยู่ — agent ทำงานต่อได้เลย';
+    formWrap.append(empty);
+  } else if (selected.subtype === 'ask') {
+    formWrap.append(buildQuestionForm(selected, qDrafts.get(selected.id), ixSubmitState(selected.id), inbox.cbs));
+  } else {
+    formWrap.append(buildApprovalMini(selected, ixSubmitState(selected.id), inbox.cbs));
+  }
+  updateInboxList(inbox.panel, items, inbox.selectedId, chatTitleOf, (id) => inbox.cbs.onSelect(id));
+}
+
+/**
+ * Open the inbox, optionally on one interaction. Records the focused
+ * element for safe return — and deliberately never calls focus() itself,
+ * so an auto-surface preserves the composer's focus, caret and draft.
+ */
+function openInbox(ixId = null, { userOpened = false } = {}) {
+  if (userOpened) closePopover(); // a stale auto-surface yields to the explicit open
+  const prevFocus = document.activeElement;
+  inbox.returnFocus = prevFocus && prevFocus !== document.body ? prevFocus : null;
+  inbox.userOpened = userOpened || inbox.userOpened;
+  const items = inboxItems();
+  if (ixId && items.some((i) => i.id === ixId)) inbox.selectedId = ixId;
+  else if (!items.some((i) => i.id === inbox.selectedId)) inbox.selectedId = items[0]?.id || null;
+  inbox.deferred.delete(inbox.selectedId);
+  inbox.cbs = inboxCbs();
+  const selected = items.find((i) => i.id === inbox.selectedId) || null;
+  // An explicit bell-click open engages the shown item; an auto-surface
+  // does not (the user may never look at it).
+  if (selected && userOpened) engageIx(selected.id);
+  inbox.panel = buildInboxPanel({
+    items,
+    selected,
+    values: selected ? qDrafts.get(selected.id) : {},
+    submit: selected ? ixSubmitState(selected.id) : null,
+    chatTitleOf,
+    cbs: inbox.cbs,
+  });
+  inbox.handle = openPanel(el.inboxBtn, inbox.panel, { onClose: onInboxClosed });
+  // Positive route receipt: the shell retains the exact tap route until
+  // the page confirms application. A locally ABSENT id is not proof of
+  // gone — a failed boot GET or chat fetch also yields [] — so moot
+  // needs a seen resolve (tombstone) or a successful fresh server
+  // lookup. When the fresh lookup FINDS the row, it merges under the
+  // revision/tombstone guards and the exact form opens — that is what
+  // lets a retried tap (or the bounded in-verdict retry) recover after
+  // an outage instead of retaining forever. Transport failure retains
+  // the route, quietly after bounded retries; only a positive
+  // applied/moot clears the native queue. Identity-guarded throughout:
+  // a replaced route is never confirmed — or painted — by its
+  // predecessor's lookup. Never throws (shell-bridge optional).
+  try {
+    const pr = window.__musePendingRoute;
+    if (pr?.ixId && window.__museHydrated) {
+      // Revision capture BEFORE the fetch: SSE landing mid-lookup wins
+      // over the snapshot row at merge time (same guard as selectChat).
+      const revBefore = pr.chatId ? wireRevs.revOf(pr.chatId, 'ix') : null;
+      let foundRow = null;
+      void routeReceiptVerdict({
+        selectedId: inbox.selectedId,
+        route: pr,
+        hasTombstone: ixTombs.get(pr.chatId)?.has(pr.ixId) ?? false,
+        lookupAbsent: async () => {
+          const { interactions } = await api('/api/interactions');
+          if (!Array.isArray(interactions)) throw new Error('bad pending snapshot');
+          foundRow = interactions.find((i) => String(i?.id) === pr.ixId) || null;
+          return !foundRow;
+        },
+      }).then((verdict) => {
+        if (window.__musePendingRoute !== pr) return; // a newer tap owns the queue now
+        if (verdict === 'applied' || verdict === 'moot') {
+          window.__musePendingRoute = null;
+          nativeNotifyBridge()?.postMessage({ op: 'routed', chatId: pr.chatId, ixId: pr.ixId });
+        } else if (verdict === 'retain' && foundRow) {
+          // Recovery: fresh server truth PROVES the question pending.
+          // Merge it, paint the exact form, and receipt only the paint.
+          if (mergeRoutedRow(pr, foundRow, revBefore)) {
+            openInbox(pr.ixId, { userOpened: true });
+            if (inbox.selectedId === pr.ixId && window.__musePendingRoute === pr) {
+              window.__musePendingRoute = null;
+              nativeNotifyBridge()?.postMessage({ op: 'routed', chatId: pr.chatId, ixId: pr.ixId });
+            }
+          } else {
+            // The merge refused the row: recount before confirming — moot
+            // only with a seen resolve (tombstone) or a locally resolved
+            // card. Anything else (malformed input, never observed)
+            // retains the route instead of discarding it.
+            const cid = foundRow.chatId || pr.chatId;
+            const local = state.turnViews.get(cid)?.interactions?.get(pr.ixId);
+            const moot = (cid && ixTombs.get(cid)?.has(pr.ixId)) || local?.resolved === true;
+            if (moot) {
+              window.__musePendingRoute = null;
+              nativeNotifyBridge()?.postMessage({ op: 'routed', chatId: pr.chatId, ixId: pr.ixId });
+            }
+          }
+        }
+        // retain without a row (transport failure): the shell queue
+        // survives for a later re-flush. Never pretend applied.
+      }, () => {
+        /* lookup exhausted — the shell queue survives for a later re-flush */
+      });
     }
   } catch {
-    // The host banner below is the real path on macOS; this is best-effort.
+    /* receipt failure keeps the shell queue — a re-flush re-applies */
   }
-  void api('/api/notify', { method: 'POST', body: { title, body } }).catch(() => {});
+}
+
+/**
+ * Merge one server-proven pending row from a route lookup into the live
+ * model, under the same guards as every other snapshot path: the
+ * revision capture (SSE mid-fetch wins) and the chat tombstones (a row
+ * for a turn we saw resolve is stale wire). Returns true when the row
+ * is locally present and unresolved afterwards — i.e. the exact form
+ * CAN paint. False means tombstoned-same-turn: authoritatively moot.
+ */
+function mergeRoutedRow(pr, row, revBefore) {
+  const chatId = row?.chatId || pr.chatId;
+  if (!chatId || !row || row.id == null) return false;
+  const id = String(row.id);
+  const tv = turnView(chatId, true);
+  if (!tv.turnId) tv.turnId = 'pending';
+  const authoritative = revBefore == null || !wireRevs.stale(chatId, 'ix', revBefore);
+  const merged = applyIxSnapshot(tv.interactions, [row], { authoritative, tombstones: ixTombs.get(chatId) || null });
+  adoptIxSubmits([row], authoritative);
+  if (merged.added.length || merged.updated.length) {
+    tv.rev = (tv.rev || 0) + 1;
+    paintInboxBadge();
+    repaintInboxQueue();
+    if (chatId === state.activeId) paintLiveTurn();
+  }
+  if (authoritative) wireRevs.bump(chatId, 'ix');
+  const local = tv.interactions.get(id);
+  return !!local && !local.resolved;
+}
+
+/** Auto-surface once per question — deferred ids stay on the badge. */
+function autoSurfaceInbox(ix, chatId) {
+  if (!ix || ix.resolved || inbox.deferred.has(ix.id)) return;
+  if (inbox.panel) return; // already up — the queue repaint below lists it
+  // openPanel is single-slot: auto-surfacing now would CLOSE an overview,
+  // config menu or confirm the user is reading. Badge + banner carry it.
+  if (isPopoverOpen()) return;
+  inbox.userOpened = false;
+  openInbox(ix.id);
+}
+
+/** Dismissal defers: the question stays pending, the badge keeps it. */
+function closeInbox() {
+  if (inbox.selectedId) inbox.deferred.add(inbox.selectedId);
+  closePopover(); // → onInboxClosed → safe focus return
+}
+
+function onInboxClosed() {
+  inbox.panel = null;
+  inbox.handle = null;
+  inbox.userOpened = false;
+  const target = inbox.returnFocus;
+  inbox.returnFocus = null;
+  // Restore focus ONLY when it went nowhere (Esc/programmatic close) —
+  // an outside mousedown already moved it where the user pointed.
+  const active = document.activeElement;
+  if (target && target.isConnected && (!active || active === document.body)) {
+    try {
+      target.focus({ preventScroll: true });
+    } catch {
+      try {
+        target.focus();
+      } catch {
+        /* gone */
+      }
+    }
+  }
+}
+
+/** A settle resolved one queue entry: advance, empty out, or auto-close. */
+function onInboxResolved(ixId) {
+  inbox.deferred.delete(ixId);
+  engagedSent.delete(ixId);
+  if (!inbox.panel) return;
+  const items = inboxItems();
+  if (!items.length) {
+    if (inbox.userOpened) {
+      inbox.selectedId = null;
+      renderInboxForm();
+    } else {
+      closePopover(); // auto-surfaced and nothing left — vanish silently
+    }
+    return;
+  }
+  if (!items.some((i) => i.id === inbox.selectedId)) {
+    inbox.selectedId = items[0].id;
+    renderInboxForm();
+  } else {
+    repaintInboxQueue();
+  }
+}
+
+/** Repaint the queue list only (membership changed, form untouched). */
+function repaintInboxQueue() {
+  if (!inbox.panel) return;
+  updateInboxList(inbox.panel, inboxItems(), inbox.selectedId, chatTitleOf, (id) => inbox.cbs.onSelect(id));
+}
+
+/** Repaint the open form's footer for one id (submit flights, drafts). */
+function repaintInboxSubmit(ixId) {
+  if (!inbox.panel || inbox.selectedId !== ixId) return;
+  const item = inboxItems().find((i) => i.id === ixId);
+  if (!item) return;
+  updateInboxSubmit(inbox.panel, item, qDrafts.get(ixId), ixSubmitState(ixId), inbox.cbs);
+}
+
+/** Header badge: pending count, hidden when the queue is empty. */
+function paintInboxBadge() {
+  const btn = el.inboxBtn;
+  if (!btn) return;
+  const items = inboxItems();
+  const n = items.length;
+  btn.hidden = n === 0;
+  btn.classList.toggle('has-pending', n > 0);
+  updateIconLabel(btn, n > 9 ? '9+' : String(n));
+  const asks = items.filter((i) => i.subtype === 'ask').length;
+  btn.title = asks === n
+    ? `คำถามรอคำตอบ ${n} ข้อ — คลิกเพื่อเปิด`
+    : `รอคำตอบ ${n} รายการ (คำถาม ${asks}) — คลิกเพื่อเปิด`;
+  btn.setAttribute('aria-label', btn.title);
 }
 
 function onEvent(type, data) {
@@ -1672,9 +2300,28 @@ function onEvent(type, data) {
       // Replays (resync, second window) re-deliver the same card — notify
       // only the first time an id is seen, or one question spams N banners.
       const isNew = !tv.interactions.has(data.id) && !data.resolved;
+      // A live mount lifts any tombstone: the id is askable again, whether
+      // this is a first ask or a same-ID recovery after a rejection.
+      ixTombs.get(chatId)?.delete(String(data.id));
       tv.interactions.set(data.id, data);
       tv.rev = (tv.rev || 0) + 1;
-      if (isNew) notifyAgentQuestion(data, chatId);
+      wireRevs.bump(chatId, 'ix');
+      if (isNew) {
+        notifyAgentQuestion(data, chatId);
+        // Badge BEFORE the popup: the inbox anchors to the badge button,
+        // and a still-hidden anchor measures a zero rect — the first
+        // auto-popup landed at x8,y6 over the sidebar. paintInboxBadge is
+        // synchronous DOM, so the anchor has a real rect by open time.
+        paintInboxBadge();
+        autoSurfaceInbox(data, chatId);
+      } else {
+        // Same-ID recovery (a rejected answer re-mounted): the model is
+        // answerable again — drop any stale submit error, keep the draft.
+        ixSubmit.delete(data.id);
+        repaintInboxSubmit(data.id);
+      }
+      paintInboxBadge();
+      repaintInboxQueue();
       if (chatId === state.activeId) {
         paintLiveTurn();
         updateRunningChrome(); // the status verb flips to รอการอนุญาต…
@@ -1686,16 +2333,48 @@ function onEvent(type, data) {
       return;
     }
 
+    case 'interaction_state': {
+      // Transient POST-flight mirror (submitting/failed) — the card and the
+      // inbox footer share it, so a submit from any window paints in all.
+      if (data.state === 'submitting') {
+        ixSubmit.set(data.id, { submitting: true, error: null });
+      } else if (data.state === 'failed') {
+        ixSubmit.set(data.id, { submitting: false, error: String(data.error || IX_SUBMIT_ERROR_TEXT) });
+      } else {
+        return;
+      }
+      const tvs = state.turnViews.get(chatId);
+      if (tvs?.interactions?.has(data.id)) tvs.rev = (tvs.rev || 0) + 1;
+      if (chatId === state.activeId) paintLiveTurn();
+      repaintInboxSubmit(data.id);
+      return;
+    }
+
     case 'interaction_resolved': {
       const tv = state.turnViews.get(chatId);
       const ix = tv?.interactions.get(data.id);
+      // Tombstone even unseen ids: the resolve is newer than any snapshot
+      // row for this turn still in flight (late-GET resurrection guard).
+      tombIx(chatId, data.id, data.turnId ?? ix?.turnId ?? null);
       if (ix) {
         ix.resolved = true;
         // The picked option survives on the card — a resolved card with no
         // record of the choice reads as unanswered (BUG-032).
         if (data.optionId != null) ix.optionId = data.optionId;
+        if (data.outcome != null) ix.outcome = data.outcome;
+        if (data.answers != null) ix.answers = data.answers;
+        if (data.reason != null) ix.reason = data.reason;
+        if (data.decidedByCommandId != null) ix.decidedByCommandId = data.decidedByCommandId;
         tv.rev = (tv.rev || 0) + 1;
       }
+      wireRevs.bump(chatId, 'ix');
+      // Landed means the draft served its purpose; a rejection never
+      // reaches this event, so drafts are never dropped early.
+      qDrafts.clear(data.id);
+      ixSubmit.delete(data.id);
+      withdrawNativeQuestion(data.id);
+      paintInboxBadge();
+      onInboxResolved(data.id);
       if (chatId === state.activeId) {
         paintLiveTurn();
         updateRunningChrome(); // answered card: the verb drops รอการอนุญาต…
@@ -1711,6 +2390,7 @@ function onEvent(type, data) {
       // final chunks would stay unrendered if the transcript reload fails.
       if (chatId === state.activeId) liveMd.flush();
       state.turnViews.delete(chatId);
+      ixTombs.delete(chatId); // turn clear drops models and tombs together
       rightbar.applyTurn(chatId, null);
       if (chatId === state.activeId) {
         // Dereference only the ACTIVE chat's live nodes. Nulling them for a
@@ -1874,7 +2554,7 @@ function connectStream() {
   const source = new EventSource(`/api/events?clientId=${encodeURIComponent(state.clientId)}`);
   const types = [
     'hello', 'resync', 'turn_started', 'message_delta', 'thought_delta', 'tool_call', 'tool_call_update',
-    'plan', 'interaction', 'interaction_resolved', 'turn_done', 'turn_error', 'agent_status',
+    'plan', 'interaction', 'interaction_state', 'interaction_resolved', 'turn_done', 'turn_error', 'agent_status',
     'agent_ready', 'agent_exit', 'agent_released', 'agent_error', 'agent_stderr', 'auth_required',
     'mode_changed', 'load_miss', 'chat_created', 'chat_updated', 'chat_removed', 'chat_moved',
     'group_created', 'group_updated', 'group_removed', 'groups_reordered', 'group_selected',
@@ -1980,13 +2660,32 @@ async function resyncFromServer() {
   for (const chat of state.chats) {
     if (!chat.running) state.turnViews.delete(chat.id);
   }
+  // Pending cards merge under the same revision guard as goal/ctx: an
+  // SSE resolve landing mid-fetch is newer than this snapshot, and a
+  // blind set() would resurrect the answered card (or strand a submit).
+  const revIx = new Map();
+  for (const c of state.chats) revIx.set(c.id, wireRevs.revOf(c.id, 'ix'));
   const { interactions } = await api('/api/interactions').catch(() => ({ interactions: [] }));
   if (!fresh()) return;
+  const byChat = new Map();
   for (const ix of interactions || []) {
-    const tv = turnView(ix.chatId, true);
-    if (!tv.turnId) tv.turnId = 'pending';
-    tv.interactions.set(ix.id, ix);
+    if (!ix?.chatId) continue;
+    if (!byChat.has(ix.chatId)) byChat.set(ix.chatId, []);
+    byChat.get(ix.chatId).push(ix);
   }
+  for (const c of state.chats) {
+    const tv = turnView(c.id, true);
+    if (!tv.turnId) tv.turnId = 'pending';
+    const authoritative = !wireRevs.stale(c.id, 'ix', revIx.get(c.id));
+    const rows = byChat.get(c.id) || [];
+    const merged = applyIxSnapshot(tv.interactions, rows, { authoritative, tombstones: ixTombs.get(c.id) || null });
+    adoptIxSubmits(rows, authoritative);
+    if (merged.added.length || merged.updated.length || merged.removed.length) {
+      tv.rev = (tv.rev || 0) + 1;
+    }
+    if (authoritative) wireRevs.bump(c.id, 'ix');
+  }
+  paintInboxBadge();
   if (state.activeId) await selectChat(state.activeId, { keepScroll: true });
   if (!fresh()) return;
   updateRunningChrome();
@@ -2778,9 +3477,15 @@ async function hydrateTurnView(chatId) {
  * newer select started must not paint its stale transcript over the new
  * chat (rapid switches, turn_done refetch racing a click). */
 let selectSeq = 0;
+/** chatId → wireRevs 'ix' captured at select head (snapshot guard). */
+const navIxRev = new Map();
 
 async function selectChat(chatId, { keepScroll = false } = {}) {
   const prevId = state.activeId;
+  // Capture the ix revision BEFORE the chat GET below: the pending-cards
+  // merge compares against this, so SSE that lands mid-fetch wins over
+  // the older snapshot (revision guard, like goal/ctx).
+  navIxRev.set(chatId, wireRevs.revOf(chatId, 'ix'));
   const mySeq = ++selectSeq;
   /** False once a newer select started or the active chat moved on. */
   const fresh = () => mySeq === selectSeq && state.activeId === chatId;
@@ -2850,13 +3555,27 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
   setAgentState(chat.live ? chat.status : 'cold');
   updateConfigPills();
 
-  // Rehydrate pending approvals: one may have arrived while this chat was off
+  // Rehydrate pending cards: one may have arrived while this chat was off
   // screen, and it blocks the agent until answered from *somewhere*.
-  if (chat.pendingInteractions?.length) {
+  // Guarded by the fetch-start revision (captured at select head): SSE
+  // that landed mid-fetch is newer than this snapshot, so a stale fetch
+  // backfills unknown ids only, while a fresh one is authoritative
+  // (adds, refreshes unresolved, drops absent unresolved cards).
+  {
+    const list = Array.isArray(chat.pendingInteractions) ? chat.pendingInteractions : [];
     const tv = turnView(chatId, true);
     if (!tv.turnId) tv.turnId = chat.turnId || 'pending';
-    for (const ix of chat.pendingInteractions) tv.interactions.set(ix.id, ix);
+    const captured = navIxRev.get(chatId);
+    const authoritative = captured == null || !wireRevs.stale(chatId, 'ix', captured);
+    const merged = applyIxSnapshot(tv.interactions, list, { authoritative, tombstones: ixTombs.get(chatId) || null });
+    adoptIxSubmits(list, authoritative);
+    if (merged.added.length || merged.updated.length || merged.removed.length) {
+      tv.rev = (tv.rev || 0) + 1;
+    }
+    if (authoritative) wireRevs.bump(chatId, 'ix');
+    navIxRev.delete(chatId);
   }
+  paintInboxBadge();
 
   // Mid-turn switch/reload: seed the live view from the server's snapshot.
   // renderTranscript() below then paints partial text + tool rows + plan, and
@@ -3397,20 +4116,30 @@ function wireUi() {
   });
 
   document.addEventListener('keydown', (ev) => {
-    // Interaction-card shortcuts (BUG-030): 1..9 picks an option, Esc rejects
-    // — scoped to the active chat's unanswered card, and never while any
-    // input/textarea (composer, sidebar renames) is focused.
+    // While the inbox is open it owns numbers/Escape: the popup may show a
+    // BACKGROUND chat's form, so answering the active card's option here
+    // would answer the wrong chat. (Esc itself is captured by the popover
+    // layer, which defers; number keys inside form fields stay textual.)
+    if (inbox.panel) return;
+    // Interaction-card shortcuts (BUG-030): 1..9 picks an option — scoped
+    // to the active chat's unanswered card, and never while a field
+    // (composer, inbox form, sidebar renames, selects) is focused. Esc is
+    // deliberately NOT a card shortcut (bare-Esc-reject used to answer
+    // cards the user never meant to touch): it falls through to the
+    // stop-turn confirm below, and defers while the inbox is open.
     const tv = state.activeId ? state.turnViews.get(state.activeId) : null;
     const openIx = tv ? [...tv.interactions.values()].find((ix) => !ix.resolved) : null;
-    const typingTag = (document.activeElement?.tagName || '').toLowerCase();
-    if (openIx && typingTag !== 'textarea' && typingTag !== 'input' && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
+    const activeEl = document.activeElement;
+    const typingTag = (activeEl?.tagName || '').toLowerCase();
+    const inField = typingTag === 'textarea' || typingTag === 'input' || typingTag === 'select' || !!activeEl?.isContentEditable;
+    if (openIx && !inField && !ev.metaKey && !ev.ctrlKey && !ev.altKey && ev.key !== 'Escape') {
       const optionId = ixKeyToOptionId(openIx.options?.length ? openIx.options : DEFAULT_IX_OPTIONS, ev.key);
       if (optionId) {
         const card = liveChildren.get(`ix:${openIx.id}`);
         const btn = card
           ? [...card.querySelectorAll('.ix-actions button')].find((b) => b.dataset.optionId === optionId)
           : null;
-        if (btn) {
+        if (btn && !btn.disabled) {
           ev.preventDefault();
           btn.click(); // same path as a mouse click — one submit funnel
           return;
@@ -3529,6 +4258,46 @@ function wireUi() {
   el.tasksChip.addEventListener('click', () => openThreadOverview(el.tasksChip));
   el.goalChip.addEventListener('click', () => openThreadOverview(el.goalChip));
   if (el.overviewBtn) el.overviewBtn.addEventListener('click', () => openThreadOverview(el.overviewBtn));
+  // Inbox badge: toggle the popup. An open panel closes (deferring the
+  // selection); a closed one opens explicitly on the first queued item.
+  if (el.inboxBtn) {
+    el.inboxBtn.addEventListener('click', () => {
+      if (inbox.panel) closeInbox();
+      else openInbox(null, { userOpened: true });
+    });
+  }
+  // Native-shell click routing: a banner tap lands on the exact chat and
+  // question (the GTK shell evaluates this with the ids from the typed
+  // GAction parameter). Same-origin only — the shell checks the page URI
+  // before it ever calls in.
+  window.__museQuestionRoute = (chatId, ixId) => {
+    try {
+      // The shell holds this exact route until openInbox posts the
+      // receipt — a newer tap replaces it (latest wins, same as the
+      // shell queue), and a reload re-flushes whatever is retained.
+      if (!ixId) {
+        openInbox(null, { userOpened: true });
+        return;
+      }
+      const pr = { chatId: String(chatId || ''), ixId: String(ixId) };
+      window.__musePendingRoute = pr;
+      inbox.deferred.delete(pr.ixId);
+      // Hydration is keyed off loaded state, never activeId: a failed
+      // first fetch leaves activeId SET with nothing loaded, and a retry
+      // that skipped selectChat on activeId-match would stay empty
+      // forever despite a healthy server.
+      void applyQuestionRoute({
+        route: pr,
+        loadedChatId: state.chat?.id ?? null,
+        ixPresent: inboxItems().some((i) => i.id === pr.ixId),
+        selectChatFn: (cid) => selectChat(cid || state.activeId, { keepScroll: true }),
+        openFn: (id) => openInbox(id, { userOpened: true }),
+        isCurrent: () => window.__musePendingRoute === pr,
+      });
+    } catch {
+      /* a routing failure must never break the shell action */
+    }
+  };
   if (el.goalBarBtn) el.goalBarBtn.addEventListener('click', sendGoalBarCommand);
   el.rightbarToggle?.addEventListener('click', () => rightbar.toggle());
 
@@ -3601,16 +4370,38 @@ async function boot() {
   await refreshChats();
 
   // Any approval still waiting from a previous UI session blocks its agent.
+  // The stream connected above, so SSE may have beaten this GET — merge
+  // backfill-only and let the wire stay authoritative (boot never notifies:
+  // the badge + cards carry recovered questions, not a banner replay).
   const { interactions } = await api('/api/interactions').catch(() => ({ interactions: [] }));
+  const bootByChat = new Map();
   for (const ix of interactions || []) {
-    const tv = turnView(ix.chatId, true);
-    if (!tv.turnId) tv.turnId = 'pending';
-    tv.interactions.set(ix.id, ix);
+    if (!ix?.chatId) continue;
+    if (!bootByChat.has(ix.chatId)) bootByChat.set(ix.chatId, []);
+    bootByChat.get(ix.chatId).push(ix);
   }
+  for (const [chatId, list] of bootByChat) {
+    const tv = turnView(chatId, true);
+    if (!tv.turnId) tv.turnId = 'pending';
+    applyIxSnapshot(tv.interactions, list, { authoritative: false, tombstones: ixTombs.get(chatId) || null });
+    adoptIxSubmits(list, false);
+  }
+  paintInboxBadge();
 
   await selectChat(state.chats[0]?.id ?? null);
   if (!state.chats.length) await newChat({ reuseEmpty: true });
   el.prompt.focus();
+  // Hydration done (chats, pendings, active transcript): tell the native
+  // shell it may deliver queued banner-tap routes. load-finished is NOT
+  // enough — the route hook exists before these fetches land, and a tap
+  // applied mid-hydration finds no chats/pendings and loses the route.
+  // A reload re-boots and re-announces, so retained routes re-flush.
+  window.__museHydrated = true;
+  try {
+    nativeNotifyBridge()?.postMessage({ op: 'ready' });
+  } catch {
+    /* no shell bridge — browsers need no handshake */
+  }
 }
 
 // A boot that throws (host hiccup mid-refreshChats, etc.) must still surface

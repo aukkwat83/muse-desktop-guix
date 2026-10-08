@@ -301,6 +301,95 @@ export function confirmedStopProceeds({ escChatId, activeChatId, running }) {
 }
 
 /**
+ * Thai label for an interaction outcome — what the resolved card and the
+ * inbox show instead of the wire string. Unknown outcomes pass through so
+ * a new agent state is never blank (same rule as toolStatusLabel).
+ */
+export function outcomeLabel(outcome) {
+  const o = String(outcome || '');
+  if (o === 'answered') return 'ตอบแล้ว';
+  if (o === 'decided') return 'ตัดสินใจแล้ว';
+  if (o === 'cancelled') return 'ยกเลิกแล้ว';
+  if (o === 'timedOut') return 'หมดเวลา';
+  if (o === 'interrupted') return 'ถูกขัดจังหวะ';
+  if (o === 'clarified') return 'ชี้แจงแล้ว';
+  if (o === 'aborted') return 'ยกเลิกโดยระบบ';
+  if (o === 'settled-remote') return 'agent ดำเนินการเองแล้ว';
+  if (o === 'settled') return 'จบพร้อมเทิร์น';
+  if (o === 'resolved' || o === 'released') return 'เสร็จแล้ว';
+  return o;
+}
+
+/**
+ * Merge a server pending-interactions snapshot into one chat's live map.
+ * The caller decides authoritativeness with the wireRevs 'ix' guard: a
+ * snapshot fetched while SSE kept flowing is stale and may only backfill
+ * unknown ids — applying it wholesale would resurrect a card the user
+ * just answered (the resolve raced the GET). A fresh snapshot is
+ * authoritative: unknown ids are added, unresolved locals are refreshed
+ * from server truth (this is what heals a same-ID recovery — the
+ * re-mounted question replaces the dead resolved model), and unresolved
+ * locals ABSENT from the snapshot are removed (their resolve fell into
+ * an evicted SSE gap; answering would 404). Locally-resolved entries are
+ * never touched — the resolved mark came from newer SSE by construction.
+ *
+ * `tombstones` (a Map<id, turnId>, chat-scoped, owned by the caller)
+ * closes the GET-captured-pending → resolved-SSE → late-GET hole: an
+ * unknown snapshot id the window already saw resolve, for the SAME turn,
+ * is stale wire and is dropped. A different turn means the id was
+ * re-asked in a new turn — accepted, and the tombstone lifted. A live
+ * `interaction` frame always lifts the tombstone outright (same-ID
+ * recovery re-mounts through the live wire, never the snapshot).
+ *
+ * Mutates `current` (a tv.interactions Map). Pure apart from the map.
+ * @returns {{added: string[], updated: string[], removed: string[]}}
+ */
+export function applyIxSnapshot(current, list, { authoritative = false, tombstones = null } = {}) {
+  const added = [];
+  const updated = [];
+  const removed = [];
+  const snap = new Map();
+  for (const ix of Array.isArray(list) ? list : []) {
+    if (ix?.id != null) snap.set(String(ix.id), ix);
+  }
+  for (const [id, ix] of snap) {
+    const local = current.get(id);
+    if (!local) {
+      if (tombstones?.has(id)) {
+        const snapTurn = ix?.turnId == null ? '' : String(ix.turnId);
+        const tombTurn = tombstones.get(id) == null ? '' : String(tombstones.get(id));
+        if (snapTurn === tombTurn) continue; // stale: we saw this turn resolve
+        tombstones.delete(id); // re-asked under a new turn — accept below
+      }
+      current.set(id, ix);
+      added.push(id);
+      continue;
+    }
+    if (!authoritative) continue; // stale: backfill only, never overwrite
+    if (!local.resolved) {
+      current.set(id, ix);
+      updated.push(id);
+      continue;
+    }
+    // A resolved local from an OLDER turn is fossil — the snapshot's
+    // pending entry for the same id belongs to the live turn.
+    if (local.turnId && ix.turnId && String(local.turnId) !== String(ix.turnId)) {
+      current.set(id, ix);
+      updated.push(id);
+    }
+  }
+  if (authoritative) {
+    for (const [id, local] of [...current]) {
+      if (!local?.resolved && !snap.has(id)) {
+        current.delete(id);
+        removed.push(id);
+      }
+    }
+  }
+  return { added, updated, removed };
+}
+
+/**
  * Child order for a persisted assistant message — must mirror
  * liveChildOrder() (tools → plan → answer, marker last). After turn_done the
  * transcript reloads from disk; if history rendered plan → tools → text while

@@ -7,7 +7,8 @@
 //
 // The public surface intentionally mirrors the old AcpClient so SessionManager
 // keeps working unchanged: start/prompt/cancel/shutdown, setSessionMode,
-// resolvePermission, configSelects/setConfigOption, and the same emitted
+// ACK-safe decideApproval/answerUserInput/cancelUserInput (+ the sweep-only
+// cancelInteractive), configSelects/setConfigOption, and the same emitted
 // events (status/stderr/handshake/auth_required/load_miss/update/permission/
 // exit/error/mode/session). MSP frames are normalized to the ACP-shaped
 // update kinds _onUpdate already handles (agent_message_chunk,
@@ -25,6 +26,7 @@ import {
   mspApprovalCard,
   mspApprovalOptions,
   mspChoiceIsSticky,
+  mspDecisionIsApprove,
   mspUserInputCard,
   pickMspApproveChoice,
   pickMspDenyChoice,
@@ -470,73 +472,239 @@ export class MspClient extends EventEmitter {
     this.subscribed = false;
   }
 
-  resolvePermission(id, optionId) {
+  /**
+   * ACK-safe approval decision. The waiter survives until the host acks
+   * `approval/decide` (or the call fails): resolving the card before the
+   * ack is what used to paint answered cards over parked agents. The
+   * caller (sessions.submitInteraction) owns idempotency — it passes the
+   * stored commandId on uncertain retries so the host dedupes by its
+   * SS3.1.1 handle. Rejects with the RPC error; never resolves falsely.
+   *
+   * Multi-stage approvals (schema ApprovalDecideResult.terminal): a
+   * terminal:false ack ACCEPTED the decision but the approval stays
+   * pending — the waiter and the card stay, and the follow-up
+   * approval/request refreshes the choices. Only a terminal:true ack
+   * drops the waiter. The sticky flag engages only after a validated
+   * accepted APPROVE decision, never before the RPC.
+   */
+  async decideApproval(approvalId, choiceId, { commandId = null } = {}) {
+    const id = String(approvalId || '');
     const wait = this._permWaiters.get(id);
-    if (!wait) return false;
+    if (!wait || wait.kind !== 'approval') {
+      const err = new Error(`no pending approval ${id}`);
+      err.code = 'NO_WAIT';
+      throw err;
+    }
+    const picked = (wait.choices || []).find((c) => String(c?.choiceId) === String(choiceId));
+    if (!picked) {
+      // Policy gate, second layer (sessions validates first): never decide
+      // blind. An unknown choice is a caller bug, not a deny.
+      const err = new Error(`unknown choice ${choiceId} for approval ${id}`);
+      err.code = 'UNKNOWN_CHOICE';
+      throw err;
+    }
+    const cid = commandId || uuidv7();
+    const stage = wait.requirementId ?? null;
+    let res;
+    try {
+      res = await this.request('approval/decide', {
+        approvalId: wait.approvalId,
+        choiceId: String(picked.choiceId),
+        requirementId: stage,
+        sessionId: this.sessionId,
+        commandId: cid,
+      });
+    } catch (err) {
+      // Loud, never swallowed — and the waiter STAYS, so the card stays
+      // answerable and the retry reuses this commandId.
+      this.emit('stderr', `[msp] approval/decide FAILED id=${id}: ${err?.message || err}\n`);
+      err.commandId = cid;
+      err.stage = stage;
+      throw err;
+    }
+    // Validate the ack — a malformed result is a failure, not a success.
+    // (status accepted + terminal boolean + id echoes, per the schema.)
+    const badAck = res?.status !== 'accepted'
+      || typeof res?.terminal !== 'boolean'
+      || (res.approvalId != null && String(res.approvalId) !== id)
+      || (res.commandId != null && String(res.commandId) !== cid);
+    if (badAck) {
+      const err = new Error(`approval/decide ack invalid for ${id}`);
+      err.code = 'BAD_ACK';
+      err.commandId = cid;
+      err.stage = stage;
+      this.emit('stderr', `[msp] approval/decide BAD_ACK id=${id}: ${JSON.stringify(res)}\n`);
+      throw err;
+    }
+    if (mspChoiceIsSticky(picked) && mspDecisionIsApprove(picked.decision)) {
+      this.permissionStickyApprove = true;
+    }
+    this.emit('diag', `[msp] approval/decide ok id=${id} choice=${picked.choiceId} terminal=${res.terminal}\n`);
+    if (res.terminal) {
+      this._permWaiters.delete(id);
+      try { wait.resolve(String(picked.choiceId)); } catch { /* ignore */ }
+    }
+    return {
+      choiceId: String(picked.choiceId),
+      commandId: cid,
+      status: res.status,
+      terminal: res.terminal,
+      stage,
+    };
+  }
+
+  /**
+   * ACK-safe question answer. `answers` is the validated full set (one
+   * entry per question — sessions.validate first). Same contract as
+   * decideApproval: waiter until ack, caller-owned commandId for
+   * idempotent retries, rejection propagates with the RPC attached.
+   */
+  async answerUserInput(userInputId, answers, { commandId = null } = {}) {
+    const id = String(userInputId || '');
+    const wait = this._permWaiters.get(id);
+    if (!wait || wait.kind !== 'userInput') {
+      const err = new Error(`no pending question ${id}`);
+      err.code = 'NO_WAIT';
+      throw err;
+    }
+    const cid = commandId || uuidv7();
+    let res;
+    try {
+      res = await this.request('userInput/answer', {
+        userInputId: wait.userInputId,
+        sessionId: this.sessionId,
+        commandId: cid,
+        answers,
+      });
+    } catch (err) {
+      this.emit('stderr', `[msp] userInput/answer FAILED id=${id}: ${err?.message || err}\n`);
+      err.commandId = cid;
+      throw err;
+    }
+    // Validate the ack (schema UserInputAnswerResult): status accepted +
+    // id echoes. A malformed result is a failure — never a substituted
+    // success — and the waiter stays for the retry.
+    if (res?.status !== 'accepted'
+      || (res.commandId != null && String(res.commandId) !== cid)
+      || (res.userInputId != null && String(res.userInputId) !== id)) {
+      const err = new Error(`userInput/answer ack invalid for ${id}`);
+      err.code = 'BAD_ACK';
+      err.commandId = cid;
+      this.emit('stderr', `[msp] userInput/answer BAD_ACK id=${id}: ${JSON.stringify(res)}\n`);
+      throw err;
+    }
     this._permWaiters.delete(id);
-    // The decision RPC goes out best-effort: the waiter unblocks the UI
-    // path synchronously (same contract as the ACP client), and a failed
-    // decide surfaces as agent_error rather than a stuck card.
+    this.emit('diag', `[msp] userInput/answer ok id=${id} n=${answers.length}\n`);
+    try { wait.resolve(answers); } catch { /* ignore */ }
+    return { commandId: cid, status: res.status, answers };
+  }
+
+  /**
+   * ACK-safe explicit cancel of one question. A reason is always sent —
+   * the schema marks it optional but binary 1.4.2 rejects a reason-less
+   * cancel (`missing field 'reason'`), the f381a7e1 wedge (BUG-084).
+   */
+  async cancelUserInput(userInputId, reason, { commandId = null } = {}) {
+    const id = String(userInputId || '');
+    const wait = this._permWaiters.get(id);
+    if (!wait || wait.kind !== 'userInput') {
+      const err = new Error(`no pending question ${id}`);
+      err.code = 'NO_WAIT';
+      throw err;
+    }
+    const cid = commandId || uuidv7();
+    let res;
+    try {
+      res = await this.request('userInput/cancel', {
+        userInputId: wait.userInputId,
+        sessionId: this.sessionId,
+        commandId: cid,
+        reason: String(reason || 'declined in Muse Desktop'),
+      });
+    } catch (err) {
+      this.emit('stderr', `[msp] userInput/cancel FAILED id=${id}: ${err?.message || err}\n`);
+      err.commandId = cid;
+      throw err;
+    }
+    // Same ack validation as answers (schema UserInputCancelResult).
+    if (res?.status !== 'accepted'
+      || (res.commandId != null && String(res.commandId) !== cid)
+      || (res.userInputId != null && String(res.userInputId) !== id)) {
+      const err = new Error(`userInput/cancel ack invalid for ${id}`);
+      err.code = 'BAD_ACK';
+      err.commandId = cid;
+      this.emit('stderr', `[msp] userInput/cancel BAD_ACK id=${id}: ${JSON.stringify(res)}\n`);
+      throw err;
+    }
+    this._permWaiters.delete(id);
+    this.emit('diag', `[msp] userInput/cancel ok id=${id}\n`);
+    try { wait.resolve(null); } catch { /* ignore */ }
+    return { commandId: cid, status: res.status };
+  }
+
+  /**
+   * Engagement note for a timed prompt (schema userInput/engaged):
+   * fire-and-forget, no commandId, no result — the host disarms that
+   * prompt's auto-resolution countdown. Sent at most once per id; a
+   * dead stdin must never throw the UI path that reports engagement.
+   */
+  engageUserInput(userInputId) {
+    const id = String(userInputId || '');
+    if (!id || !this.sessionId) return false;
+    if (!this._engagedIds) this._engagedIds = new Set();
+    if (this._engagedIds.has(id)) return true;
+    this._engagedIds.add(id);
+    try {
+      this.notify('userInput/engaged', { sessionId: this.sessionId, userInputId: id });
+    } catch (err) {
+      this.emit('stderr', `[msp] userInput/engaged not sent id=${id}: ${err?.message || err}\n`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Shutdown/sweep path for one interactive waiter (settleTurn, client
+   * release): un-park the agent best-effort — a deny decide for approvals,
+   * a cancel for questions — then drop the waiter. Best-effort only: the
+   * turn is already settling, so there is no flight to await and no card
+   * left to keep truthful. Returns false when nothing was waiting.
+   */
+  cancelInteractive(id, reason = 'turn settled') {
+    const wait = this._permWaiters.get(String(id || ''));
+    if (!wait) return false;
+    this._permWaiters.delete(String(id));
     if (wait.kind === 'approval') {
-      const choices = wait.choices || [];
-      const exact = choices.find((c) => String(c?.choiceId) === String(optionId));
-      const fallback = pickMspDenyChoice(choices);
-      const picked = exact || fallback;
-      if (picked && mspChoiceIsSticky(picked)) this.permissionStickyApprove = true;
-      if (picked) {
+      const deny = pickMspDenyChoice(wait.choices || []);
+      if (deny) {
         this.request('approval/decide', {
           approvalId: wait.approvalId,
-          choiceId: String(picked.choiceId),
+          choiceId: String(deny.choiceId),
           requirementId: wait.requirementId,
+          sessionId: this.sessionId,
           commandId: uuidv7(),
         }).then(
-          () => wait.resolve(optionId),
-          (err) => {
-            this._emitError( err instanceof Error ? err : new Error(String(err)));
-            wait.resolve(optionId);
-          },
+          () => this.emit('diag', `[msp] approval/decide ok id=${wait.approvalId} (sweep deny)\n`),
+          (err) => this.emit('stderr', `[msp] approval/decide FAILED id=${wait.approvalId} (sweep): ${err?.message || err}\n`),
         );
-      } else {
-        wait.resolve(optionId);
       }
+      try { wait.resolve('reject'); } catch { /* ignore */ }
       return true;
     }
     if (wait.kind === 'userInput') {
-      const labels = wait.labels || [];
-      if (labels.includes(String(optionId))) {
-        this.request('userInput/answer', {
-          userInputId: wait.userInputId,
-          sessionId: this.sessionId,
-          commandId: uuidv7(),
-          answers: [{ questionId: wait.questionId, selectedLabel: String(optionId) }],
-        }).then(
-          () => {
-            this.emit('diag', `[msp] userInput/answer ok id=${wait.userInputId}\n`);
-            wait.resolve(optionId);
-          },
-          (err) => {
-            // Loud, never swallowed: a rejected answer leaves the agent
-            // parked on the question while the card looks resolved (BUG-084).
-            this.emit('stderr', `[msp] userInput/answer FAILED id=${wait.userInputId}: ${err?.message || err}\n`);
-            wait.resolve(optionId);
-          },
-        );
-      } else {
-        // Unknown pick — cancel rather than answer wrong.
-        this.request('userInput/cancel', {
-          userInputId: wait.userInputId,
-          sessionId: this.sessionId,
-          commandId: uuidv7(),
-          reason: 'unknown option picked; cancelled rather than answer wrong',
-        }).then(
-          () => this.emit('diag', `[msp] userInput/cancel ok id=${wait.userInputId} (unknown pick)\n`),
-          (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${wait.userInputId}: ${err?.message || err}\n`),
-        );
-        wait.resolve(optionId);
-      }
+      this.request('userInput/cancel', {
+        userInputId: wait.userInputId,
+        sessionId: this.sessionId,
+        commandId: uuidv7(),
+        reason: String(reason || 'turn settled'),
+      }).then(
+        () => this.emit('diag', `[msp] userInput/cancel ok id=${wait.userInputId} (sweep)\n`),
+        (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${wait.userInputId} (sweep): ${err?.message || err}\n`),
+      );
+      try { wait.resolve(null); } catch { /* ignore */ }
       return true;
     }
-    wait.resolve(optionId);
+    try { wait.resolve(null); } catch { /* ignore */ }
     return true;
   }
 
@@ -1098,7 +1266,14 @@ export class MspClient extends EventEmitter {
         this.emit('permission', {
           id,
           resolved: true,
-          optionId: params?.decision != null ? String(params.decision) : 'resolved',
+          // The wire carries NO choice identity (ApprovalResolvedParams
+          // has decision + decidedByCommandId only): the decision enum
+          // is the OUTCOME, never the optionId. The session layer
+          // attributes our submitted choice IFF the winning command is
+          // ours; anything else stays null (BUG-032 selected button).
+          optionId: null,
+          outcome: params?.decision != null ? String(params.decision) : 'resolved',
+          decidedByCommandId: params?.decidedByCommandId ?? null,
         });
         return;
       }
@@ -1106,10 +1281,27 @@ export class MspClient extends EventEmitter {
         this._onUserInputFrame(params);
         return;
       case 'userInput/settled': {
+        // The authoritative settlement (schema UserInputSettledParams):
+        // outcome ∈ answered|cancelled|interrupted|clarified|timedOut|
+        // aborted, plus the winning commandId. Forwarded verbatim — the
+        // card must show what actually happened, never a blanket
+        // 'answered' (a timedOut prompt is not an answered one).
         const id = String(params?.userInputId || '');
         this._permWaiters.delete(id);
         this._cancelledIds?.delete(id);
-        this.emit('permission', { id, resolved: true, optionId: 'answered' });
+        this._engagedIds?.delete(id);
+        this.emit('permission', {
+          id,
+          resolved: true,
+          // Questions have no single choice identity on the wire — the
+          // outcome enum is the OUTCOME (answers carry the detail), never
+          // the optionId. Unknown choice stays null, outcome separate.
+          optionId: null,
+          outcome: String(params?.outcome || 'answered'),
+          decidedByCommandId: params?.decidedByCommandId ?? null,
+          reason: params?.reason ?? null,
+          answers: Array.isArray(params?.answers) ? params.answers : null,
+        });
         return;
       }
       case 'session/todoListChanged': {
@@ -1378,14 +1570,23 @@ export class MspClient extends EventEmitter {
     if (this.alwaysApprove || this.permissionStickyApprove) {
       const auto = pickMspApproveChoice(params?.availableChoices || []);
       if (auto) {
-        if (mspChoiceIsSticky(auto)) this.permissionStickyApprove = true;
+        // Sticky engages only after a validated accepted ack — never
+        // before the RPC, and never for a non-approve pick.
         this.request('approval/decide', {
           approvalId: card.approvalId,
           choiceId: String(auto.choiceId),
           requirementId: card.requirementId,
+          sessionId: this.sessionId,
           commandId: uuidv7(),
         }).then(
-          () => this.emit('diag', `[msp] approval/decide ok id=${card.approvalId} (auto-approve)\n`),
+          (res) => {
+            if (res?.status === 'accepted'
+              && mspChoiceIsSticky(auto)
+              && mspDecisionIsApprove(auto.decision)) {
+              this.permissionStickyApprove = true;
+            }
+            this.emit('diag', `[msp] approval/decide ok id=${card.approvalId} (auto-approve)\n`);
+          },
           (err) => this.emit('stderr', `[msp] approval/decide FAILED id=${card.approvalId}: ${err?.message || err}\n`),
         );
         return;
@@ -1418,6 +1619,7 @@ export class MspClient extends EventEmitter {
             approvalId: card.approvalId,
             choiceId: String(deny.choiceId),
             requirementId: waiter.requirementId,
+            sessionId: this.sessionId,
             commandId: uuidv7(),
           }).then(
             () => this.emit('diag', `[msp] approval/decide ok id=${card.approvalId} (card timeout)\n`),
@@ -1428,6 +1630,7 @@ export class MspClient extends EventEmitter {
           id: card.id,
           resolved: true,
           optionId: deny ? String(deny.choiceId) : 'reject',
+          outcome: 'decided',
           reason: 'timeout',
         });
       }, 5 * 60 * 1000).unref?.();
@@ -1446,6 +1649,9 @@ export class MspClient extends EventEmitter {
       body: card.body,
       params,
       options: card.options,
+      // The multi-stage race token: the UI posts it back with its decision
+      // so the server can tell a stale decision from the current stage.
+      requirementId: card.requirementId ?? null,
     });
   }
 
@@ -1473,9 +1679,10 @@ export class MspClient extends EventEmitter {
     if (this._cancelledIds?.has(userInputId)) return 'duplicate';
     const card = mspUserInputCard(params);
     if (!card) {
-      // Multi-question / multi-select / free-text shapes do not fit the
-      // single-optionId card. Cancelling (with a visible trace) beats
-      // stranding the turn on a prompt nobody can answer.
+      // Malformed frames only (no id, no questions, unknown mode) — every
+      // well-formed shape mounts a form since 1.1.33. Cancelling (with a
+      // visible trace) beats stranding the turn on a prompt nobody can
+      // answer; the watchdog poll escalates when the agent ignores it.
       const qCount = Array.isArray(params?.questions) ? params.questions.length : 0;
       if (!this._cancelledIds) this._cancelledIds = new Set();
       this._cancelledIds.add(userInputId);
@@ -1493,7 +1700,7 @@ export class MspClient extends EventEmitter {
         // rejects the cancel without it (`missing field 'reason'`) — the
         // actual f381a7e1 wedge. The model sees the cancelled result, so
         // say why and what to do.
-        reason: `desktop shows one single-select question at a time (this prompt has ${qCount}); proceeding without an answer`,
+        reason: 'desktop cannot render this prompt shape; proceeding without an answer',
       }).then(
         () => this.emit('diag', `[msp] userInput/cancel ok id=${userInputId}\n`),
         (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${userInputId}: ${err?.message || err}\n`),
@@ -1502,11 +1709,14 @@ export class MspClient extends EventEmitter {
     }
     // Questions always surface — even an always-approve session cannot know
     // the answers, and cancelling them would silently change the outcome.
+    // The card waits for the human by default: there is deliberately no
+    // auto-cancel timer here (1.1.33 removed the silent 5-minute cancel —
+    // a question the user never saw must never answer itself). The
+    // watchdog still freezes while the card is mounted, and the stop
+    // button / turn settle path cancels explicitly.
     this._permWaiters.set(card.id, {
       kind: 'userInput',
       userInputId: card.userInputId,
-      questionId: card.questionId,
-      labels: card.options.map((o) => o.optionId),
       resolve: () => {},
       reject: () => {},
     });
@@ -1516,20 +1726,6 @@ export class MspClient extends EventEmitter {
       waiter.reject = reject;
     });
     gate.catch(() => {});
-    setTimeout(() => {
-      if (!this._permWaiters.has(card.id)) return;
-      this._permWaiters.delete(card.id);
-      this.request('userInput/cancel', {
-        userInputId: card.userInputId,
-        sessionId: this.sessionId,
-        commandId: uuidv7(),
-        reason: 'question unanswered for 5 minutes',
-      }).then(
-        () => this.emit('diag', `[msp] userInput/cancel ok id=${card.userInputId} (card timeout)\n`),
-        (err) => this.emit('stderr', `[msp] userInput/cancel FAILED id=${card.userInputId}: ${err?.message || err}\n`),
-      );
-      this.emit('permission', { id: card.id, resolved: true, optionId: 'cancel', reason: 'timeout' });
-    }, 5 * 60 * 1000).unref?.();
     this.emit('permission', {
       id: card.id,
       toolName: card.toolName,
@@ -1539,6 +1735,8 @@ export class MspClient extends EventEmitter {
       body: card.body,
       params,
       options: card.options,
+      questions: card.questions,
+      autoResolutionMs: card.autoResolutionMs,
     });
     return 'card';
   }

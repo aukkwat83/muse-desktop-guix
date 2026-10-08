@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // The MSP card builders in hosts.js: approval headlines per subject kind,
 // the body-only-when-it-adds-info rule, choice mapping, auto-pick helpers,
-// and the single-question userInput card (multi-question shapes return null
-// and the client auto-cancels them).
+// the multi-shape userInput form card, and the answer validators the
+// submit path enforces before any RPC goes out.
 
 import assert from 'node:assert/strict';
 import {
@@ -16,6 +16,11 @@ import {
   mspUserInputCard,
   pickMspApproveChoice,
   pickMspDenyChoice,
+  submissionKey,
+  summarizeUserInputAnswers,
+  USER_INPUT_TEXT_MAX,
+  validateApprovalDecision,
+  validateUserInputAnswers,
 } from '../src/server/hosts.js';
 
 const tests = [];
@@ -184,36 +189,60 @@ test('single-question userInput becomes an ask card with label ids', () => {
   );
 });
 
-test('multi-question, multi-select and option-less prompts return null', () => {
-  const base = { userInputId: 'q-x', questions: [] };
-  assert.equal(
-    mspUserInputCard({
-      ...base,
-      questions: [
-        { id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] },
-        { id: 'b', question: 'B?', selection: { mode: 'single' }, options: [{ label: 'z' }] },
-      ],
-    }),
-    null,
-  );
-  assert.equal(
-    mspUserInputCard({
-      ...base,
-      questions: [{ id: 'a', question: 'A?', selection: { mode: 'multi' }, options: [{ label: 'y' }] }],
-    }),
-    null,
-  );
-  assert.equal(
-    mspUserInputCard({
-      ...base,
-      questions: [{ id: 'a', question: 'A?', selection: { mode: 'single' }, options: [] }],
-    }),
-    null,
-  );
-  assert.equal(mspUserInputCard({ questions: [] }), null);
+test('multi-question and multi-select prompts mount a form card (1.1.33)', () => {
+  const card = mspUserInputCard({
+    userInputId: 'q-m',
+    questions: [
+      { id: 'a', header: 'A', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] },
+      {
+        id: 'b', header: 'B', question: 'B?', selection: { mode: 'multiple', minSelections: 1, maxSelections: 2 },
+        options: [{ label: 'x' }, { label: 'z' }],
+      },
+    ],
+  });
+  assert.ok(card, 'multi-question must mount, not auto-cancel');
+  assert.equal(card.subtype, 'ask');
+  assert.deepEqual(card.questions.map((q) => q.id), ['a', 'b']);
+  assert.equal(card.questions[1].mode, 'multiple');
+  assert.equal(card.questions[1].maxSelections, 2);
+  assert.match(card.summary, /2 คำถาม/);
+  assert.deepEqual(card.options, [], 'multi cards answer through the form, not quick-pick buttons');
 });
 
-test('pending poll mounts single cards and cancels the rest (BUG-084)', () => {
+test('an options-less question mounts as free-text (1.1.33)', () => {
+  const card = mspUserInputCard({
+    userInputId: 'q-f',
+    questions: [{ id: 'a', header: 'Why', question: 'Why?', selection: { mode: 'single' }, options: [] }],
+  });
+  assert.ok(card);
+  assert.equal(card.questions[0].freeText, true);
+  assert.deepEqual(card.options, []);
+});
+
+test('malformed prompts still return null (auto-cancel with a trace)', () => {
+  const base = { userInputId: 'q-x', questions: [] };
+  // Unknown selection mode.
+  assert.equal(
+    mspUserInputCard({
+      ...base,
+      questions: [{ id: 'a', question: 'A?', selection: { mode: 'fuzzy' }, options: [{ label: 'y' }] }],
+    }),
+    null,
+  );
+  // Missing question id.
+  assert.equal(
+    mspUserInputCard({
+      ...base,
+      questions: [{ question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] }],
+    }),
+    null,
+  );
+  assert.equal(mspUserInputCard({ ...base, questions: [] }), null);
+  assert.equal(mspUserInputCard({ questions: [] }), null);
+  assert.equal(mspUserInputCard({}), null);
+});
+
+test('pending poll mounts every well-formed card and cancels only malformed (BUG-084)', () => {
   const single = {
     userInputId: 'u-single',
     questions: [{ id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] }],
@@ -225,9 +254,13 @@ test('pending poll mounts single cards and cancels the rest (BUG-084)', () => {
       { id: 'b', question: 'B?', selection: { mode: 'single' }, options: [{ label: 'z' }] },
     ],
   };
-  const out = classifyPendingUserInputs({ pending: [single, multi] });
-  assert.deepEqual(out.mount.map((p) => p.userInputId), ['u-single']);
-  assert.deepEqual(out.cancel.map((p) => p.userInputId), ['u-multi']);
+  const broken = {
+    userInputId: 'u-broken',
+    questions: [{ id: 'a', question: 'A?', selection: { mode: 'fuzzy' }, options: [{ label: 'y' }] }],
+  };
+  const out = classifyPendingUserInputs({ pending: [single, multi, broken] });
+  assert.deepEqual(out.mount.map((p) => p.userInputId), ['u-single', 'u-multi']);
+  assert.deepEqual(out.cancel.map((p) => p.userInputId), ['u-broken']);
   assert.deepEqual(out.escalate, []);
 });
 
@@ -276,15 +309,211 @@ test('a cancel the agent ignored past grace escalates (BUG-084)', () => {
 test('pending poll dedupes repeats and drops id-less entries (BUG-084)', () => {
   const dup = {
     userInputId: 'u-dup',
-    questions: [
-      { id: 'a', question: 'A?', selection: { mode: 'single' }, options: [{ label: 'y' }] },
-      { id: 'b', question: 'B?', selection: { mode: 'single' }, options: [{ label: 'z' }] },
-    ],
+    questions: [{ id: 'a', question: 'A?', selection: { mode: 'fuzzy' }, options: [{ label: 'y' }] }],
   };
   const out = classifyPendingUserInputs({ pending: [dup, dup, { questions: [] }, null] });
   assert.deepEqual(out.cancel.map((p) => p.userInputId), ['u-dup']);
   assert.deepEqual(out.mount, []);
   assert.deepEqual(out.escalate, []);
+});
+
+const formQuestions = () => ([
+  {
+    id: 'a', header: 'Cache', question: 'Cache where?', mode: 'single',
+    minSelections: 1, maxSelections: 1, freeText: false,
+    options: [{ label: 'Redis', description: '' }, { label: 'SQLite', description: '' }],
+  },
+  {
+    id: 'b', header: 'Flags', question: 'Which flags?', mode: 'multiple',
+    minSelections: 1, maxSelections: 2, freeText: false,
+    options: [{ label: 'x', description: '' }, { label: 'y', description: '' }, { label: 'z', description: '' }],
+  },
+  {
+    id: 'c', header: 'Why', question: 'Why?', mode: 'single',
+    minSelections: 1, maxSelections: 0, freeText: true, options: [],
+  },
+]);
+
+test('validateUserInputAnswers accepts a complete mixed-shape set', () => {
+  const v = validateUserInputAnswers(formQuestions(), [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x', 'z'] },
+    { questionId: 'c', freeText: 'because', note: 'n' },
+  ]);
+  assert.equal(v.ok, true);
+  assert.equal(v.answers.length, 3);
+  assert.equal(v.answers[1].selectedLabels.join(','), 'x,z');
+});
+
+test('validateUserInputAnswers is atomic: one bad entry rejects all', () => {
+  const qs = formQuestions();
+  // Missing one question.
+  let v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x'] },
+  ]);
+  assert.equal(v.ok, false);
+  assert.equal(v.code, 'ANSWER_INCOMPLETE');
+  // Unknown label.
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Memcached' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'UNKNOWN_LABEL');
+  assert.equal(v.questionId, 'a');
+  // Multi below min / above max.
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: [] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'SELECTION_BOUNDS', 'empty multi array breaks the min bound');
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x', 'y', 'z'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'SELECTION_BOUNDS');
+  // Free text empty / too long.
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: '   ' },
+  ]);
+  assert.equal(v.code, 'ANSWER_SHAPE');
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 't'.repeat(USER_INPUT_TEXT_MAX + 1) },
+  ]);
+  assert.equal(v.code, 'TEXT_TOO_LONG');
+  // Note too long.
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis', note: 'n'.repeat(USER_INPUT_TEXT_MAX + 1) },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'NOTE_TOO_LONG');
+  // Two shapes at once.
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis', freeText: 'x' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'ANSWER_SHAPE');
+  // Duplicate + unknown question.
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'a', selectedLabel: 'SQLite' },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'ANSWER_DUPLICATE');
+  v = validateUserInputAnswers(qs, [
+    { questionId: 'zzz', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.code, 'UNKNOWN_QUESTION');
+});
+
+test('ids and labels survive exactly (spaced labels are distinct picks)', () => {
+  const card = mspUserInputCard({
+    userInputId: 'q-sp',
+    questions: [{
+      id: ' a ',
+      header: ' H ',
+      question: ' Q? ',
+      selection: { mode: 'single' },
+      options: [{ label: ' SQLite ' }, { label: 'Redis' }],
+    }],
+  });
+  assert.ok(card);
+  assert.equal(card.questions[0].id, ' a ');
+  assert.equal(card.questions[0].options[0].label, ' SQLite ');
+  const v = validateUserInputAnswers(card.questions, [
+    { questionId: ' a ', selectedLabel: ' SQLite ' },
+  ]);
+  assert.equal(v.ok, true);
+  assert.equal(v.answers[0].selectedLabel, ' SQLite ', 'the RPC must carry the exact wire label');
+  const trimmed = validateUserInputAnswers(card.questions, [
+    { questionId: 'a', selectedLabel: 'SQLite' },
+  ]);
+  assert.equal(trimmed.ok, false, 'trimmed twins must not match exact ids/labels');
+});
+
+test('min:0 allows an empty multi-pick; bad bounds fail the frame', () => {
+  const card = mspUserInputCard({
+    userInputId: 'q-min0',
+    questions: [{
+      id: 'm', question: 'Flags?', selection: { mode: 'multiple', minSelections: 0, maxSelections: 2 },
+      options: [{ label: 'x' }, { label: 'y' }],
+    }],
+  });
+  assert.ok(card);
+  const v = validateUserInputAnswers(card.questions, [{ questionId: 'm', selectedLabels: [] }]);
+  assert.equal(v.ok, true);
+  assert.deepEqual(v.answers[0].selectedLabels, []);
+  // Invalid bounds make the frame malformed (auto-cancel with a trace).
+  for (const selection of [
+    { mode: 'multiple', minSelections: -1 },
+    { mode: 'multiple', maxSelections: 1.5 },
+    { mode: 'multiple', minSelections: 2, maxSelections: 1 },
+  ]) {
+    assert.equal(
+      mspUserInputCard({ userInputId: 'q-bad', questions: [{ id: 'm', selection, options: [{ label: 'x' }] }] }),
+      null,
+      `bounds ${JSON.stringify(selection)} must fail normalize`,
+    );
+  }
+});
+
+test('freeText answers choice questions too (schema: independent alternative)', () => {
+  const qs = formQuestions();
+  const v = validateUserInputAnswers(qs, [
+    { questionId: 'a', freeText: 'something else entirely' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(v.ok, true);
+  assert.equal(v.answers[0].freeText, 'something else entirely');
+  const both = validateUserInputAnswers(qs, [
+    { questionId: 'a', selectedLabel: 'Redis', freeText: 'x' },
+    { questionId: 'b', selectedLabels: ['x'] },
+    { questionId: 'c', freeText: 'because' },
+  ]);
+  assert.equal(both.code, 'ANSWER_SHAPE', 'pick + text together is still two shapes');
+});
+
+test('validateApprovalDecision only passes current choices (policy gate)', () => {
+  const choices = [
+    { choiceId: 'approve_once', decision: 'approved', scope: 'once' },
+    { choiceId: 'reject', decision: 'denied', scope: 'once' },
+  ];
+  assert.equal(validateApprovalDecision(choices, 'approve_once').ok, true);
+  assert.equal(validateApprovalDecision(choices, 'reject').ok, true);
+  const bad = validateApprovalDecision(choices, 'approve_always');
+  assert.equal(bad.ok, false);
+  assert.equal(bad.code, 'UNKNOWN_CHOICE');
+  assert.equal(validateApprovalDecision(choices, '').ok, false);
+  assert.equal(validateApprovalDecision([], 'approve_once').ok, false);
+});
+
+test('summarizeUserInputAnswers renders one display row per answer', () => {
+  const rows = summarizeUserInputAnswers(formQuestions(), [
+    { questionId: 'a', selectedLabel: 'Redis' },
+    { questionId: 'b', selectedLabels: ['x', 'z'] },
+    { questionId: 'c', freeText: 'because reasons' },
+  ]);
+  assert.deepEqual(rows.map((r) => r.display), ['Redis', 'x, z', 'because reasons']);
+  assert.deepEqual(rows.map((r) => r.header), ['Cache', 'Flags', 'Why']);
+});
+
+test('submissionKey is stable under key order', () => {
+  const a = submissionKey({ kind: 'answer', answers: [{ questionId: 'a', selectedLabel: 'x' }] });
+  const b = submissionKey({ answers: [{ selectedLabel: 'x', questionId: 'a' }], kind: 'answer' });
+  assert.equal(a, b);
+  assert.notEqual(a, submissionKey({ kind: 'answer', answers: [{ questionId: 'a', selectedLabel: 'y' }] }));
 });
 
 let failed = 0;

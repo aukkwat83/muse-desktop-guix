@@ -7,7 +7,7 @@
 
 import assert from 'node:assert/strict';
 
-import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from '../src/renderer/turn-view.js';
+import { createTurnView, bindTurnId, interruptedMarkerText, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixAnchorKey, ixKeyToOptionId, escStopAction, confirmedStopProceeds, outcomeLabel, applyIxSnapshot, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, inProgressPlanStep, configSelectsFromOptions, modelShortName, configMenuItems, isAgentTool, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from '../src/renderer/turn-view.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -320,6 +320,81 @@ test('confirmedStopProceeds: a stale yes stops nothing', () => {
   assert.equal(confirmedStopProceeds({ escChatId: 'c1', activeChatId: 'c2', running: true }), false);
   assert.equal(confirmedStopProceeds({ escChatId: 'c1', activeChatId: null, running: true }), false);
   assert.equal(confirmedStopProceeds({ escChatId: null, activeChatId: 'c1', running: true }), false);
+});
+
+test('outcomeLabel maps every settlement to Thai, unknowns pass through', () => {
+  assert.equal(outcomeLabel('answered'), 'ตอบแล้ว');
+  assert.equal(outcomeLabel('decided'), 'ตัดสินใจแล้ว');
+  assert.equal(outcomeLabel('cancelled'), 'ยกเลิกแล้ว');
+  assert.equal(outcomeLabel('timedOut'), 'หมดเวลา');
+  assert.equal(outcomeLabel('settled-remote'), 'agent ดำเนินการเองแล้ว');
+  assert.equal(outcomeLabel('settled'), 'จบพร้อมเทิร์น');
+  assert.equal(outcomeLabel('weird-future'), 'weird-future');
+  assert.equal(outcomeLabel(null), '');
+});
+
+test('applyIxSnapshot authoritative: add, refresh unresolved, remove absent', () => {
+  const current = new Map([
+    ['keep', { id: 'keep', turnId: 't1' }],
+    ['gone', { id: 'gone', turnId: 't1' }],
+    ['done', { id: 'done', turnId: 't1', resolved: true, optionId: 'x' }],
+  ]);
+  const out = applyIxSnapshot(current, [
+    { id: 'keep', turnId: 't1', summary: 'fresh' },
+    { id: 'new', turnId: 't1' },
+  ], { authoritative: true });
+  assert.deepEqual(out.added, ['new']);
+  assert.deepEqual(out.updated, ['keep']);
+  assert.deepEqual(out.removed, ['gone']);
+  assert.equal(current.get('keep').summary, 'fresh', 'unresolved locals refresh from server truth');
+  assert.equal(current.get('done').optionId, 'x', 'resolved locals are never touched');
+  assert.equal(current.has('gone'), false);
+});
+
+test('applyIxSnapshot stale: backfill unknown ids only, never overwrite/remove', () => {
+  const local = { id: 'k', turnId: 't1', resolved: true, optionId: 'picked' };
+  const current = new Map([
+    ['k', local],
+    ['stale-pending', { id: 'stale-pending', turnId: 't1' }],
+  ]);
+  const out = applyIxSnapshot(current, [
+    { id: 'k', turnId: 't1', summary: 'older snapshot' },
+    { id: 'fresh', turnId: 't1' },
+  ], { authoritative: false });
+  assert.deepEqual(out.added, ['fresh']);
+  assert.deepEqual(out.updated, []);
+  assert.deepEqual(out.removed, []);
+  assert.equal(current.get('k'), local, 'a resolve that raced the GET must not resurrect');
+  assert.equal(current.has('stale-pending'), true, 'no removal without authority');
+});
+
+test('applyIxSnapshot replaces a resolved fossil from an older turn', () => {
+  const current = new Map([['q', { id: 'q', turnId: 't0', resolved: true }]]);
+  const out = applyIxSnapshot(current, [{ id: 'q', turnId: 't1' }], { authoritative: true });
+  assert.deepEqual(out.updated, ['q']);
+  assert.equal(current.get('q').turnId, 't1');
+  assert.equal(current.get('q').resolved, undefined);
+});
+
+test('applyIxSnapshot drops tombstoned same-turn ids (late-GET resurrection)', () => {
+  // GET captured pending → resolved SSE (unseen id: model already gone) →
+  // late GET: the snapshot row is older wire and must not come back.
+  for (const authoritative of [true, false]) {
+    const current = new Map();
+    const tombs = new Map([['q', 't1']]);
+    const out = applyIxSnapshot(current, [{ id: 'q', turnId: 't1' }], { authoritative, tombstones: tombs });
+    assert.deepEqual(out.added, [], `authoritative=${authoritative}: tombstoned id is dropped`);
+    assert.equal(current.has('q'), false);
+    assert.equal(tombs.has('q'), true, 'the tombstone itself survives a stale row');
+  }
+});
+
+test('applyIxSnapshot accepts a tombstoned id re-asked under a new turn', () => {
+  const current = new Map();
+  const tombs = new Map([['q', 't1']]);
+  const out = applyIxSnapshot(current, [{ id: 'q', turnId: 't2' }], { authoritative: true, tombstones: tombs });
+  assert.deepEqual(out.added, ['q']);
+  assert.equal(tombs.has('q'), false, 'a new turn lifts the old tomb');
 });
 
 test('messageChildOrder mirrors liveChildOrder for the settled transcript (BUG-031)', () => {

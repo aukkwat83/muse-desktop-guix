@@ -10,6 +10,13 @@
 //   edit     → short text turn
 //   ask      → an approval card (waits for approval/decide before finishing)
 //   quiz     → a userInput question card (waits for userInput/answer)
+//   quizmulti → two single-select questions, answered atomically
+//   quizshapes → single + multi + free-text questions, answered atomically
+//   quizflaky → the first answer RPC fails transiently, the retry lands
+//   askstaged  → two-stage approval (terminal:false, then updated req)
+//   quizbroken → malformed prompt (client auto-cancels with a trace)
+//   ghostquiz → unannounced multi-question ghost (poll mounts the card)
+//   stubbornquiz → malformed ghost whose cancel the agent ignores (escalate)
 //   exitplan → completes immediately (plan-mode smoke)
 //   plan     → a session/todoListChanged plan + text
 //   slow     → ~600ms of silence, then text (deadline guard rail)
@@ -56,6 +63,13 @@ const AUDITFAIL_MARKER = process.env.MOCK_MSP_AUDITFAIL_MARKER || '';
 const PROMPT_LOG = process.env.MOCK_MSP_PROMPT_LOG || '';
 const SESSION_LOG = process.env.MOCK_MSP_SESSION_LOG || '';
 const SUBAGENT_LOG = process.env.MOCK_MSP_SUBAGENT_LOG || '';
+// Delayed-subscribe determinism (readiness e2e): when SUBSCRIBE_GATE is set,
+// the FIRST view/subscribe reply is held until that file exists; arrival is
+// signalled by writing SUBSCRIBE_SEEN, so the harness can order "prompt is
+// in flight behind the held subscribe" with zero sleeps.
+const SUBSCRIBE_GATE = process.env.MOCK_MSP_SUBSCRIBE_GATE || '';
+const SUBSCRIBE_SEEN = process.env.MOCK_MSP_SUBSCRIBE_SEEN || '';
+let subscribeHeld = false;
 
 const MODEL = process.env.MUSE_DESKTOP_MODEL || 'mock-model-1';
 const EFFORT = process.env.MUSE_DESKTOP_EFFORT || 'max';
@@ -108,6 +122,78 @@ const cancelled = new Set();
 // agent ignores (served pending forever, until turn/interrupt).
 const ghostPending = new Map();
 const ignoreCancel = new Set();
+// userInputId → questions asked, for answer validation (schema-shape: one
+// entry per question, labels within the options, freeText <= 500).
+const quizExpected = new Map();
+// userInputIds whose NEXT answer is rejected once with -32057 (the flaky
+// ACK e2e: 502-then-200 on an identical retry).
+const flakyOnce = new Set();
+// commandIds already answered (SS3.1.1 idempotency replay at the wire).
+const seenCommands = new Map();
+// Multi-stage approvals: approvalId → { stage, req:[r1,r2], choices2 }.
+const stagedApprovals = new Map();
+// approvalId → currently available choices (decision echo alignment: the
+// resolved decision must match the CHOSEN choice, like a real host).
+const approvalChoices = new Map();
+const KNOWN_DECISIONS = {
+  approve_once: 'approved',
+  approve_always: 'approvedForSession',
+  reject: 'denied',
+  escalate: 'approved',
+};
+const UUIDV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Schema-true answer check (mirrors the EXPORTED binary schema, not the
+ * product validator — a bad mock must not mask valid product): exactly
+ * one shape per question; freeText is an INDEPENDENT alternative (<= 500)
+ * for ANY question, options or not; ids/labels compare EXACTLY (no
+ * trim — surrounding spaces are legal label characters); min:0 allows
+ * an empty multi-pick. Null when valid, a message when not.
+ */
+function invalidAnswerReason(questions, answers) {
+  const qs = Array.isArray(questions) ? questions : [];
+  const list = Array.isArray(answers) ? answers : [];
+  if (list.length !== qs.length) return `want one entry per question (${qs.length}), got ${list.length}`;
+  const byId = new Map(qs.map((q) => [String(q?.id ?? ''), q]));
+  const seen = new Set();
+  for (const a of list) {
+    const qid = String(a?.questionId ?? '');
+    const q = byId.get(qid);
+    if (!q || seen.has(qid)) return `unknown or duplicate questionId ${qid}`;
+    seen.add(qid);
+    const opts = Array.isArray(q.options) ? q.options : [];
+    const labels = new Set(opts.map((o) => String(o?.label ?? '')));
+    const hasLabel = typeof a?.selectedLabel === 'string' && labels.has(a.selectedLabel);
+    const hasText = typeof a?.freeText === 'string' && a.freeText.trim() !== '';
+    // Shape presence counts structurally (a blank-but-present field is a
+    // shape violation, not a missing one); validity is checked per shape.
+    const shapes = [
+      typeof a?.selectedLabel === 'string',
+      Array.isArray(a?.selectedLabels),
+      typeof a?.freeText === 'string',
+    ].filter(Boolean).length;
+    if (shapes !== 1) return `question ${qid}: exactly one of selectedLabel/selectedLabels/freeText`;
+    if (typeof a?.note === 'string' && a.note.length > 500) return `question ${qid}: note over 500 chars`;
+    if (typeof a?.freeText === 'string') {
+      if (!hasText) return `question ${qid}: freeText must not be blank`;
+      if (a.freeText.length > 500) return `question ${qid}: freeText over 500 chars`;
+      continue; // independent alternative — options present or not
+    }
+    if (!opts.length) return `question ${qid}: freeText required, <= 500 chars`;
+    if (q.selection?.mode === 'multiple') {
+      const picks = [...new Set(a.selectedLabels.map((s) => String(s)).filter((s) => s.trim() !== ''))];
+      const min = Number.isInteger(q.selection?.minSelections) ? q.selection.minSelections : 1;
+      const max = Number.isInteger(q.selection?.maxSelections) ? q.selection.maxSelections : opts.length;
+      if (min < 0 || max < 0 || min > max) return `question ${qid}: bad selection bounds`;
+      if (picks.length < min || picks.length > max) return `question ${qid}: pick ${min}-${max}`;
+      if (picks.some((p) => !labels.has(p))) return `question ${qid}: unknown label`;
+    } else if (!hasLabel) {
+      return `question ${qid}: unknown label`;
+    }
+  }
+  return null;
+}
 // subagentId → itemId for every child the scripts can spawn. Owner verbs
 // reject anything outside this map, like the real host rejects a child id
 // it never minted.
@@ -249,9 +335,26 @@ async function handle(msg) {
       });
       return;
     }
-    case 'view/subscribe':
+    case 'view/subscribe': {
+      // Held-subscribe determinism for the readiness e2e (first subscribe
+      // only): signal arrival, then hold the reply until the gate file
+      // exists. The client must wait, not fail NOT_SUBSCRIBED.
+      if (SUBSCRIBE_GATE && !subscribeHeld) {
+        subscribeHeld = true;
+        try { if (SUBSCRIBE_SEEN) fs.writeFileSync(SUBSCRIBE_SEEN, 'seen'); } catch { /* ignore */ }
+        const heldId = id;
+        const tick = () => {
+          let open = false;
+          try { open = fs.existsSync(SUBSCRIBE_GATE); } catch { /* ignore */ }
+          if (open) reply(heldId, { sessionId: SESSION_ID, viewCursor: 'mock-cursor-1' });
+          else setTimeout(tick, 25).unref?.();
+        };
+        tick();
+        return;
+      }
       reply(id, { sessionId: SESSION_ID, viewCursor: 'mock-cursor-1' });
       return;
+    }
     case 'model/list':
       reply(id, { models: [{ modelId: MODEL }, { modelId: 'mock-model-2' }] });
       return;
@@ -274,7 +377,42 @@ async function handle(msg) {
     }
     case 'approval/decide': {
       if (DECIDE_LOG) fs.appendFileSync(DECIDE_LOG, `${JSON.stringify(params)}\n`);
-      reply(id, {});
+      if (!UUIDV7.test(String(params?.commandId || ''))) {
+        replyError(id, -32602, 'Invalid params: commandId must be UUIDv7');
+        return;
+      }
+      // Multi-stage approvals: the stage-1 decide acks terminal:false and
+      // the follow-up approval/updated advances the requirement; a decide
+      // against a dead stage gets -32053 like the real host.
+      const staged = stagedApprovals.get(params?.approvalId);
+      if (staged && staged.stage === 1 && params?.requirementId === staged.req[0]) {
+        staged.stage = 2;
+        approvalChoices.set(params?.approvalId, staged.choices2);
+        reply(id, { commandId: params?.commandId, status: 'accepted', terminal: false, approvalId: params?.approvalId });
+        setTimeout(() => {
+          notify('approval/updated', {
+            sessionId: SESSION_ID,
+            approvalId: params?.approvalId,
+            currentRequirementId: staged.req[1],
+            availableChoices: staged.choices2,
+            change: 'advanced',
+          });
+        }, 20);
+        return; // waiter stays: stage 2 still needs its decision
+      }
+      if (staged && params?.requirementId !== staged.req[staged.stage - 1]) {
+        replyError(id, -32053, 'approvalRequirementStale: decide against the current requirement');
+        return;
+      }
+      // The resolved decision echoes the CHOSEN available choice (real
+      // hosts do not blanket-emit one decision): approve_once→approved,
+      // approve_always→approvedForSession, reject→denied.
+      const pool = approvalChoices.get(params?.approvalId) || [];
+      const hit = pool.find((c) => c?.choiceId === params?.choiceId);
+      const decision = hit?.decision || KNOWN_DECISIONS[params?.choiceId] || 'approved';
+      reply(id, { commandId: params?.commandId, status: 'accepted', terminal: true, approvalId: params?.approvalId });
+      if (staged) stagedApprovals.delete(params?.approvalId);
+      approvalChoices.delete(params?.approvalId);
       const w = waiters.get(params?.approvalId);
       if (w) {
         waiters.delete(params.approvalId);
@@ -283,20 +421,56 @@ async function handle(msg) {
       notify('approval/resolved', {
         sessionId: SESSION_ID,
         approvalId: params?.approvalId,
-        decision: 'approvedForSession',
+        decision,
+        decidedByCommandId: params?.commandId,
       });
       return;
     }
     case 'userInput/answer': {
       if (DECIDE_LOG) fs.appendFileSync(DECIDE_LOG, `${JSON.stringify(params)}\n`);
-      reply(id, {});
+      // Wire-true command handle: UUIDv7 required, and a replayed handle
+      // replays its result instead of double-settling (SS3.1.1).
+      if (!UUIDV7.test(String(params?.commandId || ''))) {
+        replyError(id, -32602, 'Invalid params: commandId must be UUIDv7');
+        return;
+      }
+      if (seenCommands.has(params.commandId)) {
+        reply(id, seenCommands.get(params.commandId));
+        return;
+      }
+      // The flaky ACK e2e: the first answer for a flagged prompt fails
+      // transiently (-32000, retryable); the identical retry must land.
+      // (-32057 would be a VALUE rejection — correctly non-retryable.)
+      if (flakyOnce.has(params?.userInputId)) {
+        flakyOnce.delete(params.userInputId);
+        replyError(id, -32000, 'transient test failure');
+        return;
+      }
+      const expected = quizExpected.get(params?.userInputId);
+      if (expected) {
+        const bad = invalidAnswerReason(expected, params?.answers);
+        if (bad) {
+          replyError(id, -32057, `userInputAnswerInvalid: ${bad}`);
+          return;
+        }
+      }
+      const ack = { commandId: params?.commandId, status: 'accepted', userInputId: params?.userInputId };
+      seenCommands.set(params.commandId, ack);
+      reply(id, ack);
       ghostPending.delete(params?.userInputId);
+      quizExpected.delete(params?.userInputId);
       const w = waiters.get(params?.userInputId);
       if (w) {
         waiters.delete(params.userInputId);
         w.resolve(params);
       }
-      notify('userInput/settled', { sessionId: SESSION_ID, userInputId: params?.userInputId });
+      notify('userInput/settled', {
+        sessionId: SESSION_ID,
+        userInputId: params?.userInputId,
+        outcome: 'answered',
+        decidedByCommandId: params?.commandId,
+        answers: params?.answers,
+      });
       return;
     }
     case 'userInput/cancel': {
@@ -309,17 +483,27 @@ async function handle(msg) {
         replyError(id, -32602, 'Invalid params: missing field `reason`');
         return;
       }
-      reply(id, {});
+      if (!UUIDV7.test(String(params?.commandId || ''))) {
+        replyError(id, -32602, 'Invalid params: commandId must be UUIDv7');
+        return;
+      }
+      reply(id, { commandId: params?.commandId, status: 'accepted', userInputId: params?.userInputId });
       // Wire-true (schema: the tool call resolves with a cancelled result),
       // except ids flagged to emulate an agent that ignores the cancel.
       if (ignoreCancel.has(params?.userInputId)) return;
       ghostPending.delete(params?.userInputId);
+      quizExpected.delete(params?.userInputId);
       const w = waiters.get(params?.userInputId);
       if (w) {
         waiters.delete(params.userInputId);
         w.resolve({ cancelled: true });
       }
-      notify('userInput/settled', { sessionId: SESSION_ID, userInputId: params?.userInputId });
+      notify('userInput/settled', {
+        sessionId: SESSION_ID,
+        userInputId: params?.userInputId,
+        outcome: 'cancelled',
+        decidedByCommandId: params?.commandId,
+      });
       return;
     }
     case 'approval/listPending':
@@ -342,7 +526,7 @@ async function handle(msg) {
         }),
         status,
       };
-      reply(id, { commandId: params?.commandId, status: 'accepted' });
+      reply(id, { commandId: params.commandId, status: 'accepted' });
       notify('session/goalChanged', { sessionId: SESSION_ID, goal: { ...MOCK_GOAL } });
       return;
     }
@@ -352,7 +536,6 @@ async function handle(msg) {
       // Wire-trueness the e2e asserts on: the real host rejects a
       // non-UUIDv7 commandId with -32602 (AGENTS.md), and every verb
       // addresses the child through its PARENT session id.
-      const UUIDV7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
       if (!UUIDV7.test(String(params?.commandId || ''))) {
         replyError(id, -32602, 'Invalid params: commandId must be UUIDv7');
         return;
@@ -636,6 +819,43 @@ async function runTurn(turnId, text) {
     return;
   }
 
+  if (t.includes('askstaged')) {
+    // Two-stage approval: the stage-1 decide acks terminal:false, an
+    // approval/updated advances req-1 → req-2, and only the stage-2
+    // decide settles. A decide against req-1 after the advance -32053s.
+    const approvalId = `mock-staged-${turnId}`;
+    const choices1 = [
+      { choiceId: 'approve_once', label: 'Approve once', decision: 'approved', scope: 'once' },
+      { choiceId: 'reject', label: 'Reject', decision: 'denied', scope: 'once' },
+    ];
+    const choices2 = [
+      { choiceId: 'approve_once', label: 'Approve once', decision: 'approved', scope: 'once' },
+      { choiceId: 'escalate', label: 'Escalate', decision: 'approved', scope: 'once' },
+    ];
+    stagedApprovals.set(approvalId, { stage: 1, req: ['req-1', 'req-2'], choices2 });
+    const params = {
+      sessionId: SESSION_ID,
+      approvalId,
+      toolName: 'Bash',
+      toolCallId: 'tc-staged-1',
+      subject: { kind: 'shell', command: 'rm -rf /tmp/staged' },
+      rawArgs: '{"command":"rm -rf /tmp/staged"}',
+      currentRequirementId: 'req-1',
+      availableChoices: choices1,
+    };
+    approvalChoices.set(approvalId, choices1);
+    send({ jsonrpc: '2.0', id: `mock-req-${turnId}-as`, method: 'approval/request', params });
+    notify('approval/requested', params);
+    const decision = await new Promise((resolve) => waiters.set(approvalId, { resolve }));
+    if (cancelled.has(turnId)) return;
+    const picked = `${decision?.choiceId || 'nothing'}@${decision?.requirementId || 'no-req'}`;
+    await sleep(30);
+    if (await emitAgentText('m-asks', [`staged → ${picked}. `], `staged → ${picked}.`, turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
   if (t.includes('ask')) {
     // Unique per turn — a real host never reuses an approval id, and the
     // harness dedupes cards by id.
@@ -661,6 +881,7 @@ async function runTurn(turnId, text) {
     };
     // Both the server-initiated request AND the notification, like a real
     // host — the client must mount exactly one card.
+    approvalChoices.set(approvalId, params.availableChoices);
     send({ jsonrpc: '2.0', id: `mock-req-${turnId}-a`, method: 'approval/request', params });
     notify('approval/requested', params);
     const decision = await new Promise((resolve) => waiters.set(approvalId, { resolve }));
@@ -676,58 +897,129 @@ async function runTurn(turnId, text) {
     return;
   }
 
-  if (t.includes('quizmulti')) {
-    // Two questions — wider than the single-optionId card. The client must
-    // auto-cancel (with a visible trace) instead of stranding the turn.
-    const userInputId = 'mock-quiz-multi';
+  if (t.includes('quizbroken')) {
+    // Malformed prompt (unknown selection mode) — no form can answer it.
+    // The client must auto-cancel with a visible trace, and the turn must
+    // still settle. A hang here fails the e2e wait.
+    const userInputId = 'mock-quiz-broken';
     notify('userInput/requested', {
       sessionId: SESSION_ID,
       userInputId,
       toolName: 'AskUserQuestion',
       questions: [
-        { id: 'q1', question: 'First?', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
-        { id: 'q2', question: 'Second?', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
+        { id: 'q1', question: 'Bogus?', selection: { mode: 'fuzzy' }, options: [{ label: 'a' }] },
       ],
     });
     await sleep(300);
     if (cancelled.has(turnId)) return;
-    if (await emitAgentText('m-quizm', ['Continuing without an answer. '], 'Continuing without an answer.', turnId)) {
+    if (await emitAgentText('m-quizb', ['Continuing without an answer. '], 'Continuing without an answer.', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('quizflaky')) {
+    // The first answer RPC fails transiently; the identical retry lands.
+    const userInputId = `mock-quiz-flaky-${turnId}`;
+    const questions = [
+      { id: 'q1', question: 'Flaky pick?', header: 'Flaky', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
+    ];
+    quizExpected.set(userInputId, questions);
+    flakyOnce.add(userInputId);
+    const params = { sessionId: SESSION_ID, userInputId, toolName: 'AskUserQuestion', toolCallId: 'mock-tool-flaky', questions };
+    send({ jsonrpc: '2.0', id: `mock-req-${turnId}-qf`, method: 'userInput/request', params });
+    notify('userInput/requested', params);
+    const answer = await new Promise((resolve) => waiters.set(userInputId, { resolve }));
+    if (cancelled.has(turnId)) return;
+    const picked = answer?.answers?.[0]?.selectedLabel || answer?.answers?.[0]?.freeText || 'nothing';
+    await sleep(30);
+    if (await emitAgentText('m-quizf', [`flaky → ${picked}. `], `flaky → ${picked}.`, turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('quizshapes')) {
+    // One of every answerable shape: single-select, multi-select with
+    // bounds, and free-text. Answered atomically through the form.
+    const userInputId = `mock-quiz-shapes-${turnId}`;
+    const questions = [
+      { id: 'q1', question: 'Single pick?', header: 'Single', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
+      { id: 'q2', question: 'Multi pick?', header: 'Multi', selection: { mode: 'multiple', minSelections: 1, maxSelections: 2 }, options: [{ label: 'x' }, { label: 'y' }, { label: 'z' }] },
+      { id: 'q3', question: 'Explain?', header: 'Why', selection: { mode: 'single' }, options: [] },
+    ];
+    quizExpected.set(userInputId, questions);
+    const params = { sessionId: SESSION_ID, userInputId, toolName: 'AskUserQuestion', toolCallId: 'mock-tool-shapes', questions };
+    send({ jsonrpc: '2.0', id: `mock-req-${turnId}-qs`, method: 'userInput/request', params });
+    notify('userInput/requested', params);
+    const answer = await new Promise((resolve) => waiters.set(userInputId, { resolve }));
+    if (cancelled.has(turnId)) return;
+    const got = (answer?.answers || []).map((a) => a.selectedLabel || (a.selectedLabels || []).join('+') || a.freeText || '?').join('/');
+    await sleep(30);
+    if (await emitAgentText('m-quizs', [`shapes → ${got}. `], `shapes → ${got}.`, turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('quizmulti')) {
+    // Two questions — answered atomically through the form since 1.1.33
+    // (used to auto-cancel; malformed prompts still do — see quizbroken).
+    const userInputId = 'mock-quiz-multi';
+    const questions = [
+      { id: 'q1', question: 'First?', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
+      { id: 'q2', question: 'Second?', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
+    ];
+    quizExpected.set(userInputId, questions);
+    const params = { sessionId: SESSION_ID, userInputId, toolName: 'AskUserQuestion', questions };
+    send({ jsonrpc: '2.0', id: `mock-req-${turnId}-qm`, method: 'userInput/request', params });
+    notify('userInput/requested', params);
+    const answer = await new Promise((resolve) => waiters.set(userInputId, { resolve }));
+    if (cancelled.has(turnId)) return;
+    const got = (answer?.answers || []).map((a) => a.selectedLabel || '?').join('/');
+    await sleep(30);
+    if (await emitAgentText('m-quizm', [`multi → ${got}. `], `multi → ${got}.`, turnId)) {
       completeTurn(turnId);
     }
     return;
   }
 
   if (t.includes('ghostquiz')) {
-    // BUG-084: the wedge — a multi-question prompt the agent holds but never
-    // announces (no userInput/request, no userInput/requested). The client's
-    // only rescue is the listPending recovery poll, whose auto-cancel must
-    // unblock this waiter; the turn then completes normally.
+    // BUG-084 wedge shape, answerable ending: a multi-question prompt the
+    // agent holds but never announces (no userInput/request, no
+    // userInput/requested). The client's only rescue is the listPending
+    // recovery poll, which now MOUNTS the card; the harness answers it
+    // and the turn completes. A hang here fails the e2e wait.
     const userInputId = `mock-ghost-${turnId}`;
+    const questions = [
+      { id: 'g1', question: 'Ghost first?', header: 'Ghost1', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
+      { id: 'g2', question: 'Ghost second?', header: 'Ghost2', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
+    ];
+    quizExpected.set(userInputId, questions);
     ghostPending.set(userInputId, {
       sessionId: SESSION_ID,
       userInputId,
       toolName: 'AskUserQuestion',
       toolCallId: 'mock-tool-ghost',
       turnId,
-      questions: [
-        { id: 'g1', question: 'Ghost first?', header: 'Ghost1', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
-        { id: 'g2', question: 'Ghost second?', header: 'Ghost2', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
-      ],
+      questions,
     });
-    await new Promise((resolve) => waiters.set(userInputId, { resolve }));
+    const answer = await new Promise((resolve) => waiters.set(userInputId, { resolve }));
     ghostPending.delete(userInputId);
     if (cancelled.has(turnId)) return;
-    if (await emitAgentText('m-ghost', ['Recovered without an answer. '], 'Recovered without an answer.', turnId)) {
+    const got = (answer?.answers || []).map((a) => a.selectedLabel || '?').join('/');
+    if (await emitAgentText('m-ghost', [`ghost → ${got}. `], `ghost → ${got}.`, turnId)) {
       completeTurn(turnId);
     }
     return;
   }
 
   if (t.includes('stubbornquiz')) {
-    // BUG-084 escalation: like ghostquiz, but the agent ignores the cancel
-    // (stays pending) — the client must interrupt the run and settle loud.
-    // The interrupt unparks the waiter; the script then stays silent because
-    // the client already settled the turn itself.
+    // BUG-084 escalation: a MALFORMED ghost the agent holds but never
+    // announces — the poll auto-cancels, the agent ignores the cancel
+    // (stays pending), so the client must interrupt the run and settle
+    // loud. The interrupt unparks the waiter; the script then stays silent
+    // because the client already settled the turn itself.
     const userInputId = `mock-stubborn-${turnId}`;
     ignoreCancel.add(userInputId);
     ghostPending.set(userInputId, {
@@ -737,8 +1029,7 @@ async function runTurn(turnId, text) {
       toolCallId: 'mock-tool-stubborn',
       turnId,
       questions: [
-        { id: 's1', question: 'Stubborn first?', header: 'Stub1', selection: { mode: 'single' }, options: [{ label: 'a' }, { label: 'b' }] },
-        { id: 's2', question: 'Stubborn second?', header: 'Stub2', selection: { mode: 'single' }, options: [{ label: 'x' }, { label: 'y' }] },
+        { id: 's1', question: 'Stubborn?', header: 'Stub1', selection: { mode: 'fuzzy' }, options: [{ label: 'a' }] },
       ],
     });
     await new Promise((resolve) => waiters.set(userInputId, { resolve }));
@@ -764,11 +1055,12 @@ async function runTurn(turnId, text) {
         },
       ],
     };
+    quizExpected.set(userInputId, params.questions);
     send({ jsonrpc: '2.0', id: `mock-req-${turnId}-q`, method: 'userInput/request', params });
     notify('userInput/requested', params);
     const answer = await new Promise((resolve) => waiters.set(userInputId, { resolve }));
     if (cancelled.has(turnId)) return;
-    const picked = answer?.answers?.[0]?.selectedLabel || 'nothing';
+    const picked = answer?.answers?.[0]?.selectedLabel || answer?.answers?.[0]?.freeText || 'nothing';
     await sleep(30);
     if (await emitAgentText('m-quiz', [`ask → ${picked}. `], `ask → ${picked}.`, turnId)) {
       completeTurn(turnId);

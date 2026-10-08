@@ -15,6 +15,8 @@ import { MspClient } from '../src/server/msp-client.js';
 // Unit tests must never spawn a real agent — createChat background-warms by
 // default, so pin it off for this process (each suite is its own process).
 process.env.MUSE_DESKTOP_CREATE_WARM = '0';
+// Host-origin banners stay off here — unit suites never touch a desktop.
+process.env.MUSE_DESKTOP_NOTIFY = 'off';
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -244,7 +246,14 @@ test('settleTurn rejects the agent\'s real permission waiter, not just the UI ca
   const { mgr, wire, chatId } = managerWithOpenTurn();
   const client = new MspClient({ cwd: os.tmpdir() });
   const settled = [];
-  client._permWaiters.set('ix-7', { resolve: (v) => settled.push(v), reject: () => {} });
+  client._permWaiters.set('ix-7', {
+    kind: 'approval',
+    approvalId: 'ix-7',
+    requirementId: 'req-1',
+    choices: [{ choiceId: 'reject', decision: 'denied', scope: 'once' }],
+    resolve: (v) => settled.push(v),
+    reject: () => {},
+  });
   mgr.slots.get(chatId).client = client;
   mgr._onPermission(chatId, { id: 'ix-7', toolName: 'bash', options: [] });
   mgr.settleTurn(chatId, 't1', { reason: 'watchdog', error: 'stalled' });
@@ -618,7 +627,7 @@ test('every session/update kind counts as activity, not just rendered ones', () 
   assert.ok(slot.turn.lastActivity > 0);
 });
 
-test('sticky approve engages on a session-scoped approve choice', () => {
+test('sticky approve engages on a session-scoped approve choice', async () => {
   const approvalWaiter = (choices) => ({
     kind: 'approval',
     approvalId: 'a1',
@@ -627,27 +636,31 @@ test('sticky approve engages on a session-scoped approve choice', () => {
     resolve: () => {},
     reject: () => {},
   });
-  const client = new MspClient({ cwd: os.tmpdir() });
+  const acked = (client) => {
+    client.request = async () => ({ status: 'accepted', terminal: true });
+    return client;
+  };
+  const client = acked(new MspClient({ cwd: os.tmpdir() }));
   client._permWaiters.set('p1', approvalWaiter([
     { choiceId: 'approve_once', decision: 'approved', scope: 'once' },
     { choiceId: 'approve_always', decision: 'approvedForSession', scope: 'session' },
   ]));
   assert.equal(client.permissionStickyApprove, false);
-  client.resolvePermission('p1', 'approve_always');
+  await client.decideApproval('p1', 'approve_always');
   assert.equal(client.permissionStickyApprove, true, 'session-scoped approve must set the sticky flag');
   // …and the legacy spelling keeps working via the always-name fallback
-  const legacy = new MspClient({ cwd: os.tmpdir() });
+  const legacy = acked(new MspClient({ cwd: os.tmpdir() }));
   legacy._permWaiters.set('p2', approvalWaiter([
     { choiceId: 'allow_always', decision: 'approved', scope: 'once' },
   ]));
-  legacy.resolvePermission('p2', 'allow_always');
+  await legacy.decideApproval('p2', 'allow_always');
   assert.equal(legacy.permissionStickyApprove, true);
   // approve_once must NOT make the session sticky
-  const once = new MspClient({ cwd: os.tmpdir() });
+  const once = acked(new MspClient({ cwd: os.tmpdir() }));
   once._permWaiters.set('p3', approvalWaiter([
     { choiceId: 'approve_once', decision: 'approved', scope: 'once' },
   ]));
-  once.resolvePermission('p3', 'approve_once');
+  await once.decideApproval('p3', 'approve_once');
   assert.equal(once.permissionStickyApprove, false);
 });
 

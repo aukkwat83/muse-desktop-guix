@@ -2940,6 +2940,360 @@ button.search-hit:hover {
   padding: 6px 8px;
 }
 
+/* Resolved dressing (1.1.33): the outcome word plus one row per landed
+   answer. Ink-dim on --code-bg is the measured .ix-summary pair; the
+   header gets weight, not a new colour. */
+.ix-card .ix-outcome {
+  font-size: 0.78em;
+  color: var(--muted);
+  /* Own chip like the error line: the card body is an accent wash with no
+     muted-text pair, and wash-muted is the combination that failed at 4.0. */
+  background: var(--panel);
+  border-radius: 6px;
+  padding: 2px 8px;
+  align-self: flex-start;
+}
+
+.ix-card .ix-answers {
+  background: var(--code-bg);
+  border-radius: 6px;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.8em;
+  line-height: 1.45;
+  color: var(--ink-dim);
+  overflow-wrap: anywhere;
+}
+
+.ix-card .ix-answer-head {
+  font-weight: 650;
+}
+
+.ix-card .ix-sending,
+.qform-actions .qform-sending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8em;
+  color: var(--muted);
+  /* Chips onto --panel (the measured muted pair): the transcript card
+     is an accent wash with no muted pair, so the indicator carries its
+     own backdrop in both contexts. */
+  background: var(--panel);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+/* Spinner glyph (submit flights): reuses the progress-wheel keyframes so
+   there is exactly one rotation rhythm in the app. */
+.ico.spin {
+  animation: progress-spin 0.9s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ico.spin {
+    animation: none;
+  }
+}
+
+/* ------------------------------------------------------ question inbox */
+
+/* Header badge: hidden until something waits (app.js toggles `hidden`).
+   The count is accent type on the header panel — the measured pair. */
+#inbox-btn .ic-label {
+  color: var(--accent-text);
+  font-weight: 700;
+  font-size: var(--fs-footnote);
+}
+
+#inbox-btn.has-pending {
+  border-color: var(--accent-line);
+}
+
+/* The panel root lives inside .pop (app panel chrome: --raised bg). All
+   type below reuses measured pairs only — no new PAIRS entries needed. */
+.qinbox {
+  min-width: 21rem;
+  max-width: min(34rem, calc(100vw - 2rem));
+  display: flex;
+  flex-direction: column;
+  max-height: 70vh;
+}
+
+.qinbox-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-body);
+  color: var(--ink);
+}
+
+.qinbox-title {
+  font-weight: 650;
+  line-height: 1.5;
+}
+
+.qinbox-count {
+  color: var(--muted);
+  font-size: var(--fs-footnote);
+  line-height: 1.5;
+}
+
+.qinbox-close {
+  margin-left: auto;
+}
+
+.qinbox-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.qinbox-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  overflow-y: auto;
+  max-height: 10rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.qinbox-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.qinbox-item:hover,
+.qinbox-item:focus-visible {
+  background: var(--panel-2);
+  outline: none;
+}
+
+.qinbox-item.selected {
+  /* --panel-2 chip (both text colours measured on it), not the accent
+     wash — wash-muted failed AA at 4.19. The outline is decorative; the
+     open form carries the selection state. */
+  background: var(--panel-2);
+  outline: 1px solid var(--accent-line);
+  outline-offset: -1px;
+}
+
+/* Status dots are decorative fills (no text) — no contrast pair. */
+.qinbox-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: none;
+}
+
+.qinbox-dot.ask {
+  background: var(--ok);
+}
+
+.qinbox-dot.approval {
+  background: var(--warn);
+}
+
+.qinbox-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* One-line ellipsis rows need vertical breathing room: Sarabun's raised
+   tone marks paint outside the line box and a bare overflow clip cuts
+   them (the Thai clip trap — see GUIX.md). */
+.qinbox-item-chat,
+.qinbox-item-sum {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.5;
+  padding-block: 2px;
+}
+
+.qinbox-item-chat {
+  font-weight: 650;
+  font-size: var(--fs-body-sm);
+}
+
+.qinbox-item-sum {
+  color: var(--muted);
+  font-size: var(--fs-footnote);
+}
+
+.qinbox-empty {
+  padding: 14px 12px;
+  color: var(--muted);
+  font-size: var(--fs-body-sm);
+  line-height: 1.5;
+}
+
+.qinbox-form {
+  padding: 10px 12px 12px;
+  overflow-y: auto;
+}
+
+.qform {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.qform-q {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qform-qhead {
+  font-weight: 650;
+  font-size: var(--fs-body-sm);
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.qform-qtext {
+  font-size: var(--fs-body-sm);
+  line-height: 1.5;
+  color: var(--ink-dim);
+  overflow-wrap: anywhere;
+}
+
+.qform-hint {
+  font-size: var(--fs-footnote);
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.qform-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.qform-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: var(--fs-body-sm);
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.qform-opt:hover {
+  background: var(--panel-2);
+}
+
+.qform-opt input {
+  accent-color: var(--accent);
+  flex: none;
+  transform: translateY(1px);
+}
+
+.qform-opt-desc {
+  color: var(--muted);
+  font-size: var(--fs-footnote);
+}
+
+/* The “other, type your own” row: italic marker, typed box tucked under
+   the row it belongs to. */
+.qform-other .qform-opt-text {
+  font-style: italic;
+  color: var(--muted);
+}
+
+/* Doubled class: the later `.qform-text { width: 100% }` rule has equal
+   specificity and would override this width — 100% + the 28px indent
+   then overflows and clips the right edge. (Global border-box keeps the
+   calc exact: indent + (100% - indent) = the full row.) */
+.qform-text.qform-other-text {
+  margin: 0 0 4px 28px;
+  width: calc(100% - 28px);
+}
+
+.qform-text,
+.qform-note {
+  font: inherit;
+  font-size: var(--fs-body-sm);
+  line-height: 1.5;
+  color: var(--ink);
+  background: var(--input-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  width: 100%;
+  resize: vertical;
+}
+
+.qform-text::placeholder,
+.qform-note::placeholder {
+  color: var(--placeholder);
+}
+
+.qform-text:focus-visible,
+.qform-note:focus-visible,
+.qinbox-item:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.qform-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Same --danger-on---panel chip as .ix-card-error (the form sits on the
+   --raised popover, which has no danger pair). */
+.qform-err {
+  margin: 0;
+  font-size: 0.8em;
+  line-height: 1.5;
+  color: var(--danger);
+  background: var(--panel);
+  border-radius: 6px;
+  padding: 6px 8px;
+  overflow-wrap: anywhere;
+}
+
+.qform-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qform-actions .btn {
+  padding: 0.35rem 0.7rem;
+  font-size: var(--fs-body-sm);
+}
+
+.qform-ap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 /* -------------------------------------------------------- status line */
 
 .status-line {

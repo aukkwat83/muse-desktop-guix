@@ -38,6 +38,23 @@ MUSE_DESKTOP_SHELL=chrome ./bin/muse-desktop
 
 `linux/gtk-shell/manifest.scm` — pulled automatically by `native-launch.sh`.
 
+## Verify without running (compile-only)
+
+`main()` calls `ensure_host()` before anything else, so even
+`muse-desktop-shell --help` touches the live host on :3850. To check the
+C shell on the Guix host WITHOUT contacting any host or desktop:
+
+```bash
+cd linux/gtk-shell && guix shell -m manifest.scm gcc-toolchain pkg-config -- \
+  sh -c 'gcc -fsyntax-only -Wall -Wextra main.c $(pkg-config --cflags gtk4 libadwaita-1 webkitgtk-6.0)'
+```
+
+For the Python fallback shell: `python3 -m py_compile muse_desktop_shell.py`.
+
+Native notification/route checks need the real desktop (see the 1.1.33
+release notes): banner a question, tap it cold-started, and confirm the
+renderer lands on the exact chat + form.
+
 Rebuild after any `main.c` change:
 
 ```bash

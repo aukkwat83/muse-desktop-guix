@@ -164,6 +164,14 @@ Inspector is on. Guix stack modelled on grok-desktop `deploy/v0.8.9-guix`.
   against the old node process.
 - **No PAC on Guix** (see above). No `chrome-shell.js` SoT — the Chrome
   fallback uses minimal inline `--app` flags.
+- **Host is the Linux notification source** (1.1.33): `notify-question (op, key)`
+  over `gdbus call` with the tuple VARIANT-wrapped (`[<(..)>]` — bare `[(..)]`
+  is rejected, proven by GLib parse); receipts say queued/accepted, never
+  "delivered". The payload's `hostNotified` tells watching renderers not to
+  banner again. Banner taps queue until the page posts `{op:'ready'}` AFTER
+  hydration and clear only on the `{op:'routed'}` receipt; closing the window
+  drops the view (the app stays bus-activatable via the installed `.service`,
+  single instance reuses the window).
 - **Thai clip trap.** Sarabun's raised tone marks paint outside the line box;
   never ship a bare `overflow: hidden` + tight `line-height` on one-line
   elements (see `GUIX.md`).
@@ -175,10 +183,9 @@ Inspector is on. Guix stack modelled on grok-desktop `deploy/v0.8.9-guix`.
 - Windows. (`docs/attic/` has two sketches from the original scaffold; neither runs.
   Linux is implemented now — this section used to say otherwise.)
 - Electron. The shell is Swift; there is no `electron-builder` path.
-- Multi-question / multi-select / free-text agent questions. The card posts a single optionId
-  and `userInput/answer` requires every question answered, so shapes that do not fit are
-  auto-cancelled with a visible `msp:user_input_unsupported` trace instead of stranding the
-  turn. The single-question single-select shape covers the common case.
+- ~~Multi-question / multi-select / free-text agent questions~~ — BUILT in 1.1.33
+  (full forms per the installed MSP schema + Thai inbox). Only genuinely
+  malformed prompts still auto-cancel with `msp:user_input_unsupported`.
 - MCP parity with the TUI. Sessions run with the binary's own MCP audit; the desktop adds no
   servers of its own (same as the kimi lineage, which passed `mcpServers: []`).
 - Image/audio prompt blocks. We send text only.

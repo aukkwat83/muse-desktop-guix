@@ -3,7 +3,7 @@
 // (teams-format.js:546-566). grok's Teams/HTML variant is grok-specific and
 // deliberately not ported. Pure — unit-testable in Node.
 
-import { toolStatusLabel, toolTopic } from './turn-view.js?v=0.4.26';
+import { toolStatusLabel, toolTopic } from './turn-view.js?v=0.5.0';
 
 /** A fence that can hold `text` even when it contains backtick runs. */
 function fenceFor(text) {

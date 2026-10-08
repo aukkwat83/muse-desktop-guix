@@ -682,14 +682,35 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, interactions: sessions.listPendingInteractions() });
     }
 
+    const engagedMatch = pathname.match(/^\/api\/interactions\/([^/]+)\/engaged$/);
+    if (engagedMatch && method === 'POST') {
+      // Timed-prompt engagement (userInput/engaged): best-effort by
+      // contract — always 200, the form is the guarantee.
+      const done = sessions.engageInteraction(decodeURIComponent(engagedMatch[1]));
+      return send(res, 200, { ok: true, engaged: !!done });
+    }
+
     const interactionMatch = pathname.match(/^\/api\/interactions\/([^/]+)$/);
     if (interactionMatch && method === 'POST') {
+      // ACK-safe submit: { answers } | { optionId } | { cancel, reason? }.
+      // 200 lands (or duplicates) only after the RPC ack; 400 validates,
+      // 404 is gone, 409 is a conflicting answer, 502 keeps the card with
+      // retryable cause. The UI paints resolved from SSE, never this body.
       const body = await readJson(req);
-      const ok = sessions.resolveInteraction(
-        decodeURIComponent(interactionMatch[1]),
-        String(body.optionId || 'reject'),
-      );
-      return send(res, ok ? 200 : 404, { ok });
+      try {
+        const result = await sessions.submitInteraction(
+          decodeURIComponent(interactionMatch[1]),
+          body || {},
+        );
+        return send(res, 200, result);
+      } catch (err) {
+        return fail(res, err?.status || 500, err?.message || 'submit failed', {
+          code: err?.code || null,
+          retryable: err?.retryable ?? null,
+          questionId: err?.questionId || null,
+          outcome: err?.outcome || null,
+        });
+      }
     }
 
     if (pathname === '/api/usage' && method === 'GET') {
@@ -703,21 +724,29 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: true, pricing: priceTable(), thbPerUsd: thbPerUsd() });
     }
 
-    // ---- mac notification ------------------------------------------
+    // ---- notifications ---------------------------------------------
     // The WKWebView shell does not deliver Web Notifications reliably, so an
     // agent question also fans out through here: osascript posts a real macOS
     // banner even when the window is behind something else. Fire-and-forget —
     // a notification failure must never fail the turn it announces.
+    // On Linux the banner path is the native GTK bridge (museNotify), not
+    // this route — but the renderer still reports which channel fired, so
+    // the host log shows the honest delivery story per question.
     if (pathname === '/api/notify' && method === 'POST') {
-      const payload = buildNotifyPayload(await readJson(req).catch(() => ({})));
+      const input = await readJson(req).catch(() => ({}));
+      const payload = buildNotifyPayload(input);
+      const channel = typeof input?.channel === 'string' ? input.channel.slice(0, 16) : '?';
+      const ix = typeof input?.interactionId === 'string' ? input.interactionId.slice(0, 64) : '-';
       if (shouldDeliver(payload)) {
         const p = spawn('/usr/bin/osascript', notifyArgs(payload), {
           detached: true,
           stdio: 'ignore',
         });
         p.unref();
+        console.log(`[notify] host banner ix=${ix} renderer-channel=${channel}`);
         return send(res, 200, { ok: true, delivered: true });
       }
+      if (payload.text) console.log(`[notify] renderer-channel=${channel} ix=${ix} (host delivers on macOS only)`);
       return send(res, 200, { ok: true, delivered: false });
     }
 

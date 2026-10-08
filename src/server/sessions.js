@@ -21,7 +21,14 @@ import path from 'node:path';
 
 import { MspClient, formatRpcError, isAuthRequiredError, isClientAlive, isHistoryIncompatibleError, isMcpAuditFailedError, sanitizeSubscriptionUsage, terminalAuthCommand, uuidv7 } from './msp-client.js';
 import { ConfigCatalog } from './config-catalog.js';
-import { classifyPendingUserInputs, formatDiffPreview } from './hosts.js';
+import {
+  classifyPendingUserInputs,
+  formatDiffPreview,
+  submissionKey,
+  summarizeUserInputAnswers,
+  validateApprovalDecision,
+  validateUserInputAnswers,
+} from './hosts.js';
 import { normalizeSessionMode } from './session-mode.js';
 import { SearchIndex, turnForMessageIndex } from './search-index.js';
 import { readNativeChildTranscript } from './native-transcript.js';
@@ -30,6 +37,7 @@ import { cutEllipsis } from './text.js';
 import { normalizeAttachmentInput, resolveAttachments } from './attachments.js';
 import { applyApPrefixToTitle } from './ap-title.js';
 import { usageCacheFile, writeUsageCache } from './usage-cache.js';
+import { buildQuestionNotice, defaultQuestionNotifier } from './notify.js';
 
 const DEFAULT_MAX_HOT = Number(process.env.MUSE_DESKTOP_MAX_HOT_AGENTS || 6);
 const DEFAULT_IDLE_DEMOTE_MS = Number(process.env.MUSE_DESKTOP_IDLE_DEMOTE_MS || 30 * 60 * 1000);
@@ -99,6 +107,22 @@ const HISTORY_INCOMPATIBLE_NOTICE =
  * poisoned, so the retry resumes the same session on a fresh agent. */
 const MCP_AUDIT_FAILED_NOTICE =
   'agent สตาร์ท MCP ไม่ผ่าน (MCP startup audit failed) — เปิด agent ใหม่แล้วลองส่งต่ออีกครั้ง เซสชันเดิมยังอยู่ครบ';
+/**
+ * Interactive-settlement RPC codes (binary 1.4.3 error table, all
+ * retryable:false AT THE HOST) — but the desktop's answer differs per
+ * code: already-settled/not-found means the prompt is gone (resolve the
+ * card as remotely settled); invalid/stale means OUR submission was wrong
+ * (keep the card, hand it back with the cause).
+ */
+const RPC_USER_INPUT_NOT_FOUND = -32055;
+const RPC_USER_INPUT_ALREADY_SETTLED = -32056;
+const RPC_USER_INPUT_ANSWER_INVALID = -32057;
+const RPC_APPROVAL_NOT_FOUND = -32050;
+const RPC_APPROVAL_ALREADY_RESOLVED = -32051;
+const RPC_APPROVAL_CHOICE_INVALID = -32052;
+const RPC_APPROVAL_REQUIREMENT_STALE = -32053;
+/** Bounded duplicate window for recently resolved interactions. */
+const SETTLED_INTERACTIONS_MAX = 200;
 
 export function extractText(content) {
   if (content == null) return '';
@@ -419,10 +443,13 @@ export function readUpdate(params) {
 }
 
 export class SessionManager extends EventEmitter {
-  constructor({ store, wire, defaults = {}, catalog = null, searchDbPath = null }) {
+  constructor({ store, wire, defaults = {}, catalog = null, searchDbPath = null, notifier = null }) {
     super();
     this.store = store;
     this.wire = wire;
+    // Host-origin question banners (Linux gdbus; injectable so unit/E2E
+    // tests never touch a real desktop — see MUSE_DESKTOP_NOTIFY_LOG).
+    this.notifier = notifier || defaultQuestionNotifier();
     /** Agent-wide model/thinking catalog — lets cold chats offer pickers
      * before their first spawn (BUG-079). */
     this.catalog = catalog || new ConfigCatalog();
@@ -443,6 +470,25 @@ export class SessionManager extends EventEmitter {
     this.slots = new Map();
     /** interactionId → { chatId, resolve } — any client may answer. */
     this.pendingInteractions = new Map();
+    /**
+     * interactionId → in-flight or last submission
+     * { key, commandId, state: 'submitting'|'failed', promise? }.
+     * The idempotency registry: an identical concurrent POST awaits the
+     * same flight, an identical retry reuses the stored commandId (the
+     * host dedupes by its SS3.1.1 handle), and a conflicting body 409s.
+     * Cleared when the interaction resolves; see settledInteractions for
+     * the post-resolve duplicate window.
+     */
+    this.submissions = new Map();
+    /**
+     * interactionId → { key, outcome, swept, ts } for recently resolved
+     * interactions (bounded, insertion-capped). Lets an identical retry
+     * that lost its HTTP response answer 200-duplicate instead of 404,
+     * and a conflicting late answer 409 instead of silently dropping.
+     * Swept entries (turn settled underneath) stay 404 — a stale card
+     * after settle is gone, not conflicting (BUG-025).
+     */
+    this.settledInteractions = new Map();
     /**
      * chatId → { message?: {turnId,delta,text,timer}, thought?: {...} } —
      * batched stream deltas, flushed by timer/size and always by settleTurn
@@ -527,7 +573,7 @@ export class SessionManager extends EventEmitter {
       mspSessionId: slot?.client?.sessionId ?? chat.mspSessionId ?? null,
       pendingInteractions: [...this.pendingInteractions.values()]
         .filter((p) => p.chatId === chat.id)
-        .map((p) => p.payload),
+        .map((p) => this._pendingSnapshot(p)),
     };
   }
 
@@ -611,7 +657,7 @@ export class SessionManager extends EventEmitter {
         plan: turn.plan,
         pendingInteractions: [...this.pendingInteractions.values()]
           .filter((p) => p.chatId === chatId)
-          .map((p) => p.payload),
+          .map((p) => this._pendingSnapshot(p)),
       },
     };
   }
@@ -865,17 +911,67 @@ export class SessionManager extends EventEmitter {
     return !!this.slots.get(id)?.client;
   }
 
+  /**
+   * True only for a client that can actually serve a prompt: spawned,
+   * sessioned, subscribed AND fully configured. The handshake assigns
+   * sessionId before view/subscribe completes, and applies model/mode
+   * config AFTER the subscribe — so neither sessionId nor subscribed
+   * alone is readiness; only a settled boot is. `_sessionReady === false`
+   * marks a boot remnant a fresh spawn must replace; undefined (test
+   * stubs) takes the fast path — there is nothing further this layer
+   * can verify about a stub.
+   */
+  _clientReady(client) {
+    return !!(
+      client &&
+      client.sessionId &&
+      client.subscribed &&
+      client._sessionReady !== false &&
+      client.proc?.exitCode == null
+    );
+  }
+
   async ensureClient(chatId) {
     const chat = this.store.get(chatId);
     if (!chat) throw new Error(`unknown chat ${chatId}`);
 
     let slot = this.slots.get(chatId);
-    if (slot?.client && slot.client.sessionId && slot.client.proc?.exitCode == null) {
+    // A boot in flight owns readiness — await it BEFORE any fast path:
+    // full _handshake configuration (model/list, mode, session config)
+    // lands after view/subscribe, so even a subscribed client is partial
+    // until the boot promise settles. Single-flight doubles here: two
+    // prompts arriving together wait on one boot, never a half-open
+    // client (the 72/78 NOT_SUBSCRIBED cascade).
+    if (slot?.starting) {
+      const client = await slot.starting;
+      slot = this.slots.get(chatId) || slot;
+      if (!this._clientReady(client)) {
+        throw new Error('agent boot finished without a ready session');
+      }
+      slot.lastUsed = Date.now();
+      return client;
+    }
+    if (this._clientReady(slot?.client)) {
       slot.lastUsed = Date.now();
       return slot.client;
     }
-    // Single-flight: two prompts arriving together must not spawn two agents.
-    if (slot?.starting) return slot.starting;
+    // A live session that lost its subscription outside any boot (a
+    // subscribe that failed post-handshake, a resubscribed mock) heals
+    // here rather than failing the prompt that noticed it. Clients
+    // without the heal verb (test stubs) return as-is — there is
+    // nothing further this layer can verify about them. A boot remnant
+    // (_sessionReady === false) is never healed: it falls through to a
+    // fresh spawn below.
+    if (slot?.client
+      && slot.client.sessionId
+      && slot.client.proc?.exitCode == null
+      && slot.client._sessionReady !== false) {
+      if (typeof slot.client.ensureSubscribed === 'function') {
+        await slot.client.ensureSubscribed();
+      }
+      slot.lastUsed = Date.now();
+      return slot.client;
+    }
 
     if (!slot) {
       // cancelledPrompts: userInputId → cancel-timestamp ms, for the BUG-084
@@ -892,6 +988,15 @@ export class SessionManager extends EventEmitter {
 
     const boot = (async () => {
       await this._evictIfOverCap(chatId);
+      // A remnant client (dead proc, no session, half-configured boot) must
+      // not leak its process when the fresh spawn replaces it.
+      if (slot.client) {
+        const stale = slot.client;
+        slot.client = null;
+        try {
+          await stale.shutdown();
+        } catch { /* best effort */ }
+      }
       const client = new MspClient({
         cwd: chat.cwd,
         model: chat.model,
@@ -1028,10 +1133,14 @@ export class SessionManager extends EventEmitter {
     }
     for (const [id, p] of [...this.pendingInteractions]) {
       if (p.chatId === chatId) {
-        // Same dead-shape fix as settleTurn: reject through the real waiter on
-        // the client before it is shut down below.
-        try { slot.client?.resolvePermission(id, 'reject'); } catch { /* ignore */ }
+        // Same dead-shape fix as settleTurn: un-park through the real waiter
+        // on the client before it is shut down below (deny for approvals,
+        // cancel for questions), then mark swept so a stale answer 404s
+        // instead of looking conflicting.
+        try { slot.client?.cancelInteractive(id, reason); } catch { /* ignore */ }
         this.pendingInteractions.delete(id);
+        this.submissions.delete(id);
+        this._recordSettled(id, { key: null, outcome: 'released', swept: true });
       }
     }
     const client = slot.client;
@@ -1375,10 +1484,21 @@ export class SessionManager extends EventEmitter {
         // The waiter that actually unblocks the agent lives on the MspClient
         // (_permWaiters) — pendingInteractions is metadata only. Resolving it
         // here is what lets a watchdog/released settle un-park an agent that
-        // is still sitting on session/request_permission.
-        try { slot.client?.resolvePermission(id, 'reject'); } catch { /* ignore */ }
+        // is still sitting on session/request_permission. Deny for
+        // approvals, cancel for questions — and swept, so a stale answer
+        // 404s (BUG-025) instead of looking conflicting.
+        try { slot.client?.cancelInteractive(id, 'turn settled'); } catch { /* ignore */ }
         this.pendingInteractions.delete(id);
-        this.wire.emit(chatId, 'interaction_resolved', { id, optionId: 'reject', reason: 'turn settled' });
+        this.submissions.delete(id);
+        this._recordSettled(id, { key: null, outcome: 'settled', swept: true });
+        this.wire.emit(chatId, 'interaction_resolved', {
+          id,
+          optionId: 'reject',
+          outcome: 'settled',
+          reason: 'turn settled',
+          turnId: turnId ?? null,
+        });
+        this._notifyQuestionWithdraw(id);
       }
     }
 
@@ -1973,7 +2093,7 @@ export class SessionManager extends EventEmitter {
         const heads = qs.map((q) => String(q?.header || q?.id || '').trim()).filter(Boolean);
         this.store.addMessage(chatId, {
           role: 'notice',
-          text: `agent ถาม ${qs.length} คำถามพร้อมกัน${heads.length ? ` (${heads.slice(0, 4).join(' / ')})` : ''} — เดสก์ท็อปแสดงได้ทีละคำถาม จึงยกเลิกให้ agent ตอบต่อเอง`,
+          text: `agent ส่งคำถามที่เดสก์ท็อปแสดงไม่ได้${heads.length ? ` (${heads.slice(0, 4).join(' / ')})` : ''} — จึงยกเลิกให้ agent ตอบต่อเอง`,
           meta: { ...(turnId ? { turnId } : {}), userInputId: update.userInputId || null },
         });
         this.wire.emit(chatId, 'agent_update_other', { kind: kind || 'unknown', update });
@@ -1989,12 +2109,75 @@ export class SessionManager extends EventEmitter {
 
   _onPermission(chatId, req) {
     if (req?.resolved) {
-      this.pendingInteractions.delete(req.id);
+      // Authoritative settlement (agent-side resolve, settled event, card
+      // timeout) applies IMMEDIATELY — pending/UI/banner update now with
+      // the true outcome/reason/answers/turnId, with zero dependence on a
+      // late ack. A mid-flight ack that lands afterwards resolves
+      // superseded: no second terminal event, no downgrade. The settled
+      // record keeps the flight's fingerprint, so the identical retry
+      // (lost-response included) still duplicates instead of 404ing.
+      const flight = this.submissions.get(req.id);
+      const was = this.pendingInteractions.get(req.id);
+      const wasPending = this.pendingInteractions.delete(req.id);
+      this.submissions.delete(req.id);
+      const prev = this.settledInteractions.get(req.id);
+      // Choice attribution: the wire carries NO choice identity, only the
+      // winning commandId. Attribute our submitted/cached choice IFF the
+      // winner IS our command (in-flight attempt or landed record's
+      // submitted command) — a foreign or unknown winner stays null.
+      // Never pretend another command chose our choice; the outcome enum
+      // travels separately. The match is against submittedCommandId, NOT
+      // the record's decidedByCommandId: that field is the authoritative
+      // WINNER, and matching it re-attributed our choice to a repeated
+      // foreign-winner event (recorded ours + winner foreign, repeat
+      // matched foreign-to-foreign and emitted our choice).
+      const winner = req.decidedByCommandId ?? null;
+      const ourCommand = flight?.commandId ?? prev?.submittedCommandId ?? null;
+      const optionId = (winner != null && ourCommand != null && winner === ourCommand)
+        ? (flight?.optionId ?? prev?.optionId ?? null)
+        : null;
+      if (prev) {
+        if (req.outcome) prev.outcome = req.outcome;
+      } else if (wasPending || req.outcome) {
+        // A failed attempt's fingerprint survives: its identical retry is
+        // a duplicate of this settlement, not a 404 — the lost-response
+        // retry after a settled-while-failed race must not look gone.
+        // Submitted identity and winning identity are separate fields:
+        // optionId/submittedCommandId are OURS (retry matching + later
+        // winner confirmation), decidedByCommandId is the AUTHORITATIVE
+        // winner (foreign or ours). The emit above carries only the
+        // attributed choice (or null).
+        this._recordSettled(req.id, {
+          key: flight?.key ?? null,
+          kind: flight?.kind ?? null,
+          optionId: flight?.optionId ?? null,
+          submittedCommandId: flight?.commandId ?? null,
+          sessionId: flight?.sessionId ?? null,
+          decidedByCommandId: winner ?? null,
+          outcome: req.outcome || 'resolved',
+          swept: false,
+        });
+      }
+      // Authoritative answers carry the SAME renderer summary as the
+      // ack path ({questionId, header, display}): the UI/E2E reads
+      // .display off resolved answers whichever path won the race. The
+      // EVENT's answers are authoritative — a foreign winner's or an
+      // empty timeout's — never our flight's; missing stays null.
+      const settledAnswers = Array.isArray(req.answers)
+        ? summarizeUserInputAnswers(was?.payload?.questions || [], req.answers)
+        : null;
       this.wire.emit(chatId, 'interaction_resolved', {
         id: req.id,
-        optionId: req.optionId,
+        optionId,
+        outcome: req.outcome || null,
         reason: req.reason || null,
+        decidedByCommandId: req.decidedByCommandId ?? null,
+        answers: settledAnswers,
+        // Tombstone key (1.1.33): a late pending snapshot carrying this
+        // same turn must not resurrect the card.
+        turnId: was?.payload?.turnId ?? req.turnId ?? null,
       });
+      this._notifyQuestionWithdraw(req.id);
       return;
     }
     // Scoped like every other turn event: a renderer that missed turn_started
@@ -2009,24 +2192,443 @@ export class SessionManager extends EventEmitter {
       summary: req.summary,
       body: req.body || '',
       options: req.options || [],
+      // The question form model (ask cards only) + the timed-prompt
+      // countdown the renderer disarms via userInput/engaged.
+      ...(Array.isArray(req.questions) ? { questions: req.questions } : {}),
+      ...(req.autoResolutionMs != null ? { autoResolutionMs: req.autoResolutionMs } : {}),
+      // Multi-stage race token (approvals): the UI posts it back so a
+      // decision against a dead stage 409s instead of mis-deciding.
+      requirementId: req.requirementId ?? null,
       turnId: turn && !turn.settled ? turn.turnId : null,
       ts: Date.now(),
     };
     // Stored, not just broadcast: a client that was not watching this chat
     // when the request arrived must still be able to answer it.
+    // The host banners BEFORE the emit so the payload can carry the
+    // receipt: on Linux the host is the notification source and a
+    // watching renderer must NOT banner again (no double banner).
+    payload.hostNotified = this._notifyQuestionPending(chatId, payload);
     this.pendingInteractions.set(req.id, { chatId, payload });
     this._touch(chatId, turn?.turnId);
     this.wire.emit(chatId, 'interaction', payload);
   }
 
-  resolveInteraction(interactionId, optionId) {
-    const pending = this.pendingInteractions.get(interactionId);
-    if (!pending) return false;
+  /**
+   * Host-origin banner for a new pending question (Linux). Returns true
+   * when the host took responsibility (queued/accepted/logged) — the
+   * renderer then skips its own banner and the inbox + card stay the
+   * guaranteed surfaces. Best-effort: never throws.
+   */
+  _notifyQuestionPending(chatId, payload) {
+    try {
+      const chat = this.store.get(chatId);
+      const notice = buildQuestionNotice({
+        subtype: payload?.subtype,
+        chatTitle: chat?.title,
+        summary: payload?.summary,
+      });
+      const r = this.notifier?.pending?.({
+        id: payload?.id,
+        chatId,
+        title: notice.title,
+        body: notice.text,
+      });
+      return !!(r?.attempted && (r.delivered || r.queued));
+    } catch { return false; /* notification failure never fails the turn */ }
+  }
+
+  /** Withdraw the host banner for a settled question. Best-effort. */
+  _notifyQuestionWithdraw(id) {
+    try {
+      this.notifier?.withdraw?.(id);
+    } catch { /* ignore */ }
+  }
+
+  _recordSettled(id, record) {
+    this.settledInteractions.set(String(id), { ...record, ts: Date.now() });
+    while (this.settledInteractions.size > SETTLED_INTERACTIONS_MAX) {
+      const oldest = this.settledInteractions.keys().next().value;
+      this.settledInteractions.delete(oldest);
+    }
+  }
+
+  _httpError(status, code, message, extra = {}) {
+    const err = new Error(message);
+    err.status = status;
+    err.code = code;
+    Object.assign(err, extra);
+    return err;
+  }
+
+  /**
+   * ACK-safe answer / decide / cancel for one pending interaction — the
+   * only user path that settles a card (the sweep path is
+   * cancelInteractive, the agent path is the settled event).
+   *
+   * `body` is one of `{ answers }` (ask), `{ optionId }` (approval) or
+   * `{ cancel: true, reason? }` (explicit question cancel). Lifecycle:
+   * pending → submitting → resolved, and resolved ONLY after the RPC
+   * ack or an authoritative settled event. A rejection keeps the card
+   * pending with the cause; the UI retries with the same body.
+   *
+   * Idempotency: an identical concurrent POST awaits the same flight; an
+   * identical retry (lost HTTP response included) reuses the stored
+   * UUIDv7 commandId so the host dedupes; a conflicting body 409s.
+   * Throws HTTP-ish errors (status 400/404/409/502).
+   */
+  async submitInteraction(interactionId, body = {}) {
+    const id = String(interactionId || '');
+    const pending = this.pendingInteractions.get(id);
+    const wantCancel = body?.cancel === true;
+    if (!pending) return this._submitToSettled(id, body, wantCancel);
+
     const slot = this.slots.get(pending.chatId);
-    const ok = slot?.client?.resolvePermission(interactionId, optionId);
-    this.pendingInteractions.delete(interactionId);
-    this.wire.emit(pending.chatId, 'interaction_resolved', { id: interactionId, optionId });
-    return !!ok;
+    const client = slot?.client;
+    if (!client || !isClientAlive(client)) {
+      throw this._httpError(502, 'AGENT_GONE', 'agent หลุดการเชื่อมต่อ — ลอง prompt ใหม่อีกครั้ง', {
+        retryable: false,
+      });
+    }
+    const sessionId = client.sessionId ?? null;
+    const isAsk = pending.payload?.subtype === 'ask';
+    let normalized;
+    let stage = null;
+    if (wantCancel) {
+      if (!isAsk) {
+        throw this._httpError(400, 'CANCEL_UNSUPPORTED', 'การอนุญาตต้องเลือกตัวเลือก (รวมปฏิเสธ) แทนการยกเลิก');
+      }
+      normalized = {
+        kind: 'cancel',
+        reason: String(body?.reason || 'ผู้ใช้ยกเลิกคำถามใน Muse Desktop').slice(0, 500),
+      };
+    } else if (isAsk) {
+      const v = validateUserInputAnswers(pending.payload?.questions || [], body?.answers);
+      if (!v.ok) throw this._httpError(400, v.code, v.error, { questionId: v.questionId || null });
+      normalized = { kind: 'answer', answers: v.answers };
+    } else {
+      const waiter = client._permWaiters?.get(id);
+      stage = waiter?.requirementId ?? null;
+      // Multi-stage race token FIRST: the UI posts back the requirementId
+      // it rendered, and a mismatch means the whole decision targets a
+      // dead stage (approval/updated won the race) — 409 with the FRESH
+      // choices before any value validation, so the UI re-decides and
+      // never decides a dead stage.
+      if (body?.requirementId != null && String(body.requirementId) !== String(stage ?? '')) {
+        throw this._httpError(409, 'STAGE_STALE', 'ขั้นตอนการอนุญาตเปลี่ยนไปแล้ว — ตัดสินใจใหม่', {
+          choices: (pending.payload?.options || []).map((o) => ({ ...o })),
+          requirementId: stage,
+          retryable: true,
+        });
+      }
+      const choices = waiter?.choices || [];
+      const v = validateApprovalDecision(choices, body?.optionId);
+      if (!v.ok) throw this._httpError(400, v.code, v.error);
+      normalized = { kind: 'decide', optionId: String(body.optionId).trim(), requirementId: stage };
+    }
+    // Idempotency key over the shape-normalized RAW body plus the fence
+    // it must land in (session + requirement stage for approvals): values
+    // as sent, so a byte-identical retry — including one that lost its
+    // HTTP response after the ack landed — matches. A next-stage same
+    // choice is a DIFFERENT key (new command); cancel reasons are
+    // excluded (any cancel duplicates a landed cancel).
+    const key = submissionKey(
+      normalized.kind === 'answer'
+        ? { kind: 'answer', answers: body.answers, sessionId }
+        : normalized.kind === 'decide'
+          ? { kind: 'decide', optionId: String(body.optionId), requirementId: stage, sessionId }
+          : { kind: 'cancel', sessionId },
+    );
+
+    // Identical concurrent POST: one flight, every waiter shares it.
+    const flight = this.submissions.get(id);
+    if (flight?.state === 'submitting') {
+      if (flight.key !== key) {
+        throw this._httpError(409, 'SUBMIT_CONFLICT', 'มีคำตอบอื่นกำลังส่งอยู่ — รอให้เสร็จก่อน', {
+          retryable: true,
+        });
+      }
+      return flight.promise;
+    }
+    // Accepted-but-unresolved (terminal:false approval): the decision
+    // LANDED, so an identical retry — same key, same session fence, next
+    // stage not yet arrived — replays the cached accept instead of
+    // sending another RPC with a new UUID. A new stage or body is a
+    // different key and falls through to a fresh command below.
+    if (flight?.state === 'accepted' && flight.key === key && flight.sessionId === sessionId) {
+      return { ok: true, ...flight.accepted };
+    }
+    // Uncertain retry: the same key in the same session reuses the stored
+    // commandId so the host dedupes by its SS3.1.1 handle instead of
+    // double-settling. A new key (new stage, new body) or a rotated
+    // session mints a fresh command — never reuse across fences.
+    const sameFence = flight?.key === key && flight.sessionId === sessionId;
+    const commandId = sameFence && flight.commandId ? flight.commandId : uuidv7();
+    const attempt = {
+      key,
+      kind: normalized.kind,
+      optionId: normalized.optionId ?? null,
+      commandId,
+      state: 'submitting',
+      promise: null,
+      stage,
+      sessionId,
+    };
+    this.submissions.set(id, attempt);
+    pending.flight = attempt; // ownership: only this attempt may resolve this pending entry
+    this.wire.emit(pending.chatId, 'interaction_state', { id, state: 'submitting' });
+
+    attempt.promise = (async () => {
+      try {
+        if (normalized.kind === 'answer') {
+          await client.answerUserInput(id, normalized.answers, { commandId });
+          return this._landSubmission(pending, id, attempt, {
+            outcome: 'answered',
+            optionId: normalized.answers.length === 1 && normalized.answers[0].selectedLabel
+              ? normalized.answers[0].selectedLabel
+              : null,
+            answers: summarizeUserInputAnswers(pending.payload?.questions || [], normalized.answers),
+          });
+        }
+        if (normalized.kind === 'decide') {
+          const ack = await client.decideApproval(id, normalized.optionId, { commandId });
+          if (!ack.terminal) {
+            // Multi-stage: the decision LANDED but the approval stays
+            // pending — the follow-up approval/request refreshes the card.
+            // A newer flight owns the slot: this ack is real (the RPC was
+            // accepted) but resolves and caches nothing — report exactly
+            // that, without touching the newer attempt's bookkeeping.
+            const owns = this.submissions.get(id) === attempt;
+            if (owns) {
+              // Cache the accept per session/requirement stage (the key
+              // already fences both): an identical retry replays this
+              // instead of sending a second RPC. Keep pending, resolve
+              // nothing — the next stage decides its own command.
+              attempt.state = 'accepted';
+              attempt.accepted = { outcome: 'decided', terminal: false, commandId, stage };
+              if (pending.flight === attempt) pending.flight = null;
+            }
+            // A settlement that landed first (immediate) supersedes this
+            // accept: report the settled truth, never a stale re-pending.
+            const settledFirst = this.settledInteractions.get(id);
+            if (settledFirst && !settledFirst.swept) {
+              return { ok: true, outcome: settledFirst.outcome, commandId, superseded: true };
+            }
+            return { ok: true, outcome: 'decided', terminal: false, commandId, stage };
+          }
+          return this._landSubmission(pending, id, attempt, {
+            outcome: 'decided',
+            optionId: normalized.optionId,
+          });
+        }
+        await client.cancelUserInput(id, normalized.reason, { commandId });
+        return this._landSubmission(pending, id, attempt, {
+          outcome: 'cancelled',
+          reason: normalized.reason,
+        });
+      } catch (err) {
+        return this._failSubmission(pending, id, attempt, err);
+      }
+    })();
+    return attempt.promise;
+  }
+
+  /**
+   * Land an acked submission: pending → resolved, one funnel — but only
+   * when this attempt still owns the pending entry. A stage that advanced
+   * mid-flight (approval/updated replaced the entry) supersedes the ack:
+   * real, but with nothing left for THIS attempt to resolve.
+   */
+  _landSubmission(pending, id, attempt, result) {
+    const cur = this.pendingInteractions.get(id);
+    if (!cur || cur.flight !== attempt) {
+      if (this.submissions.get(id) === attempt) this.submissions.delete(id);
+      // Superseded by an immediate settlement: report the settled truth,
+      // never the guessed outcome — and emit nothing (no duplicate event).
+      const s = this.settledInteractions.get(id);
+      if (s && !s.swept) {
+        return { ok: true, ...result, outcome: s.outcome, commandId: attempt.commandId, superseded: true };
+      }
+      return { ok: true, ...result, commandId: attempt.commandId, superseded: true };
+    }
+    const outcome = result.outcome;
+    this.pendingInteractions.delete(id);
+    this.submissions.delete(id);
+    this._recordSettled(id, {
+      key: attempt.key,
+      kind: attempt.kind,
+      optionId: attempt.optionId,
+      sessionId: attempt.sessionId,
+      // Retained for later choice attribution: a settled event whose
+      // winner is this command confirms this choice (else null). On the
+      // ack path the winner IS our attempt, so both identities coincide.
+      decidedByCommandId: attempt.commandId,
+      submittedCommandId: attempt.commandId,
+      outcome,
+      swept: false,
+    });
+    // An acked explicit cancel is tracked until the poll confirms the
+    // prompt gone: an ack the agent ignores must escalate through the
+    // watchdog/settleTurn path, never read as done-then-vanish.
+    if (outcome === 'cancelled') {
+      const slot = this.slots.get(pending.chatId);
+      if (slot) {
+        if (!slot.cancelledPrompts) slot.cancelledPrompts = new Map();
+        slot.cancelledPrompts.set(id, Date.now());
+      }
+    }
+    this.wire.emit(pending.chatId, 'interaction_resolved', {
+      id,
+      outcome,
+      optionId: result.optionId ?? null,
+      answers: result.answers ?? null,
+      reason: result.reason ?? null,
+      commandId: attempt.commandId,
+      turnId: pending.payload?.turnId ?? null,
+    });
+    this._notifyQuestionWithdraw(id);
+    return { ok: true, ...result, outcome, commandId: attempt.commandId };
+  }
+
+  /**
+   * A submission whose RPC failed. Ordering first: a settlement that
+   * landed first (immediate, possibly mid-flight) means the prompt is
+   * gone — report the settlement, emit nothing, and never downgrade to
+   * failed/502. Gone-at-host codes otherwise resolve the card as
+   * remotely settled; every other failure keeps the card pending,
+   * stores the commandId for the retry, and throws an HTTP-ish error
+   * the route translates — never a false resolved.
+   */
+  _failSubmission(pending, id, attempt, err) {
+    const code = err?.rpc?.code ?? err?.code;
+    const cur = this.pendingInteractions.get(id);
+    if (!cur) {
+      // Authoritative settle already recorded (the settled event won the
+      // race, or the sweep did): report it. Emitting failed here would
+      // paint an error over a resolved card.
+      const s = this.settledInteractions.get(id);
+      if (this.submissions.get(id) === attempt) this.submissions.delete(id);
+      return { ok: true, outcome: s?.outcome || 'settled', remote: true, commandId: attempt.commandId };
+    }
+    if (cur.flight !== attempt) {
+      // A newer pending stage owns the id — leave it alone and tell the
+      // UI to re-sync (its submit raced approval/updated).
+      if (this.submissions.get(id) === attempt) this.submissions.delete(id);
+      throw this._httpError(409, 'STAGE_STALE', 'ขั้นตอนเปลี่ยนระหว่างส่ง — ตัดสินใจใหม่', {
+        choices: (cur.payload?.options || []).map((o) => ({ ...o })),
+        requirementId: cur.payload?.requirementId ?? null,
+        retryable: true,
+      });
+    }
+    if (
+      code === RPC_USER_INPUT_ALREADY_SETTLED ||
+      code === RPC_USER_INPUT_NOT_FOUND ||
+      code === RPC_APPROVAL_ALREADY_RESOLVED ||
+      code === RPC_APPROVAL_NOT_FOUND
+    ) {
+      return this._landRemoteSettled(pending, id, attempt, 'settled-remote');
+    }
+    attempt.state = 'failed';
+    attempt.error = err?.message || String(err);
+    const message = formatRpcError(err);
+    this.wire.emit(pending.chatId, 'interaction_state', {
+      id,
+      state: 'failed',
+      error: String(message).slice(0, 300),
+      code: err?.code || null,
+    });
+    if (code === RPC_USER_INPUT_ANSWER_INVALID || code === RPC_APPROVAL_CHOICE_INVALID) {
+      // The binary refused the VALUE — an identical retry cannot pass.
+      throw this._httpError(400, 'ANSWER_REJECTED', `agent ปฏิเสธคำตอบ: ${message}`, {
+        retryable: false,
+      });
+    }
+    if (code === RPC_APPROVAL_REQUIREMENT_STALE) {
+      // Our stage token lost the race with approval/updated: the card
+      // already carries the fresh stage — re-decide against it.
+      throw this._httpError(409, 'STAGE_STALE', 'ขั้นตอนการอนุญาตเปลี่ยนไปแล้ว — ตัดสินใจใหม่', {
+        choices: (cur.payload?.options || []).map((o) => ({ ...o })),
+        requirementId: cur.payload?.requirementId ?? null,
+        retryable: true,
+      });
+    }
+    // Timeout, transport, malformed ack, anything else: the card stays
+    // and the retry reuses this commandId.
+    throw this._httpError(502, 'SUBMIT_FAILED', `ส่งไม่สำเร็จ: ${message}`, { retryable: true });
+  }
+
+  /** The prompt settled from another path while we submitted: land it. */
+  _landRemoteSettled(pending, id, attempt, outcome) {
+    this.pendingInteractions.delete(id);
+    if (this.submissions.get(id) === attempt) this.submissions.delete(id);
+    this._recordSettled(id, {
+      key: attempt.key,
+      kind: attempt.kind,
+      optionId: attempt.optionId,
+      sessionId: attempt.sessionId,
+      // Retained for later choice attribution: a settled event whose
+      // winner is this command confirms this choice (else null). On this
+      // path the winner IS our attempt, so both identities coincide.
+      decidedByCommandId: attempt.commandId,
+      submittedCommandId: attempt.commandId,
+      outcome,
+      swept: false,
+    });
+    this.wire.emit(pending.chatId, 'interaction_resolved', {
+      id,
+      outcome,
+      remote: outcome === 'settled-remote',
+      reason: 'agent settled this prompt from another path',
+      commandId: attempt.commandId,
+      turnId: pending.payload?.turnId ?? null,
+    });
+    this._notifyQuestionWithdraw(id);
+    return { ok: true, outcome, remote: true, commandId: attempt.commandId };
+  }
+
+  /** Late POST to an id that is no longer pending: duplicate, conflict or gone. */
+  _submitToSettled(id, body, wantCancel) {
+    const settled = this.settledInteractions.get(id);
+    if (!settled || settled.swept || settled.key == null) {
+      throw this._httpError(404, 'INTERACTION_GONE', 'คำถามนี้ไม่อยู่แล้ว (อาจตอบไปแล้วหรือเทิร์นจบไปแล้ว)');
+    }
+    let normalized = null;
+    if (wantCancel) {
+      normalized = { kind: 'cancel', sessionId: settled.sessionId ?? null };
+    } else if (body?.answers !== undefined) {
+      normalized = { kind: 'answer', answers: body.answers, sessionId: settled.sessionId ?? null };
+    } else if (body?.optionId !== undefined) {
+      if (body?.requirementId != null) {
+        normalized = {
+          kind: 'decide',
+          optionId: String(body.optionId),
+          requirementId: String(body.requirementId),
+          sessionId: settled.sessionId ?? null,
+        };
+      } else if (settled.kind === 'decide' && settled.optionId === String(body.optionId)) {
+        // Legacy no-token retry: the option matches the landed decision.
+        return { ok: true, outcome: settled.outcome, duplicate: true };
+      }
+    }
+    if (normalized && submissionKey(normalized) === settled.key) {
+      return { ok: true, outcome: settled.outcome, duplicate: true };
+    }
+    throw this._httpError(409, 'SUBMIT_CONFLICT', 'คำถามนี้ถูกตอบไปแล้วด้วยคำตอบอื่น', {
+      outcome: settled.outcome,
+    });
+  }
+
+  /**
+   * Engagement note for a timed prompt (the renderer calls this when the
+   * user first interacts with the question form). Best-effort by contract:
+   * a missing client or id is a no-op true, never a failure — the countdown
+   * disarm is advisory, the form is the guarantee.
+   */
+  engageInteraction(interactionId) {
+    const pending = this.pendingInteractions.get(String(interactionId || ''));
+    if (!pending) return false;
+    const client = this.slots.get(pending.chatId)?.client;
+    if (!client || !isClientAlive(client)) return false;
+    return client.engageUserInput(String(interactionId));
   }
 
   listPendingInteractions() {
@@ -2034,7 +2636,30 @@ export class SessionManager extends EventEmitter {
       id,
       chatId: p.chatId,
       ...p.payload,
+      ...this._submitSnapshot(id),
     }));
+  }
+
+  /**
+   * Live submit state for one pending id, so snapshots carry what the
+   * interaction_state wire does: a reconnecting renderer adopts it instead
+   * of staying blocked behind a submitting flag whose POST died with the
+   * old connection (or missing a failure it never saw).
+   */
+  _submitSnapshot(id) {
+    const sub = this.submissions.get(String(id));
+    if (!sub || (sub.state !== 'submitting' && sub.state !== 'failed')) return {};
+    return {
+      submit: {
+        state: sub.state,
+        ...(sub.state === 'failed' && sub.error ? { error: String(sub.error).slice(0, 300) } : {}),
+      },
+    };
+  }
+
+  /** Snapshot payload for one pending entry (chat summary + turn state). */
+  _pendingSnapshot(p) {
+    return { ...p.payload, ...this._submitSnapshot(p.payload?.id) };
   }
 
   // ------------------------------------------------------------ subagents

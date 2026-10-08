@@ -155,6 +155,10 @@ const PAIRS = [
   // ink-dim (.tool-body, .ix-summary), the auth command is muted (.auth-cmd).
   ['tool output on code', '--ink-dim', '--code-bg'],
   ['muted on code', '--muted', '--code-bg'],
+  // Question inbox (1.1.33): form question text is ink-dim on the
+  // --raised popover. (The selected queue row deliberately chips onto
+  // --panel-2 — the wash-muted pairing failed AA at 4.19.)
+  ['secondary text on raised', '--ink-dim', '--raised'],
 ];
 
 const AA = 4.5;

@@ -14,10 +14,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/icon.png" />
     <!-- Blocking on purpose: sets data-theme before the first paint. -->
-    <script src="/theme-boot.js?v=1.1.32"></script>
-    <link rel="stylesheet" href="/style.css?v=1.1.32" />
-    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.32" />
-    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.32" />
+    <script src="/theme-boot.js?v=1.1.33"></script>
+    <link rel="stylesheet" href="/style.css?v=1.1.33" />
+    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.33" />
+    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.33" />
   </head>
   <body>
     <div id="app">
@@ -81,6 +81,7 @@
             <button id="mode-chip" class="pill mode" type="button" title="Mode (Shift+Tab)">yolo</button>
            </div>
            <div class="head-actions">
+            <button id="inbox-btn" class="btn ghost inbox-badge" type="button" title="คำถามรอคำตอบ — คลิกเพื่อเปิด" aria-label="คำถามรอคำตอบ" hidden><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="alert"><circle cx="12" cy="12" r="8.5"/><path d="M12 8v4.5"/><circle cx="12" cy="16" r="1.1" fill="currentColor" stroke="none"/></svg><span class="ic-label" aria-hidden="true">0</span></button>
             <button id="btn-session-find" class="btn ghost" type="button" title="ค้นหาในแชทนี้ (⌘F)" aria-expanded="false" aria-label="ค้นหาในแชทนี้"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="search"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg></button>
             <button id="release-agent" class="btn ghost" type="button" title="Stop this chat's agent" aria-label="Stop this chat's agent"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="power"><path d="M12 4v8"/><path d="M6.3 6.5a8 8 0 1 0 11.4 0"/></svg></button>
             <button id="overview-btn" class="btn ghost" type="button" title="ภาพรวมเทิร์น: subagents · tasks · goal (แบบ ChatGPT Desktop)" aria-label="ภาพรวมเทิร์น"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" data-icon="grid"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M4 12h16M12 4v16"/></svg></button>
@@ -227,7 +228,7 @@
     <!-- Standalone version paint: runs even when app.js fails to load, so a
          dead boot never leaves a silent shell (BUG-066). External file rather
          than an inline script because the CSP is script-src 'self'. -->
-    <script src="/version-boot.js?v=1.1.32"></script>
-    <script type="module" src="/app.js?v=1.1.32"></script>
+    <script src="/version-boot.js?v=1.1.33"></script>
+    <script type="module" src="/app.js?v=1.1.33"></script>
   </body>
 </html>

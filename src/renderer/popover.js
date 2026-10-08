@@ -60,6 +60,11 @@ export function clampPlacement(current, box, viewport) {
   return { left: Math.round(left), top: Math.round(top) };
 }
 
+/** True while any popover/panel/menu owns the screen (single-slot). */
+export function isPopoverOpen() {
+  return openEl != null && openEl.isConnected;
+}
+
 /** Close whatever popover is open. Safe to call when none is. */
 export function closePopover() {
   if (onDocDown) {

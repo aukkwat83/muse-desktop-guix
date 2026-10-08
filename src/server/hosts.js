@@ -173,7 +173,7 @@ export function mspApprovalCard(params = {}) {
   };
 }
 
-function isApproveDecision(decision) {
+export function mspDecisionIsApprove(decision) {
   return (
     decision === 'approved' ||
     decision === 'approvedForSession' ||
@@ -199,7 +199,7 @@ function choiceScopeRank(scope) {
  */
 export function pickMspApproveChoice(choices = []) {
   const list = Array.isArray(choices) ? choices : [];
-  const approves = list.filter((c) => isApproveDecision(c?.decision));
+  const approves = list.filter((c) => mspDecisionIsApprove(c?.decision));
   if (!approves.length) return null;
   return [...approves].sort(
     (a, b) => choiceScopeRank(a?.scope) - choiceScopeRank(b?.scope),
@@ -211,7 +211,7 @@ export function pickMspDenyChoice(choices = []) {
   const list = Array.isArray(choices) ? choices : [];
   return (
     list.find((c) => isDenyDecision(c?.decision)) ||
-    list.find((c) => !isApproveDecision(c?.decision)) ||
+    list.find((c) => !mspDecisionIsApprove(c?.decision)) ||
     null
   );
 }
@@ -224,57 +224,300 @@ export function mspChoiceIsSticky(choice) {
 }
 
 /**
- * The card payload for a userInput/request(ed) frame — but ONLY the shape the
- * card UI can actually answer: exactly one single-select question with
- * options. optionIds are the labels verbatim; resolvePermission maps the
- * picked label back into userInput/answer. Anything else (multi-question,
- * multi-select, free-text-only) returns null and the client auto-cancels
- * with a notice instead of stranding the turn — the card posts a single
- * optionId and userInput/answer requires every question answered.
+ * Schema ceiling for user-authored answer text (binary 1.4.3
+ * UserInputAnswerParams: freeText <= 500, note <= 500). Both client and
+ * server validation pin this constant — the binary answers anything past it
+ * with -32057, so the form must refuse first.
+ */
+export const USER_INPUT_TEXT_MAX = 500;
+
+/**
+ * Normalize the wire `questions` array into the renderer's form model.
+ * Every question keeps its wire `id` (the answer's `questionId`), its
+ * closed-vocabulary `mode`, its label options, and a `freeText` flag for
+ * questions with no options.
+ *
+ * Ids and labels are preserved EXACTLY as the wire sent them — labels ARE
+ * the answer ids (the schema defines no option ids), so trimming or
+ * re-casing them here would answer a different pick than the user made.
+ * Blank ids/labels fail validation instead of being silently fixed.
+ *
+ * Selection bounds are validated, never silently rewritten: a present
+ * min/max must be an integer >= 0, min must not exceed max (for questions
+ * WITH options — bounds don't constrain free text), and min:0 is legal
+ * (an empty multi-pick answers it). Absent bounds default to min 1 (0
+ * when options-less) / max options.length. An invalid bound makes the
+ * whole frame malformed — the client auto-cancels with a trace rather
+ * than guessing. Returns { questions } or { error } for a frame no form
+ * can answer.
+ */
+export function normalizeUserInputQuestions(params = {}) {
+  const raw = Array.isArray(params?.questions) ? params.questions : [];
+  if (!raw.length) return { error: 'no questions' };
+  const questions = [];
+  for (const q of raw) {
+    const id = String(q?.id ?? '');
+    const mode = String(q?.selection?.mode ?? '');
+    if (!id.trim()) return { error: 'question without id' };
+    if (mode !== 'single' && mode !== 'multiple') return { error: `question ${id}: unknown mode` };
+    const options = [];
+    for (const o of Array.isArray(q?.options) ? q.options : []) {
+      const label = String(o?.label ?? '');
+      if (!label.trim()) continue; // unpickable — skip, don't rewrite
+      options.push({ label, description: String(o?.description ?? '') });
+    }
+    const sel = q?.selection || {};
+    let { minSelections, maxSelections } = sel;
+    if (minSelections == null) minSelections = options.length ? 1 : 0;
+    if (maxSelections == null) maxSelections = options.length;
+    if (!Number.isInteger(minSelections) || minSelections < 0) {
+      return { error: `question ${id}: bad minSelections` };
+    }
+    if (!Number.isInteger(maxSelections) || maxSelections < 0) {
+      return { error: `question ${id}: bad maxSelections` };
+    }
+    // Bounds only constrain picks: options-less (free-text) questions
+    // default to min 0 / max 0 instead of tripping min > max.
+    if (options.length && minSelections > maxSelections) {
+      return { error: `question ${id}: minSelections exceeds maxSelections` };
+    }
+    questions.push({
+      id,
+      header: String(q?.header ?? ''),
+      question: String(q?.question ?? ''),
+      mode,
+      minSelections,
+      maxSelections,
+      options,
+      freeText: options.length === 0,
+    });
+  }
+  return { questions };
+}
+
+/**
+ * The card payload for a userInput/request(ed) frame — every shape the form
+ * UI can answer: any number of questions, single- or multi-select, and
+ * free-text (options-less) questions. `questions` is the form model;
+ * single-question single-select cards also keep the legacy top-level
+ * `options` (labels verbatim) so the transcript card keeps its one-click
+ * row and the old contract stays green. Returns null only for a frame no
+ * form can answer — the client auto-cancels those with a notice instead
+ * of stranding the turn.
  */
 export function mspUserInputCard(params = {}) {
   const userInputId = String(params?.userInputId || '').trim();
-  const questions = Array.isArray(params?.questions) ? params.questions : [];
-  if (!userInputId || questions.length !== 1) return null;
-  const q = questions[0] || {};
-  if (String(q?.selection?.mode || '') !== 'single') return null;
-  const options = Array.isArray(q?.options) ? q.options : [];
-  if (!options.length) return null;
+  if (!userInputId) return null;
+  const { questions, error } = normalizeUserInputQuestions(params);
+  if (error || !questions) return null;
 
-  const questionText = String(q?.question || '').trim();
   const lines = [];
-  if (questionText) lines.push(questionText);
-  for (const o of options) {
-    const label = String(o?.label || '').trim();
-    if (!label) continue;
-    const desc = String(o?.description || '').trim();
-    lines.push(`- **${label}**${desc ? ` — ${desc}` : ''}`);
+  for (const q of questions) {
+    const head = q.header || q.question;
+    if (head && questions.length > 1) lines.push(`**${head}**`);
+    if (q.question && questions.length === 1) lines.push(q.question);
+    if (q.question && questions.length > 1 && q.question !== q.header) lines.push(q.question);
+    for (const o of q.options) {
+      lines.push(`- **${o.label}**${o.description ? ` — ${o.description}` : ''}`);
+    }
+    if (q.freeText) lines.push('*พิมพ์คำตอบเอง*');
   }
   const body = lines.join('\n').slice(0, 8000);
+  const firstText = questions[0].question || questions[0].header;
+  const summary = questions.length === 1
+    ? oneLine(firstText, 240) || 'Choose an option'
+    : oneLine(`${questions.length} คำถาม: ${firstText}`, 240);
+  const single = questions.length === 1 && !questions[0].freeText && questions[0].mode === 'single';
   return {
     id: userInputId,
     userInputId,
-    questionId: String(q?.id || ''),
+    questionId: questions.length === 1 ? questions[0].id : null,
     toolName: String(params?.toolName || 'AskUserQuestion'),
     toolCallId: params?.toolCallId != null ? String(params.toolCallId) : null,
-    summary: oneLine(questionText, 240) || 'Choose an option',
+    summary,
     subtype: 'ask',
     body,
-    options: options
-      .map((o) => String(o?.label || '').trim())
-      .filter(Boolean)
-      .map((label) => ({ optionId: label, name: label, kind: 'allow_once' })),
+    questions,
+    // Milliseconds the host waits before auto-resolving a timed prompt
+    // (schema UserInputRequestParams.autoResolutionMs); absent = waits for
+    // the human. The renderer sends userInput/engaged on first interaction
+    // so the countdown disarms while the form is open.
+    autoResolutionMs: Number.isFinite(params?.autoResolutionMs) ? params.autoResolutionMs : null,
+    options: single
+      ? questions[0].options.map((o) => ({ optionId: o.label, name: o.label, kind: 'allow_once' }))
+      : [],
   };
 }
 
 /**
+ * Validate a renderer answer set against the card's questions — the same
+ * rules the binary enforces (UserInputAnswerParams: answer EVERY question;
+ * exactly one of selectedLabel / selectedLabels / freeText per answer;
+ * multi within min/max; freeText and note <= 500). Atomic: one bad entry
+ * rejects the whole set with a machine `code` plus a Thai `error` the UI
+ * can show verbatim. Pure — the node suite pins every shape.
+ *
+ * Ids and labels compare EXACTLY (no trimming): labels are the answer ids
+ * on the wire, and a spaced label (' SQLite ') is a different pick than
+ * its trimmed twin. Bounds come from normalize as validated (min:0 allows
+ * an empty multi-pick) — never recomputed here.
+ *
+ * freeText is a first-class alternative for EVERY question, not just
+ * options-less ones: the schema allows it independently per answer and
+ * defines no allowOther gate, so the form offers Other/text on choice
+ * questions too (until binary evidence contradicts the export).
+ */
+export function validateUserInputAnswers(questions = [], answers = []) {
+  const qs = Array.isArray(questions) ? questions : [];
+  const list = Array.isArray(answers) ? answers : [];
+  if (!qs.length) return { ok: false, code: 'NO_QUESTIONS', error: 'คำถามหมดอายุหรือไม่ถูกต้อง' };
+  if (list.length !== qs.length) {
+    return {
+      ok: false,
+      code: 'ANSWER_INCOMPLETE',
+      error: `ต้องตอบให้ครบ ${qs.length} ข้อ (ส่งมา ${list.length} ข้อ)`,
+    };
+  }
+  const byId = new Map(qs.map((q) => [String(q?.id ?? ''), q]));
+  const seen = new Set();
+  const clean = [];
+  for (const a of list) {
+    const questionId = String(a?.questionId ?? '');
+    const q = byId.get(questionId);
+    if (!q || !questionId.trim()) {
+      return { ok: false, code: 'UNKNOWN_QUESTION', error: 'มีคำตอบที่ไม่ตรงกับคำถาม', questionId };
+    }
+    if (seen.has(questionId)) {
+      return { ok: false, code: 'ANSWER_DUPLICATE', error: 'ตอบคำถามเดิมซ้ำ', questionId };
+    }
+    seen.add(questionId);
+    const head = q.header || q.question || questionId;
+    const hasLabel = typeof a?.selectedLabel === 'string' && a.selectedLabel.trim() !== '';
+    const hasLabels = Array.isArray(a?.selectedLabels);
+    const hasText = typeof a?.freeText === 'string' && a.freeText.trim() !== '';
+    const shapes = [hasLabel, hasLabels, hasText].filter(Boolean).length;
+    if (shapes !== 1) {
+      return {
+        ok: false, code: 'ANSWER_SHAPE', questionId,
+        error: `คำถาม “${head}” ต้องเลือกหรือพิมพ์คำตอบอย่างใดอย่างหนึ่ง`,
+      };
+    }
+    const note = a?.note == null || a.note === '' ? undefined : String(a.note);
+    if (note !== undefined && note.length > USER_INPUT_TEXT_MAX) {
+      return {
+        ok: false, code: 'NOTE_TOO_LONG', questionId,
+        error: `โน้ตของ “${head}” ยาวเกิน ${USER_INPUT_TEXT_MAX} ตัวอักษร`,
+      };
+    }
+    const entry = { questionId, ...(note !== undefined ? { note } : {}) };
+    if (hasText) {
+      // First-class freeText on ANY question (schema: independent
+      // alternative, no allowOther gate) — the form's Other/text answer.
+      const text = a.freeText.trim();
+      if (text.length > USER_INPUT_TEXT_MAX) {
+        return {
+          ok: false, code: 'TEXT_TOO_LONG', questionId,
+          error: `คำตอบของ “${head}” ยาวเกิน ${USER_INPUT_TEXT_MAX} ตัวอักษร`,
+        };
+      }
+      entry.freeText = text;
+    } else if (q.freeText) {
+      return {
+        ok: false, code: 'ANSWER_SHAPE', questionId,
+        error: `คำถาม “${head}” ต้องพิมพ์คำตอบ`,
+      };
+    } else if (q.mode === 'single') {
+      if (!hasLabel || !q.options.some((o) => o.label === a.selectedLabel)) {
+        return {
+          ok: false, code: 'UNKNOWN_LABEL', questionId,
+          error: `ตัวเลือกของ “${head}” ไม่ถูกต้อง`,
+        };
+      }
+      entry.selectedLabel = a.selectedLabel;
+    } else {
+      const picks = [...new Set((a.selectedLabels || []).map((s) => String(s)).filter((s) => s.trim() !== ''))];
+      const min = q.minSelections ?? 1;
+      const max = q.maxSelections ?? q.options.length;
+      if (picks.length < min || picks.length > max) {
+        return {
+          ok: false, code: 'SELECTION_BOUNDS', questionId,
+          error: min === max
+            ? `คำถาม “${head}” ต้องเลือก ${min} ข้อ`
+            : `คำถาม “${head}” ต้องเลือก ${min}–${max} ข้อ`,
+        };
+      }
+      const bad = picks.find((p) => !q.options.some((o) => o.label === p));
+      if (bad) {
+        return {
+          ok: false, code: 'UNKNOWN_LABEL', questionId,
+          error: `ตัวเลือก “${bad}” ไม่ถูกต้อง`,
+        };
+      }
+      entry.selectedLabels = picks;
+    }
+    clean.push(entry);
+  }
+  return { ok: true, answers: clean };
+}
+
+/**
+ * Validate an approval decision against the CURRENT choices — the policy
+ * gate: an unknown choiceId is a 400, never a blind decide (the binary
+ * would -32052 it; the desktop refuses first). The settle sweep is the
+ * only caller allowed to fall back to a deny choice, and it says so.
+ */
+export function validateApprovalDecision(choices = [], choiceId = '') {
+  const list = Array.isArray(choices) ? choices : [];
+  const want = String(choiceId || '').trim();
+  const hit = list.find((c) => String(c?.choiceId || '') === want);
+  if (!want || !hit) {
+    return { ok: false, code: 'UNKNOWN_CHOICE', error: 'ตัวเลือกการอนุญาตไม่ถูกต้องหรือหมดอายุแล้ว' };
+  }
+  return { ok: true, choice: hit };
+}
+
+/**
+ * Short display rows for a landed answer set — what the resolved card and
+ * the popup history show per question (labels verbatim, free text capped).
+ */
+export function summarizeUserInputAnswers(questions = [], answers = []) {
+  const byId = new Map((Array.isArray(questions) ? questions : []).map((q) => [String(q?.id || ''), q]));
+  return (Array.isArray(answers) ? answers : []).map((a) => {
+    const q = byId.get(String(a?.questionId || ''));
+    const head = q?.header || q?.question || String(a?.questionId || '');
+    let display = '';
+    if (typeof a?.selectedLabel === 'string') display = a.selectedLabel;
+    else if (Array.isArray(a?.selectedLabels)) display = a.selectedLabels.join(', ');
+    else if (typeof a?.freeText === 'string') display = a.freeText;
+    return { questionId: String(a?.questionId || ''), header: head, display: oneLine(display, 160) };
+  });
+}
+
+/**
+ * Stable stringify for submission idempotency keys: key order cannot flip
+ * the key, or an identical retry would look conflicting. Keys/values only
+ * (no functions, no undefined holes) — answers are JSON by construction.
+ */
+export function submissionKey(value) {
+  const norm = (v) => {
+    if (Array.isArray(v)) return v.map(norm);
+    if (v && typeof v === 'object') {
+      return Object.keys(v).sort().map((k) => [k, norm(v[k])]);
+    }
+    return v;
+  };
+  return JSON.stringify(norm(value));
+}
+
+/**
  * Sort a point-in-time `approval/listPending` userInputs snapshot into what
- * the recovery poll must do (BUG-084): chat f381a7e1 held a multi-question
- * prompt for 2h with no card and no trace — its auto-cancel was rejected
+ * the recovery poll must do (BUG-084): chat f381a7e1 held a prompt for 2h
+ * with no card and no trace — its auto-cancel was rejected
  * (`missing field 'reason'`) and swallowed silently — so the watchdog
- * re-reads pending prompts and acts: mount what the card UI can answer,
- * cancel what it cannot, and escalate what we already cancelled but the
- * agent still holds past grace.
+ * re-reads pending prompts and acts: mount what the form UI can answer
+ * (every well-formed shape since 1.1.33), cancel the malformed remainder,
+ * and escalate what we already cancelled but the agent still holds past
+ * grace.
  *
  * Pure: `pending` is the raw userInputs array, `knownIds` the mounted card
  * ids, `cancelledAt` id → cancel-timestamp ms. Repeats and id-less entries

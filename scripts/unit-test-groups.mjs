@@ -13,6 +13,8 @@ import { hasLoneSurrogate } from '../src/server/text.js';
 // createChat background-warms by default — pin it off so unit tests never
 // spawn a real agent (each suite is its own process).
 process.env.MUSE_DESKTOP_CREATE_WARM = '0';
+// Host-origin banners stay off here — unit suites never touch a desktop.
+process.env.MUSE_DESKTOP_NOTIFY = 'off';
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);

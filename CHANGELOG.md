@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.33 — 2026-10-08
+
+Question workflow: pending→submitting→resolved on RPC ack or authoritative
+settlement, with idempotent retries/409s, staged approvals (terminal +
+requirementId stage tokens), full multi-question/multi-select/free-text
+forms per the installed
+MSP schema, a Thai question inbox with drafts and focus safety, host-origin
+Linux banners (typed notify-question GAction, replace-by-id with the
+renderer bridge, tap routing queued until the page is ready), per-chat
+resolve tombstones against late snapshots, honest engage semantics, and a
+single visible desktop entry. No silent 5-minute question cancel.
+Full note: [docs/releases/v1.1.33-question-workflow.md](docs/releases/v1.1.33-question-workflow.md).
+
 ## 1.1.32 — 2026-10-08
 
 Popup-only activity overview (goal + tasks + subagents union with live

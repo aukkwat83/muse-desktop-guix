@@ -24,7 +24,7 @@ function pickPort() {
   return 3900 + Math.floor(Math.random() * 400);
 }
 
-async function startHost({ authWall = false, museBin = MOCK, stateHome = null, configHome = null } = {}) {
+async function startHost({ authWall = false, museBin = MOCK, stateHome = null, configHome = null, extraEnv = null } = {}) {
   const port = pickPort();
   // stateHome/configHome reuse is the restart seam: the persistence step
   // boots a second host over the first host's dirs to prove the registry
@@ -70,6 +70,13 @@ async function startHost({ authWall = false, museBin = MOCK, stateHome = null, c
       MOCK_MSP_CONFIG_LOG: path.join(stateDir, 'config-calls.log'),
       MOCK_MSP_HISTFAIL_MARKER: path.join(stateDir, 'histfail.marker'),
       MOCK_MSP_AUDITFAIL_MARKER: path.join(stateDir, 'auditfail.marker'),
+      // Host-origin notifier sink: the E2E host logs instead of gdbus,
+      // so the suite asserts pending/withdraw without touching a desktop.
+      // NOTIFY=on is explicit: a parent MUSE_DESKTOP_NOTIFY=off (root
+      // safety default) must not disable this fixture — the LOG sink
+      // means no real desktop is possible either way.
+      MUSE_DESKTOP_NOTIFY: 'on',
+      MUSE_DESKTOP_NOTIFY_LOG: path.join(stateDir, 'notify.log'),
       MOCK_MSP_PROMPT_LOG: path.join(stateDir, 'prompts.log'),
       MOCK_MSP_SESSION_LOG: path.join(stateDir, 'sessions.log'),
       MOCK_MSP_SUBAGENT_LOG: path.join(stateDir, 'subagents.log'),
@@ -77,6 +84,7 @@ async function startHost({ authWall = false, museBin = MOCK, stateHome = null, c
       // mock-session-1 and the BUG-082 freshness assertion cannot pass.
       MOCK_MSP_ID_FILE: path.join(stateDir, 'mock-sid.counter'),
       ...(authWall ? { MOCK_MSP_MODE: 'authwall' } : {}),
+      ...(extraEnv || {}),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -355,6 +363,58 @@ await step('permission request surfaces with the real detail and the answer reac
     { label: 'fourth turn_done' },
   );
   assert.match(done.data.content, /permission → approve_once/);
+  // Idempotent duplicate window: the identical retry (lost HTTP response)
+  // 200-duplicates without re-sending, and a conflicting choice 409s.
+  const dup = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    optionId: 'approve_once',
+  });
+  assert.equal(dup.ok, true);
+  assert.equal(dup.duplicate, true);
+  const conflict = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    optionId: 'reject',
+  });
+  assert.equal(conflict.status, 409, `conflicting decide must 409, got ${conflict.status}`);
+});
+
+await step('a two-stage approval advances without resolving, then settles on stage 2', async () => {
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'askstaged run' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const first = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'staged stage-1 card' },
+  );
+  assert.equal(first.data.requirementId, 'req-1');
+  const s1 = await req(host.base, 'POST', `/api/interactions/${first.data.id}`, {
+    optionId: 'approve_once',
+    requirementId: 'req-1',
+  });
+  assert.equal(s1.ok, true);
+  assert.equal(s1.terminal, false, 'stage-1 ack must report terminal:false');
+  // The follow-up approval/updated re-emits the card with the new stage.
+  const second = await stream.waitFor(
+    (e) => e.event === 'interaction' && e.data.id === first.data.id && e.data.requirementId === 'req-2',
+    { label: 'staged stage-2 card' },
+  );
+  assert.ok(second.data.options.some((o) => o.optionId === 'escalate'), 'stage-2 choices must refresh');
+  // A decide against the dead stage 409s with the fresh choices...
+  const stale = await req(host.base, 'POST', `/api/interactions/${first.data.id}`, {
+    optionId: 'reject',
+    requirementId: 'req-1',
+  });
+  assert.equal(stale.status, 409, `dead-stage decide must 409, got ${stale.status}`);
+  assert.equal(stale.code, 'STAGE_STALE');
+  // ...and the current stage settles the turn.
+  const s2 = await req(host.base, 'POST', `/api/interactions/${first.data.id}`, {
+    optionId: 'escalate',
+    requirementId: 'req-2',
+  });
+  assert.equal(s2.ok, true);
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'staged turn_done' },
+  );
+  assert.match(done.data.content, /staged → escalate@req-2/);
 });
 
 await step('AskUserQuestion tunnels as a subtyped ask card with the question body (BUG-026)', async () => {
@@ -375,15 +435,97 @@ await step('AskUserQuestion tunnels as a subtyped ask card with the question bod
   // The labels (not the ids) are what the user reads — they must survive.
   assert.deepEqual(ix.data.options.map((o) => o.name), ['Redis', 'SQLite in-memory', 'Skip']);
 
-  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+  // ACK-safe answers ride as validated answer sets, not optionIds —
+  // a legacy {optionId} POST on a question 400s without touching the RPC.
+  const legacy = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
     optionId: 'SQLite in-memory',
   });
+  assert.equal(legacy.status, 400, `legacy optionId POST on a question must 400, got ${legacy.status}`);
+  const incomplete = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, { answers: [] });
+  assert.equal(incomplete.status, 400, 'an incomplete answer set must 400');
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [{ questionId: 'q1', selectedLabel: 'SQLite in-memory' }],
+  });
   assert.equal(res.ok, true);
+  const resolved = await stream.waitFor(
+    (e) => e.event === 'interaction_resolved' && e.data.id === ix.data.id,
+    { label: 'quiz interaction_resolved' },
+  );
+  assert.equal(resolved.data.outcome, 'answered');
+  assert.equal(resolved.data.answers?.[0]?.display, 'SQLite in-memory');
   const done = await stream.waitFor(
     (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
     { label: 'quiz turn_done' },
   );
   assert.match(done.data.content, /ask → SQLite in-memory/, 'the picked answer must reach the agent');
+  // Lost-response retry: the identical POST 200-duplicates after the ack.
+  const dup = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [{ questionId: 'q1', selectedLabel: 'SQLite in-memory' }],
+  });
+  assert.equal(dup.ok, true);
+  assert.equal(dup.duplicate, true);
+});
+
+await step('a choice question accepts an Other freeText answer end to end (1.1.33)', async () => {
+  // Acceptance for the schema-true alternative: the quiz fixture asks a
+  // single-select question WITH options, and the answer rides as freeText
+  // (the Other row) through product validation into the mock agent — the
+  // mock validates like the exported schema, so a bad mock cannot mask
+  // valid product (nor pass invalid shapes).
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quiz me' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'other interaction' },
+  );
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [{ questionId: 'q1', freeText: 'Dragonfly in a sidecar' }],
+  });
+  assert.equal(res.ok, true, `Other freeText on a choice question must 200, got ${res.status}`);
+  const resolved = await stream.waitFor(
+    (e) => e.event === 'interaction_resolved' && e.data.id === ix.data.id,
+    { label: 'other interaction_resolved' },
+  );
+  assert.equal(resolved.data.outcome, 'answered');
+  assert.equal(resolved.data.answers?.[0]?.display, 'Dragonfly in a sidecar');
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'other turn_done' },
+  );
+  assert.match(done.data.content, /ask → Dragonfly in a sidecar/, 'the Other text must reach the agent');
+});
+
+await step('host-origin notify log records pending + withdraw for a question (1.1.33)', async () => {
+  // The host banners at mount and withdraws at resolve even when no page
+  // is watching — here the NOTIFY_LOG sink captures both instead of gdbus.
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quiz me' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'notify-log interaction' },
+  );
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [{ questionId: 'q1', selectedLabel: 'Redis' }],
+  });
+  assert.equal(res.ok, true);
+  await stream.waitFor(
+    (e) => e.event === 'interaction_resolved' && e.data.id === ix.data.id,
+    { label: 'notify-log interaction_resolved' },
+  );
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'notify-log turn_done' },
+  );
+  const logFile = path.join(host.stateHome, 'notify.log');
+  const lines = fs.readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const shown = lines.find((l) => l.ixId === ix.data.id && l.title);
+  assert.ok(shown, `no host pending for ${ix.data.id} in ${logFile}`);
+  assert.equal(shown.title, 'Muse มีคำถาม');
+  assert.match(shown.body || '', /ควรเก็บ cache ไว้ที่ไหน\?/, 'banner carries the question text');
+  const cleared = lines.find((l) => l.op === 'withdraw' && l.key === shown.key);
+  assert.ok(cleared, `no host withdraw for ${shown.key} in ${logFile}`);
 });
 
 await step('agent-question banner route answers (empty body delivers nothing, pops nothing)', async () => {
@@ -397,48 +539,177 @@ await step('agent-question banner route answers (empty body delivers nothing, po
   assert.equal(r.delivered, false);
 });
 
-await step('a multi-question prompt auto-cancels with a visible trace instead of stranding the turn', async () => {
-  // MSP has no plan-review channel (the ACP ExitPlanMode card has no
-  // counterpart); what the card UI cannot answer — multi-question,
-  // multi-select, free-text — the client cancels with a trace, and the
-  // turn must still settle. A hang here fails the wait below.
-  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quizmulti run' });
+await step('a malformed prompt auto-cancels with a visible trace instead of stranding the turn', async () => {
+  // Only malformed prompts auto-cancel now (multi-question/multi-select/
+  // free-text all mount form cards since 1.1.33): the client cancels with
+  // a persisted Thai notice plus the SSE trace, and the turn must settle.
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quizbroken run' });
   assert.equal(r.status, 202);
   const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
   const done = await stream.waitFor(
     (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
-    { label: 'quizmulti turn_done' },
+    { label: 'quizbroken turn_done' },
   );
   assert.match(done.data.content, /Continuing without an answer/, 'turn must settle after auto-cancel');
   const freshCards = stream.of('interaction').filter((e) => !knownIx.has(e.data.id));
-  assert.equal(freshCards.length, 0, 'no card can answer a multi-question prompt');
+  assert.equal(freshCards.length, 0, 'no card can answer a malformed prompt');
   const trace = stream.of('agent_update_other').find(
     (e) => e.data.update?.sessionUpdate === 'msp:user_input_unsupported',
   );
   assert.ok(trace, 'the auto-cancel left no visible trace');
-});
-
-await step('a ghost prompt the live frames never delivered is recovered by the poll (BUG-084)', async () => {
-  // The agent holds a multi-question prompt but announces nothing — the
-  // production wedge (chat f381a7e1). The watchdog's listPending poll must
-  // discover it, auto-cancel, and the turn must complete. A hang here fails
-  // the wait below.
-  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'ghostquiz run' });
-  assert.equal(r.status, 202);
-  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
-  const done = await stream.waitFor(
-    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
-    { label: 'ghostquiz turn_done' },
-  );
-  assert.match(done.data.content, /Recovered without an answer/, 'the poll cancel must unblock the turn');
-  const freshCards = stream.of('interaction').filter((e) => !knownIx.has(e.data.id));
-  assert.equal(freshCards.length, 0, 'no card can answer a multi-question prompt');
   const chat = await req(host.base, 'GET', `/api/chats/${chatId}`);
   const notice = chat.chat.messages.find(
     (m) => m.role === 'notice' && m.meta?.turnId === r.turnId && m.meta?.userInputId,
   );
-  assert.ok(notice, 'the poll auto-cancel left no persisted notice');
-  assert.match(notice.text, /2 คำถาม/, 'the notice must name the question count');
+  assert.ok(notice, 'the auto-cancel left no persisted notice');
+  assert.match(notice.text, /แสดงไม่ได้/, 'the notice must say the prompt cannot render');
+});
+
+await step('a multi-question prompt mounts one form card, answered atomically', async () => {
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quizmulti run' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'quizmulti interaction' },
+  );
+  assert.equal(ix.data.subtype, 'ask');
+  assert.equal(ix.data.questions?.length, 2, 'the form model must carry both questions');
+  // Atomic: a partial set 400s and the card stays pending.
+  const partial = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [{ questionId: 'q1', selectedLabel: 'a' }],
+  });
+  assert.equal(partial.status, 400);
+  const still = await req(host.base, 'GET', '/api/interactions');
+  assert.ok(still.interactions.some((p) => p.id === ix.data.id), 'partial submit must keep the card pending');
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [
+      { questionId: 'q1', selectedLabel: 'a' },
+      { questionId: 'q2', selectedLabel: 'y' },
+    ],
+  });
+  assert.equal(res.ok, true);
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'quizmulti turn_done' },
+  );
+  assert.match(done.data.content, /multi → a\/y/, 'both answers must reach the agent');
+});
+
+await step('single + multi + free-text answer together in one submit', async () => {
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quizshapes run' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'quizshapes interaction' },
+  );
+  assert.deepEqual(ix.data.questions.map((q) => q.mode), ['single', 'multiple', 'single']);
+  assert.equal(ix.data.questions[2].freeText, true, 'the options-less question rides as free-text');
+  // Out-of-bounds multi 400s without touching the RPC.
+  const bad = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [
+      { questionId: 'q1', selectedLabel: 'a' },
+      { questionId: 'q2', selectedLabels: ['x', 'y', 'z'] },
+      { questionId: 'q3', freeText: 'because' },
+    ],
+  });
+  assert.equal(bad.status, 400);
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [
+      { questionId: 'q1', selectedLabel: 'b' },
+      { questionId: 'q2', selectedLabels: ['x', 'z'] },
+      { questionId: 'q3', freeText: 'because reasons' },
+    ],
+  });
+  assert.equal(res.ok, true);
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'quizshapes turn_done' },
+  );
+  assert.match(done.data.content, /shapes → b\/x\+z\/because reasons/);
+});
+
+await step('a transient answer failure 502s, then the identical retry lands (ACK-safe)', async () => {
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quizflaky run' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'quizflaky interaction' },
+  );
+  const body = { answers: [{ questionId: 'q1', selectedLabel: 'a' }] };
+  const first = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, body);
+  assert.equal(first.status, 502, `transient RPC failure must 502, got ${first.status}`);
+  assert.equal(first.retryable, true);
+  const pending = await req(host.base, 'GET', '/api/interactions');
+  assert.ok(pending.interactions.some((p) => p.id === ix.data.id), 'a rejection must keep the card pending');
+  const retry = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, body);
+  assert.equal(retry.ok, true, 'the identical retry must land');
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'quizflaky turn_done' },
+  );
+  assert.match(done.data.content, /flaky → a/);
+  // And the settled duplicate/conflict window holds for questions too.
+  const dup = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, body);
+  assert.equal(dup.duplicate, true);
+  const conflict = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [{ questionId: 'q1', selectedLabel: 'b' }],
+  });
+  assert.equal(conflict.status, 409);
+});
+
+await step('an explicit cancel resolves cancelled and the agent continues alone', async () => {
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quiz me again' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'cancel-flow interaction' },
+  );
+  const engaged = await req(host.base, 'POST', `/api/interactions/${ix.data.id}/engaged`);
+  assert.equal(engaged.ok, true);
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, { cancel: true });
+  assert.equal(res.ok, true);
+  assert.equal(res.outcome, 'cancelled');
+  const resolved = await stream.waitFor(
+    (e) => e.event === 'interaction_resolved' && e.data.id === ix.data.id,
+    { label: 'cancel interaction_resolved' },
+  );
+  assert.equal(resolved.data.outcome, 'cancelled');
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'cancel-flow turn_done' },
+  );
+  assert.match(done.data.content, /ask → nothing/, 'a cancelled question leaves no answer');
+});
+
+await step('a ghost prompt the live frames never delivered is mounted by the poll (BUG-084)', async () => {
+  // The agent holds a multi-question prompt but announces nothing — the
+  // production wedge (chat f381a7e1). The watchdog's listPending poll must
+  // discover it and MOUNT the answerable card; the harness answers and the
+  // turn completes. A hang here fails the wait below.
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'ghostquiz run' });
+  assert.equal(r.status, 202);
+  const knownIx = new Set(stream.of('interaction').map((e) => e.data.id));
+  const ix = await stream.waitFor(
+    (e) => e.event === 'interaction' && !knownIx.has(e.data.id),
+    { label: 'ghostquiz poll-mounted interaction', timeoutMs: 120_000 },
+  );
+  assert.equal(ix.data.questions?.length, 2);
+  const res = await req(host.base, 'POST', `/api/interactions/${ix.data.id}`, {
+    answers: [
+      { questionId: 'g1', selectedLabel: 'a' },
+      { questionId: 'g2', selectedLabel: 'x' },
+    ],
+  });
+  assert.equal(res.ok, true);
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'ghostquiz turn_done' },
+  );
+  assert.match(done.data.content, /ghost → a\/x/, 'the poll-mounted card must answer like a live one');
 });
 
 await step('a cancel the agent ignores escalates to interrupt + loud settle + recovery (BUG-084)', async () => {
@@ -1757,6 +2028,55 @@ await step('subagents: the registry survives a host restart with no prompt', asy
     await req(host2.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
     await sleep(300);
     try { host2.proc.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+});
+
+await step('an immediate prompt during a held subscribe waits, never NOT_SUBSCRIBED (readiness)', async () => {
+  // The 72/78 cascade: ensureClient returned a sessionId-bearing client
+  // before view/subscribe completed, and the racing prompt died with
+  // NOT_SUBSCRIBED. Deterministic gate (no sleeps): the mock holds its
+  // first subscribe reply until the gate file exists, and writes the seen
+  // marker on arrival — so "prompt in flight behind the held subscribe"
+  // is an observed ordering, not a timing bet.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-e2e-gate-'));
+  const gateFile = path.join(dir, 'subscribe.gate');
+  const seenFile = path.join(dir, 'subscribe.seen');
+  const gated = await startHost({
+    extraEnv: { MOCK_MSP_SUBSCRIBE_GATE: gateFile, MOCK_MSP_SUBSCRIBE_SEEN: seenFile },
+  });
+  try {
+    const stream2 = openStream(gated.base);
+    const c = await req(gated.base, 'POST', '/api/chats', { title: 'gated', cwd: os.tmpdir() });
+    assert.equal(c.status, 201);
+    // Fire the prompt WITHOUT awaiting: it must park inside ensureClient
+    // until the subscribe completes, not fail fast.
+    let promptReturned = false;
+    const p = req(gated.base, 'POST', `/api/chats/${c.chat.id}/prompt`, { text: 'hello gated' })
+      .then((r) => {
+        promptReturned = true;
+        return r;
+      });
+    const seenDeadline = Date.now() + 10_000;
+    for (;;) {
+      if (fs.existsSync(seenFile)) break;
+      if (Date.now() > seenDeadline) throw new Error('mock never received view/subscribe');
+      await sleep(25);
+    }
+    assert.equal(promptReturned, false, 'prompt must still be parked behind the held subscribe');
+    fs.writeFileSync(gateFile, 'open');
+    const r = await p;
+    assert.equal(r.status, 202, `gated prompt must 202, got ${r.status}: ${JSON.stringify(r)}`);
+    assert.ok(r.turnId, 'turnId missing');
+    const done = await stream2.waitFor(
+      (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+      { label: 'gated turn_done' },
+    );
+    assert.match(done.data.content, /สวัสดีจาก mock agent/, 'the gated turn must complete normally');
+    stream2.close();
+  } finally {
+    await req(gated.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
+    await sleep(300);
+    try { gated.proc.kill('SIGKILL'); } catch { /* already gone */ }
   }
 });
 
