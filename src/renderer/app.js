@@ -32,7 +32,7 @@ import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.4.0';
 import { adaptiveHistoryDefaults, computeHistoryStartIndex, expandHistoryStartIndex, sliceHistoryMessages } from './history-window.js?v=0.4.0';
 import { parseSlashCommand } from './slash-commands.js?v=0.4.0';
 import { chatToMarkdown } from './transcript-markdown.js?v=0.4.0';
-import { createTurnView, bindTurnId, interruptedMarkerText, stripMarkerGlyph, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, outcomeLabel, applyIxSnapshot, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.5.0';
+import { createTurnView, bindTurnId, interruptedMarkerText, stripMarkerGlyph, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, outcomeLabel, applyIxSnapshot, reconcileIxSnapshot, ixSnapshotSurvives, ixHasUnresolved, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.5.0';
 import { createQuestionDraftStore, draftToAnswers, orderInboxItems, buildInboxPanel, buildQuestionForm, buildApprovalMini, updateInboxList, updateInboxSubmit, routeReceiptVerdict, applyQuestionRoute } from './question-inbox.js?v=1.0.0';
 
 const $ = (sel) => document.querySelector(sel);
@@ -2020,10 +2020,17 @@ function mergeRoutedRow(pr, row, revBefore) {
   const chatId = row?.chatId || pr.chatId;
   if (!chatId || !row || row.id == null) return false;
   const id = String(row.id);
-  const tv = turnView(chatId, true);
-  if (!tv.turnId) tv.turnId = 'pending';
   const authoritative = revBefore == null || !wireRevs.stale(chatId, 'ix', revBefore);
-  const merged = applyIxSnapshot(tv.interactions, [row], { authoritative, tombstones: ixTombs.get(chatId) || null });
+  const tombs = ixTombs.get(chatId) || null;
+  // Same post-filter rule as reconcileIxSnapshot: probe before allocating
+  // — a tombstoned-same-turn row must report moot WITHOUT inventing a
+  // view or binding a synthetic turnId (P1 edge: stale + tombstoned).
+  if (!turnView(chatId) && !ixSnapshotSurvives([row], { authoritative, tombstones: tombs })) return false;
+  const tv = turnView(chatId, true);
+  const merged = applyIxSnapshot(tv.interactions, [row], { authoritative, tombstones: tombs });
+  // Bind AFTER the merge, like the funnel: a filtered row must not bind
+  // a placeholder to a view with nothing live.
+  if (!tv.turnId && ixHasUnresolved(tv.interactions)) tv.turnId = 'pending';
   adoptIxSubmits([row], authoritative);
   if (merged.added.length || merged.updated.length) {
     tv.rev = (tv.rev || 0) + 1;
@@ -2674,15 +2681,16 @@ async function resyncFromServer() {
     byChat.get(ix.chatId).push(ix);
   }
   for (const c of state.chats) {
-    const tv = turnView(c.id, true);
-    if (!tv.turnId) tv.turnId = 'pending';
     const authoritative = !wireRevs.stale(c.id, 'ix', revIx.get(c.id));
-    const rows = byChat.get(c.id) || [];
-    const merged = applyIxSnapshot(tv.interactions, rows, { authoritative, tombstones: ixTombs.get(c.id) || null });
-    adoptIxSubmits(rows, authoritative);
-    if (merged.added.length || merged.updated.length || merged.removed.length) {
-      tv.rev = (tv.rev || 0) + 1;
-    }
+    // Same funnel as selectChat: idle chats with no rows get no view —
+    // creating one here spun every reconnected idle chat (P1 1.1.33).
+    reconcileIxSnapshot(state.turnViews, c.id, byChat.get(c.id) || [], {
+      authoritative,
+      running: c.running,
+      turnId: c.turnId ?? null,
+      tombstones: ixTombs.get(c.id) || null,
+      adoptSubmits: adoptIxSubmits,
+    });
     if (authoritative) wireRevs.bump(c.id, 'ix');
   }
   paintInboxBadge();
@@ -3562,16 +3570,18 @@ async function selectChat(chatId, { keepScroll = false } = {}) {
   // backfills unknown ids only, while a fresh one is authoritative
   // (adds, refreshes unresolved, drops absent unresolved cards).
   {
-    const list = Array.isArray(chat.pendingInteractions) ? chat.pendingInteractions : [];
-    const tv = turnView(chatId, true);
-    if (!tv.turnId) tv.turnId = chat.turnId || 'pending';
     const captured = navIxRev.get(chatId);
     const authoritative = captured == null || !wireRevs.stale(chatId, 'ix', captured);
-    const merged = applyIxSnapshot(tv.interactions, list, { authoritative, tombstones: ixTombs.get(chatId) || null });
-    adoptIxSubmits(list, authoritative);
-    if (merged.added.length || merged.updated.length || merged.removed.length) {
-      tv.rev = (tv.rev || 0) + 1;
-    }
+    // One funnel (turn-view.js): an empty snapshot reconciles removals on
+    // an existing view and drops a synthetic placeholder on an idle chat —
+    // it never CREATES a view, or isRunning() spins behind a phantom turn.
+    reconcileIxSnapshot(state.turnViews, chatId, chat.pendingInteractions, {
+      authoritative,
+      running: chat.running,
+      turnId: chat.turnId ?? null,
+      tombstones: ixTombs.get(chatId) || null,
+      adoptSubmits: adoptIxSubmits,
+    });
     if (authoritative) wireRevs.bump(chatId, 'ix');
     navIxRev.delete(chatId);
   }
@@ -4381,10 +4391,14 @@ async function boot() {
     bootByChat.get(ix.chatId).push(ix);
   }
   for (const [chatId, list] of bootByChat) {
-    const tv = turnView(chatId, true);
-    if (!tv.turnId) tv.turnId = 'pending';
-    applyIxSnapshot(tv.interactions, list, { authoritative: false, tombstones: ixTombs.get(chatId) || null });
-    adoptIxSubmits(list, false);
+    // Same funnel as selectChat/resync (backfill-only): a view is stored
+    // only when unresolved rows survive the merge — never a phantom for
+    // filtered rows.
+    reconcileIxSnapshot(state.turnViews, chatId, list, {
+      authoritative: false,
+      tombstones: ixTombs.get(chatId) || null,
+      adoptSubmits: adoptIxSubmits,
+    });
   }
   paintInboxBadge();
 

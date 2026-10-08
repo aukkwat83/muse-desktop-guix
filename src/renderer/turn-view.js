@@ -390,6 +390,90 @@ export function applyIxSnapshot(current, list, { authoritative = false, tombston
 }
 
 /**
+ * Live-card check behind the placeholder rule: resolved cards are display
+ * history, only unresolved ones justify a view or a turnId. Shared by the
+ * funnel and the route merge so both bind on the same condition.
+ */
+export function ixHasUnresolved(interactions) {
+  if (!interactions) return false;
+  for (const ix of interactions.values()) {
+    if (!ix?.resolved) return true;
+  }
+  return false;
+}
+
+/**
+ * Post-filter probe shared by every snapshot path that may allocate a
+ * view: raw rows can ALL be filtered out (tombstoned-same-turn under a
+ * stale snapshot, or resolved-only rows), and a view must be stored only
+ * when unresolved cards survive the merge. Runs the merge against a
+ * throwaway — callers merge for real afterwards. The probe's tombstone
+ * writes are idempotent with the real merge that follows (a re-asked id
+ * the probe un-tombs merges as a plain add, with identical counts).
+ */
+export function ixSnapshotSurvives(list, { authoritative = false, tombstones = null } = {}) {
+  const probe = new Map();
+  applyIxSnapshot(probe, Array.isArray(list) ? list : [], { authoritative, tombstones });
+  return ixHasUnresolved(probe);
+}
+
+/**
+ * One funnel for pending-interaction snapshots (selectChat, resync, boot
+ * backfill): merge the rows AND discipline the placeholder, without
+ * inventing a running turn. `store` is the chatId → turn-view Map
+ * (state.turnViews in app.js, a plain Map in tests); `adoptSubmits`
+ * mirrors submit states (may be null in tests). Returns the live view,
+ * or null when there is none.
+ *
+ * The P1 this fixes: 1.1.33 bound `turnId = 'pending'` for EVERY snapshot
+ * including empty ones, and isRunning() reads ANY turnId — so an idle
+ * chat spun with Stop forever and queued prompts behind a phantom turn
+ * that never settles. A view is now allocated only when unresolved rows
+ * survive the merge (probed first — raw rows may all be tombstoned); an
+ * empty snapshot reconciles removals on an existing view only, and an
+ * empty AUTHORITATIVE snapshot on an idle chat drops a synthetic view.
+ *
+ * The drop is narrow: authoritative + server-idle (no running turn AND no
+ * turn id) + synthetic 'pending' turnId + nothing unresolved left AFTER
+ * the merge (the merge runs first, so a stale unresolved local the
+ * snapshot drops also leads here). Real turnIds, running chats and views
+ * with unresolved cards are never dropped — a turn_started (or a live
+ * question) that landed mid-fetch survives this snapshot.
+ */
+export function reconcileIxSnapshot(store, chatId, list, {
+  authoritative = false,
+  running = false,
+  turnId = null,
+  tombstones = null,
+  adoptSubmits = null,
+} = {}) {
+  const rows = Array.isArray(list) ? list : [];
+  let tv = store.get(chatId) || null;
+  if (rows.length && !tv) {
+    // Probe before allocating (P1 edge): a stale snapshot whose rows are
+    // all tombstoned-same-turn must never create a view or a synthetic
+    // turnId — with authoritative:false the drop below cannot heal it.
+    if (!ixSnapshotSurvives(rows, { authoritative, tombstones })) return null;
+    tv = createTurnView();
+    store.set(chatId, tv);
+  }
+  if (!tv) return null;
+  const merged = applyIxSnapshot(tv.interactions, rows, { authoritative, tombstones });
+  if (rows.length && typeof adoptSubmits === 'function') adoptSubmits(rows, authoritative);
+  if (merged.added.length || merged.updated.length || merged.removed.length) {
+    tv.rev = (tv.rev || 0) + 1;
+  }
+  // Bind AFTER the merge: rows that all filtered out must not bind a
+  // placeholder to a view with nothing live.
+  if (rows.length && !tv.turnId && ixHasUnresolved(tv.interactions)) tv.turnId = turnId || 'pending';
+  if (authoritative && !running && !turnId && tv.turnId === 'pending' && !ixHasUnresolved(tv.interactions)) {
+    store.delete(chatId);
+    return null;
+  }
+  return tv;
+}
+
+/**
  * Child order for a persisted assistant message — must mirror
  * liveChildOrder() (tools → plan → answer, marker last). After turn_done the
  * transcript reloads from disk; if history rendered plan → tools → text while

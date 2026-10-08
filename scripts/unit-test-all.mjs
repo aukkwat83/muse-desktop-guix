@@ -40,6 +40,7 @@ const SUITES = [
   ['msp-client', 'unit-test-msp-client.mjs'],
   ['turn-core', 'unit-test-turn-core.mjs'],
   ['turn-view', 'unit-test-turn-view.mjs'],
+  ['ix-placeholder', 'unit-test-ix-placeholder.mjs'],
   ['renderer-contracts', 'unit-test-renderer-contracts.mjs'],
   ['scroll-pin', 'unit-test-scroll-pin.mjs'],
   ['composer-draft', 'unit-test-composer-draft.mjs'],
