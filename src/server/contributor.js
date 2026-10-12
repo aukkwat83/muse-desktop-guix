@@ -9,10 +9,29 @@
 // unreadable file all resolve to enabled. This deployment standardized on
 // the contributor tier. An explicit false is always honored: the default
 // never overrides a deliberate opt-out.
+//
+// The lock is ON unless MUSE_DESKTOP_CONTRIBUTOR_LOCK=0 is set
+// explicitly: this deployment must never bill standard, no matter which
+// launcher started the host. Under lock the opt-out above is removed —
+// boot forces the key back to true, switching it off is refused, and
+// the prompt path reverts an external flip before the turn starts. The
+// lock only ever moves the mode towards contributor; a malformed
+// settings file is still never rewritten (it belongs to the user), so
+// that one state can only be reported, not repaired from here.
 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+
+/**
+ * Whether this deployment forbids standard billing outright. Locked by
+ * default so every start path (deploy script, desktop launcher, bare
+ * `node src/server/index.js`) is covered; only an explicit
+ * MUSE_DESKTOP_CONTRIBUTOR_LOCK=0 re-enables the standard opt-out.
+ */
+export function contributorLocked(env = process.env) {
+  return env?.MUSE_DESKTOP_CONTRIBUTOR_LOCK !== '0';
+}
 
 /** The CLI's own config root: $XDG_CONFIG_HOME/muse, else ~/.config/muse. */
 export function cliSettingsPath(env = process.env) {
@@ -27,15 +46,16 @@ export function cliSettingsPath(env = process.env) {
  * painting even when the CLI config is missing or corrupt.
  * @returns {{ enabled: boolean, source: 'settings'|'default', path: string }}
  */
-export function readContributorState(file = cliSettingsPath()) {
+export function readContributorState(file = cliSettingsPath(), env = process.env) {
+  const locked = contributorLocked(env);
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (raw?.contributor_mode_enabled === false) return { enabled: false, source: 'settings', path: file };
-    if (raw?.contributor_mode_enabled === true) return { enabled: true, source: 'settings', path: file };
+    if (raw?.contributor_mode_enabled === false) return { enabled: false, source: 'settings', path: file, locked };
+    if (raw?.contributor_mode_enabled === true) return { enabled: true, source: 'settings', path: file, locked };
   } catch {
     /* missing or corrupt — fall through to the default below */
   }
-  return { enabled: true, source: 'default', path: file };
+  return { enabled: true, source: 'default', path: file, locked };
 }
 
 /**
@@ -49,8 +69,15 @@ export function readContributorState(file = cliSettingsPath()) {
  * a 500, never a silent no-op.
  * @returns {{ enabled: boolean, source: 'settings', path: string }}
  */
-export function setContributorEnabled(enabled, { file = cliSettingsPath() } = {}) {
+export function setContributorEnabled(enabled, { file = cliSettingsPath(), env = process.env } = {}) {
   if (typeof enabled !== 'boolean') throw new Error('enabled must be a boolean');
+  if (enabled === false && contributorLocked(env)) {
+    const err = new Error(
+      'contributor mode is locked on by this deployment; standard billing is disabled (set MUSE_DESKTOP_CONTRIBUTOR_LOCK=0 to re-enable the opt-out)',
+    );
+    err.status = 403;
+    throw err;
+  }
   let doc = null;
   let present = false;
   try {
@@ -74,7 +101,7 @@ export function setContributorEnabled(enabled, { file = cliSettingsPath() } = {}
   const next = { ...doc, contributor_mode_enabled: enabled };
   if (enabled) next.contributor_mode_disclosure_acknowledged = true;
   fs.writeFileSync(file, JSON.stringify(next, null, 2));
-  return { enabled, source: 'settings', path: file };
+  return { enabled, source: 'settings', path: file, locked: contributorLocked(env) };
 }
 
 /**
@@ -86,7 +113,10 @@ export function setContributorEnabled(enabled, { file = cliSettingsPath() } = {}
  * Set MUSE_DESKTOP_CONTRIBUTOR_DEFAULT=0 to skip the write entirely.
  */
 export function ensureContributorDefault({ file = cliSettingsPath(), env = process.env } = {}) {
-  if (env?.MUSE_DESKTOP_CONTRIBUTOR_DEFAULT === '0') return readContributorState(file);
+  const locked = contributorLocked(env);
+  // The lock wins over the skip-write opt-out: a locked deployment must
+  // not boot into a state where the CLI could pick standard billing.
+  if (!locked && env?.MUSE_DESKTOP_CONTRIBUTOR_DEFAULT === '0') return readContributorState(file, env);
   try {
     // Existence first: a present-but-unparseable file belongs to the user
     // and must never be overwritten — only a truly missing file is created.
@@ -98,24 +128,52 @@ export function ensureContributorDefault({ file = cliSettingsPath(), env = proce
       doc = null;
     }
     if (present && doc && typeof doc === 'object' && !Array.isArray(doc)) {
-      if ('contributor_mode_enabled' in doc) return readContributorState(file);
+      // An explicit opt-out stands unless the deployment locks the mode:
+      // under lock a stored false is forced back to true at boot.
+      if ('contributor_mode_enabled' in doc && (doc.contributor_mode_enabled !== false || !locked)) {
+        return readContributorState(file, env);
+      }
       try {
         if (!fs.existsSync(`${file}.bak`)) fs.copyFileSync(file, `${file}.bak`);
       } catch {
         /* the backup is a nicety, never a failure */
       }
       fs.writeFileSync(file, JSON.stringify({ ...doc, contributor_mode_enabled: true }, null, 2));
-      return { enabled: true, source: 'default-written', path: file };
+      return {
+        enabled: true,
+        source: locked && doc.contributor_mode_enabled === false ? 'lock-forced' : 'default-written',
+        path: file,
+        locked,
+      };
     }
     // A present-but-unparseable file belongs to the user — leave it alone.
-    if (present) return { enabled: true, source: 'default', path: file };
+    if (present) return { enabled: true, source: 'default', path: file, locked };
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(
       file,
       JSON.stringify({ schema_version: 1, contributor_mode_enabled: true }, null, 2),
     );
-    return { enabled: true, source: 'default-written', path: file };
+    return { enabled: true, source: 'default-written', path: file, locked };
   } catch {
-    return { enabled: true, source: 'default', path: file };
+    return { enabled: true, source: 'default', path: file, locked };
+  }
+}
+
+/**
+ * Pre-turn guard for a locked deployment: if something outside the
+ * desktop flipped the CLI settings to standard while the host was up,
+ * flip it back before the next prompt can bill standard. Never throws —
+ * a guard failure must not break the turn, it just leaves the honest
+ * current state in place. `flipped` tells the caller a revert happened
+ * (worth a host-log line). Unlocked deployments are a pure read.
+ */
+export function enforceContributorLock({ file = cliSettingsPath(), env = process.env } = {}) {
+  const before = readContributorState(file, env);
+  if (!before.locked || before.enabled) return { ...before, flipped: false };
+  try {
+    const after = setContributorEnabled(true, { file, env });
+    return { ...after, source: 'lock-forced', flipped: true };
+  } catch {
+    return { ...before, flipped: false };
   }
 }

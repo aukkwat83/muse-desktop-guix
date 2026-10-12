@@ -14,6 +14,8 @@ export PATH="${HOME}/.local/bin:${HOME}/.guix-profile/bin:/run/current-system/pr
 export UV_THREADPOOL_SIZE="${UV_THREADPOOL_SIZE:-8}"
 # Warm-pool defaults (same as src/server/sessions.js); export explicitly for children
 export MUSE_DESKTOP_KEEP_ON_EXIT="${MUSE_DESKTOP_KEEP_ON_EXIT:-1}"
+# This deployment never bills standard (set 0 to re-enable the opt-out).
+export MUSE_DESKTOP_CONTRIBUTOR_LOCK="${MUSE_DESKTOP_CONTRIBUTOR_LOCK:-1}"
 export MUSE_DESKTOP_MAX_HOT_AGENTS="${MUSE_DESKTOP_MAX_HOT_AGENTS:-6}"
 export MUSE_DESKTOP_CREATE_WARM="${MUSE_DESKTOP_CREATE_WARM:-1}"
 

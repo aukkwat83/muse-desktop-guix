@@ -435,6 +435,12 @@ function pickRate(modelId, pricing, contributor = false) {
   for (const c of search) {
     if (c && models[c]) return { rate: models[c], matched: c, estimated: false };
   }
+  // Mirror of the server fallback: contributor billing falls to the
+  // contributor default for unlisted models, never the standard row.
+  if (contributor) {
+    const dc = models['default-contributor'] || BUILTIN_PRICING.models['default-contributor'];
+    if (dc) return { rate: dc, matched: 'default-contributor', estimated: true };
+  }
   return {
     rate: models.default || { ...BUILTIN_PRICING.models.default },
     matched: 'default',
@@ -455,7 +461,12 @@ const BUILTIN_PRICING = {
     'muse-spark-1.2-contributor': { input: 0.10, output: 0.20 },
     'muse-spark': { input: 1.25, output: 4.25 },
     'meta-muse-spark': { input: 1.25, output: 4.25 },
+    'muse-wonder-full-1.0': { input: 1.25, output: 4.25 },
+    'muse-wonder-full-1.0-contributor': { input: 0.10, output: 0.20 },
+    'muse-wonder-1.0': { input: 1.25, output: 4.25 },
+    'muse-wonder-1.0-contributor': { input: 0.10, output: 0.20 },
     default: { input: 1.25, output: 4.25 },
+    'default-contributor': { input: 0.10, output: 0.20 },
   },
   override: false,
 };

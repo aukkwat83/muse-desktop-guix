@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.38 — 2026-10-13
+
+Contributor billing is locked on: boot forces `contributor_mode_enabled`
+back to true, `POST /api/contributor {enabled:false}` 403s, the header
+pill renders disabled, and every prompt reverts an external flip to
+standard before the turn runs — only `MUSE_DESKTOP_CONTRIBUTOR_LOCK=0`
+re-enables the opt-out. Wonder models price correctly now:
+`muse-wonder-full-1.0` / `muse-wonder-1.0` (+`-contributor` siblings)
+ride the spark public rates, and a new `default-contributor` fallback
+keeps unlisted models off the standard row on contributor billing
+(wonder sessions displayed ~18x over the bill). `?v=`=1.1.38,
+`rightbar.js?v=1.2.2`.
+Full note: [docs/releases/v1.1.38-contributor-lock-wonder-pricing.md](docs/releases/v1.1.38-contributor-lock-wonder-pricing.md).
+
 ## 1.1.37 — 2026-10-12
 
 Contributor switch moved beside the effort pill (`contributor`/`standard`

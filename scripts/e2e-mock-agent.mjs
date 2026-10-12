@@ -55,6 +55,10 @@ async function startHost({ authWall = false, museBin = MOCK, stateHome = null, c
       MUSE_BIN: museBin,
       MUSE_DESKTOP_MODEL: 'mock-model-1',
       MUSE_DESKTOP_EFFORT: 'max',
+      // The main suite exercises the contributor switch end to end, which
+      // the production default (locked on) refuses — unlock here; the
+      // locked-host step below re-enables the lock explicitly.
+      MUSE_DESKTOP_CONTRIBUTOR_LOCK: '0',
       // Short test-only watchdog clocks so the liveness E2E below runs in
       // seconds instead of minutes (production defaults: 180s / 15s).
       MUSE_DESKTOP_NO_ACTIVITY_MS: '1500',
@@ -342,6 +346,35 @@ await step('POST /api/contributor switches the mode end to end', async () => {
   }
   const kept = await req(host.base, 'GET', '/api/pricing');
   assert.equal(kept.contributor?.enabled, true, 'rejected switches must not move the mode');
+});
+
+await step('a locked host refuses standard: switch 403s, prompt reverts an external flip', async () => {
+  const locked = await startHost({ extraEnv: { MUSE_DESKTOP_CONTRIBUTOR_LOCK: '1' } });
+  try {
+    const p = await req(locked.base, 'GET', '/api/pricing');
+    assert.equal(p.contributor?.enabled, true);
+    assert.equal(p.contributor?.locked, true);
+    // The off-switch is refused and the file does not move.
+    const off = await req(locked.base, 'POST', '/api/contributor', { enabled: false });
+    assert.equal(off.status, 403, `locked off-switch must 403, got ${off.status}`);
+    assert.equal(JSON.parse(fs.readFileSync(locked.settingsFile, 'utf8')).contributor_mode_enabled, true);
+    // An external flip to standard is reverted before the next turn runs.
+    const doc = JSON.parse(fs.readFileSync(locked.settingsFile, 'utf8'));
+    fs.writeFileSync(locked.settingsFile, JSON.stringify({ ...doc, contributor_mode_enabled: false }));
+    const c = await req(locked.base, 'POST', '/api/chats', { title: 'lock-guard', cwd: os.tmpdir() });
+    assert.equal(c.status, 201);
+    const pr = await req(locked.base, 'POST', `/api/chats/${c.chat.id}/prompt`, { text: 'hello' });
+    assert.equal(pr.ok, true);
+    assert.equal(
+      JSON.parse(fs.readFileSync(locked.settingsFile, 'utf8')).contributor_mode_enabled,
+      true,
+      'the prompt guard must revert the external flip before the turn',
+    );
+    const after = await req(locked.base, 'GET', '/api/pricing');
+    assert.equal(after.contributor?.enabled, true);
+  } finally {
+    try { locked.proc.kill('SIGKILL'); } catch { /* already gone */ }
+  }
 });
 
 await step('tool calls stream as rows and reach completed', async () => {

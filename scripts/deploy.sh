@@ -120,7 +120,11 @@ start_host() {
     stop_host
   fi
   log "starting host (detached) — log: $LOG_FILE"
+  # Contributor lock: this deployment never bills standard. The host
+  # forces contributor_mode_enabled=true at boot, refuses the off-switch,
+  # and reverts external flips before each turn. Set to 0 to opt out.
   NO_OPEN=1 MUSE_DESKTOP_KEEP_ON_EXIT=1 MUSE_DESKTOP_PORT="$PORT" MUSE_DESKTOP_HOST="$HOST" \
+    MUSE_DESKTOP_CONTRIBUTOR_LOCK="${MUSE_DESKTOP_CONTRIBUTOR_LOCK:-1}" \
     nohup node "$ROOT/src/server/index.js" >>"$LOG_FILE" 2>&1 &
   # host.pid is written by the host itself once it listens (index.js).
   # Health gate: the deploy fails unless /api/state answers within 15s.
@@ -182,6 +186,7 @@ Usage: $(basename "$0") [option]
 Env:
   MUSE_DESKTOP_PORT   default 3850
   MUSE_DESKTOP_HOST   default 127.0.0.1
+  MUSE_DESKTOP_CONTRIBUTOR_LOCK  default 1 (contributor locked on; 0 re-enables the standard opt-out)
   SCB_PAC_PROXY       PAC bridge URL for the agent env (default http://127.0.0.1:39080)
   NO_OPEN=1           don't open the app after deploy
   CI=1                same as NO_OPEN

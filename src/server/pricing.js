@@ -30,7 +30,20 @@ const BUILTIN = {
     'muse-spark-1.2-contributor': { input: 0.10, output: 0.20 },
     'muse-spark': { input: 1.25, output: 4.25 },
     'meta-muse-spark': { input: 1.25, output: 4.25 },
+    // Wonder ids from the agent's advertised model/list. No wonder-specific
+    // public rate is known yet, so they ride the spark public rates (the
+    // built-in table is flagged estimated either way) — without explicit
+    // rows a wonder session silently priced at the standard `default`
+    // even on contributor billing (~18x over the bill).
+    'muse-wonder-full-1.0': { input: 1.25, output: 4.25 },
+    'muse-wonder-full-1.0-contributor': { input: 0.10, output: 0.20 },
+    'muse-wonder-1.0': { input: 1.25, output: 4.25 },
+    'muse-wonder-1.0-contributor': { input: 0.10, output: 0.20 },
     default: { input: 1.25, output: 4.25 },
+    // Fallback for unknown ids on contributor billing: an unlisted model
+    // still bills the contributor tier when the mode is on, so the
+    // fallback must be a contributor row, never the standard default.
+    'default-contributor': { input: 0.10, output: 0.20 },
   },
 };
 
@@ -51,6 +64,9 @@ export function priceTable() {
         clean[String(id)] = { input: num(r?.input, 0), output: num(r?.output, 0) };
       }
       if (!clean.default) clean.default = { ...BUILTIN.models.default };
+      if (!clean['default-contributor']) {
+        clean['default-contributor'] = { ...BUILTIN.models['default-contributor'] };
+      }
       return {
         effective: String(doc?.effective || 'env override'),
         source: String(doc?.source || 'MUSE_DESKTOP_PRICE_JSON'),
@@ -98,6 +114,13 @@ export function rateFor(modelId, table = priceTable(), opts = {}) {
   search.push(...candidates);
   for (const c of search) {
     if (c && models[c]) return { rate: models[c], matched: c, estimated: false };
+  }
+  // Nothing matched: the fallback must still honor the billing mode — an
+  // unlisted model on contributor billing falls to the contributor
+  // default, never the standard row (that priced wonder ~18x over).
+  if (opts?.contributor) {
+    const dc = models['default-contributor'] || BUILTIN.models['default-contributor'];
+    if (dc) return { rate: dc, matched: 'default-contributor', estimated: true };
   }
   return { rate: models.default || BUILTIN.models.default, matched: 'default', estimated: true };
 }

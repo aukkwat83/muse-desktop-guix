@@ -20,7 +20,7 @@ import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
 import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
 import { closePopover, isPopoverOpen, miniConfirm, openMenu, openPanel } from './popover.js?v=0.5.1';
 import { createMcpPanel } from './mcp-panel.js?v=1.1.0';
-import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, unionSubagentCounts } from './rightbar.js?v=1.2.1';
+import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, unionSubagentCounts } from './rightbar.js?v=1.2.2';
 import { createChildActivity } from './child-activity.js?v=1.1.0';
 import { createOverviewPanel, resolvePlan } from './overview-panel.js?v=1.1.0';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
@@ -1618,36 +1618,48 @@ function updateConfigPills() {
   // Contributor pill: global billing mode, always visible once known —
   // unlike effort it never depends on the chat or the advertised selects.
   const contrib = state.contributor?.enabled;
+  const contribLocked = state.contributor?.locked === true;
   el.contribChip.hidden = contrib == null;
   el.contribChip.textContent = contrib ? 'contributor' : 'standard';
-  el.contribChip.title = contrib
-    ? 'โหมด contributor (เรทถูกกว่า ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อปิด'
-    : 'โหมด standard (ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อเปิด contributor';
-  el.contribChip.disabled = false;
+  el.contribChip.title = contribLocked
+    ? 'โหมด contributor (ล็อกโดย deployment — ปิดเป็น standard ไม่ได้)'
+    : contrib
+      ? 'โหมด contributor (เรทถูกกว่า ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อปิด'
+      : 'โหมด standard (ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อเปิด contributor';
+  el.contribChip.disabled = contribLocked;
 }
 
 /** Fetch the billing mode once (boot) and repaint the pill. */
 async function refreshContributor() {
   try {
     const res = await api('/api/pricing');
-    state.contributor = { enabled: res.contributor?.enabled !== false };
+    state.contributor = {
+      enabled: res.contributor?.enabled !== false,
+      locked: res.contributor?.locked === true,
+    };
   } catch {
-    state.contributor = { enabled: true }; // deployment default; pricing refines it
+    state.contributor = { enabled: true, locked: false }; // deployment default; pricing refines it
   }
   updateConfigPills();
 }
 
 /** Optimistic contributor flip + rollback — same contract as setChatConfig. */
 async function toggleContributor() {
+  // Locked deployments have no off-switch: the chip is disabled, and this
+  // guard covers any path that reaches the handler anyway.
+  if (state.contributor?.locked === true) return;
   const prev = state.contributor?.enabled !== false;
-  state.contributor = { enabled: !prev };
+  state.contributor = { ...state.contributor, enabled: !prev };
   updateConfigPills();
   try {
     const res = await api('/api/contributor', { method: 'POST', body: { enabled: !prev } });
-    state.contributor = { enabled: res.contributor?.enabled !== false };
+    state.contributor = {
+      enabled: res.contributor?.enabled !== false,
+      locked: res.contributor?.locked === true,
+    };
     rightbar.refreshPricing();
   } catch (err) {
-    state.contributor = { enabled: prev };
+    state.contributor = { ...state.contributor, enabled: prev };
     showError(`สลับโหมดไม่สำเร็จ: ${err?.message || err}`);
   }
   updateConfigPills();

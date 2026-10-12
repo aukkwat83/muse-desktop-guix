@@ -38,6 +38,7 @@ import { normalizeAttachmentInput, resolveAttachments } from './attachments.js';
 import { applyApPrefixToTitle } from './ap-title.js';
 import { usageCacheFile, writeUsageCache } from './usage-cache.js';
 import { buildQuestionNotice, defaultQuestionNotifier } from './notify.js';
+import { contributorLocked, enforceContributorLock } from './contributor.js';
 
 const DEFAULT_MAX_HOT = Number(process.env.MUSE_DESKTOP_MAX_HOT_AGENTS || 6);
 const DEFAULT_IDLE_DEMOTE_MS = Number(process.env.MUSE_DESKTOP_IDLE_DEMOTE_MS || 30 * 60 * 1000);
@@ -1230,6 +1231,17 @@ export class SessionManager extends EventEmitter {
       attachDir: path.join(stateDir(), 'attach'),
       chatId,
     });
+
+    // Locked deployments never bill standard: if the CLI settings were
+    // flipped off outside the desktop, revert before this turn can run.
+    if (contributorLocked()) {
+      const enforced = enforceContributorLock();
+      if (enforced.flipped) {
+        console.log(
+          `[sessions ${new Date().toISOString()}] contributor lock reverted an external standard flip before prompt`,
+        );
+      }
+    }
 
     const slot = this.slots.get(chatId);
     if (slot?.turn && !slot.turn.settled) {

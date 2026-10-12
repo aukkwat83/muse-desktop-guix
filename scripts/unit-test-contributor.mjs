@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Contributor billing mode: the CLI moved the mode out of the model list
 // into its own settings.json, so the desktop reads/ensures the flag.
-// Default is contributor ON; an explicit false is always honored; a
+// Default is contributor ON and locked on (standard billing disabled);
+// only MUSE_DESKTOP_CONTRIBUTOR_LOCK=0 honors an explicit false; a
 // malformed file is never rewritten. Hermetic: XDG_CONFIG_HOME points at a
 // temp dir, the developer's real CLI config is never touched.
 
@@ -12,10 +13,14 @@ import path from 'node:path';
 
 import {
   cliSettingsPath,
+  contributorLocked,
+  enforceContributorLock,
   ensureContributorDefault,
   readContributorState,
   setContributorEnabled,
 } from '../src/server/contributor.js';
+
+const UNLOCKED = { MUSE_DESKTOP_CONTRIBUTOR_LOCK: '0' };
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -114,14 +119,15 @@ test('ensure adds the key and keeps a .bak of the original', () => {
   });
 });
 
-test('ensure never rewrites an explicit opt-out', () => {
+test('unlocked ensure never rewrites an explicit opt-out', () => {
   const { dir, file } = tmpConfig();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify({ schema_version: 1, contributor_mode_enabled: false }));
   withXdg(dir, () => {
-    const st = ensureContributorDefault();
+    const st = ensureContributorDefault({ env: UNLOCKED });
     assert.equal(st.enabled, false);
     assert.equal(st.source, 'settings');
+    assert.equal(st.locked, false);
     assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).contributor_mode_enabled, false);
   });
 });
@@ -149,7 +155,7 @@ test('switch writes the mode, preserves other keys, records disclosure on enable
     assert.equal(doc.contributor_mode_enabled, true);
     assert.equal(doc.contributor_mode_disclosure_acknowledged, true);
     assert.equal(doc.model, 'muse-spark-1.3');
-    const off = setContributorEnabled(false);
+    const off = setContributorEnabled(false, { env: UNLOCKED });
     assert.equal(off.enabled, false);
     const doc2 = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(doc2.contributor_mode_enabled, false);
@@ -168,10 +174,12 @@ test('switch refuses a non-boolean and a malformed file', () => {
   });
 });
 
-test('MUSE_DESKTOP_CONTRIBUTOR_DEFAULT=0 skips the write', () => {
+test('MUSE_DESKTOP_CONTRIBUTOR_DEFAULT=0 skips the write only when unlocked', () => {
   const { dir, file } = tmpConfig();
   const saved = process.env.MUSE_DESKTOP_CONTRIBUTOR_DEFAULT;
+  const savedLock = process.env.MUSE_DESKTOP_CONTRIBUTOR_LOCK;
   process.env.MUSE_DESKTOP_CONTRIBUTOR_DEFAULT = '0';
+  process.env.MUSE_DESKTOP_CONTRIBUTOR_LOCK = '0';
   try {
     withXdg(dir, () => {
       const st = ensureContributorDefault();
@@ -182,7 +190,71 @@ test('MUSE_DESKTOP_CONTRIBUTOR_DEFAULT=0 skips the write', () => {
   } finally {
     if (saved == null) delete process.env.MUSE_DESKTOP_CONTRIBUTOR_DEFAULT;
     else process.env.MUSE_DESKTOP_CONTRIBUTOR_DEFAULT = saved;
+    if (savedLock == null) delete process.env.MUSE_DESKTOP_CONTRIBUTOR_LOCK;
+    else process.env.MUSE_DESKTOP_CONTRIBUTOR_LOCK = savedLock;
   }
+});
+
+test('contributor is locked on by default; only an explicit 0 unlocks', () => {
+  assert.equal(contributorLocked({}), true);
+  assert.equal(contributorLocked({ MUSE_DESKTOP_CONTRIBUTOR_LOCK: '1' }), true);
+  assert.equal(contributorLocked({ MUSE_DESKTOP_CONTRIBUTOR_LOCK: '0' }), false);
+});
+
+test('locked ensure forces a stored opt-out back to contributor', () => {
+  const { dir, file } = tmpConfig();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ schema_version: 1, contributor_mode_enabled: false }));
+  withXdg(dir, () => {
+    const st = ensureContributorDefault({ env: {} });
+    assert.equal(st.enabled, true);
+    assert.equal(st.source, 'lock-forced');
+    assert.equal(st.locked, true);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).contributor_mode_enabled, true);
+    assert.equal(readContributorState().locked, true);
+  });
+});
+
+test('the lock wins over MUSE_DESKTOP_CONTRIBUTOR_DEFAULT=0', () => {
+  const { dir, file } = tmpConfig();
+  withXdg(dir, () => {
+    const st = ensureContributorDefault({ env: { MUSE_DESKTOP_CONTRIBUTOR_DEFAULT: '0' } });
+    assert.equal(st.enabled, true);
+    assert.equal(st.locked, true);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).contributor_mode_enabled, true);
+  });
+});
+
+test('locked switch refuses to turn contributor off and moves nothing', () => {
+  const { dir, file } = tmpConfig();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ schema_version: 1, contributor_mode_enabled: true }));
+  withXdg(dir, () => {
+    assert.throws(
+      () => setContributorEnabled(false, { env: {} }),
+      (err) => err.status === 403 && /locked/.test(err.message),
+    );
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).contributor_mode_enabled, true);
+    // Turning it on again stays allowed under lock.
+    assert.equal(setContributorEnabled(true, { env: {} }).enabled, true);
+  });
+});
+
+test('enforce reverts an external standard flip; unlocked it only reads', () => {
+  const { dir, file } = tmpConfig();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ schema_version: 1, contributor_mode_enabled: false }));
+  withXdg(dir, () => {
+    const unlocked = enforceContributorLock({ env: UNLOCKED });
+    assert.equal(unlocked.flipped, false);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).contributor_mode_enabled, false);
+    const locked = enforceContributorLock({ env: {} });
+    assert.equal(locked.flipped, true);
+    assert.equal(locked.enabled, true);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).contributor_mode_enabled, true);
+    // Steady state: nothing left to revert.
+    assert.equal(enforceContributorLock({ env: {} }).flipped, false);
+  });
 });
 
 let failed = 0;

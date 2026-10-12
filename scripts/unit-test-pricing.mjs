@@ -96,6 +96,10 @@ test('rateFor matches every advertised model id exactly, never default', () => {
       'muse-spark-1.3-contributor',
       'muse-spark-1.2',
       'muse-spark-1.2-contributor',
+      'muse-wonder-full-1.0',
+      'muse-wonder-full-1.0-contributor',
+      'muse-wonder-1.0',
+      'muse-wonder-1.0-contributor',
     ]) {
       const r = rateFor(id, table);
       assert.equal(r.matched, id);
@@ -154,8 +158,25 @@ test('contributor flag bills a standard wire id at the contributor row', () => {
     assert.ok(s.usd > c.usd * 10);
     // Provider aliases ride along: meta/ prefix still finds the sibling.
     assert.equal(rateFor('meta/muse-spark-1.3', table, { contributor: true }).matched, 'muse-spark-1.3-contributor');
-    // Unknown ids still fall back to default, never a contributor row.
-    assert.equal(rateFor('muse-spark-9.9', table, { contributor: true }).matched, 'default');
+    // Wonder rides the same sibling rule (regression: the table had no
+    // wonder rows, so a wonder-full session on contributor billing priced
+    // at the standard default — ~18x over the bill).
+    const w = sessionCost({ ...usage, model: 'muse-wonder-full-1.0', contributor: true });
+    assert.equal(w.matched, 'muse-wonder-full-1.0-contributor');
+    assert.ok(Math.abs(w.usd - (0.1 + 0.5 * 0.2)) < 1e-9, `wonder contributor usd=${w.usd}`);
+    // Explicit -contributor wire ids (what the provider actually sees)
+    // match their own row first.
+    assert.equal(
+      rateFor('muse-wonder-full-1.0-contributor', table, { contributor: true }).matched,
+      'muse-wonder-full-1.0-contributor',
+    );
+    // Unknown ids on contributor billing fall to the contributor default,
+    // never the standard row; standard billing keeps the standard default.
+    const fb = rateFor('muse-spark-9.9', table, { contributor: true });
+    assert.equal(fb.matched, 'default-contributor');
+    assert.equal(fb.estimated, true);
+    assert.equal(fb.rate.input, 0.1);
+    assert.equal(rateFor('muse-spark-9.9', table).matched, 'default');
   });
 });
 

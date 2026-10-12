@@ -84,7 +84,7 @@ const sessions = new SessionManager({
 // live state per request below.
 const contributorBoot = ensureContributorDefault();
 console.log(
-  `[contributor] enabled=${contributorBoot.enabled} source=${contributorBoot.source} path=${contributorBoot.path}`,
+  `[contributor] enabled=${contributorBoot.enabled} source=${contributorBoot.source} locked=${contributorBoot.locked === true} path=${contributorBoot.path}`,
 );
 
 // --------------------------------------------------------------- helpers
@@ -753,7 +753,9 @@ const server = http.createServer(async (req, res) => {
         console.log(`[contributor] switched enabled=${contributor.enabled}`);
         return send(res, 200, { ok: true, contributor });
       } catch (err) {
-        return fail(res, 500, err?.message || 'contributor switch failed');
+        // A locked deployment refuses the off-switch with an honest 403;
+        // anything else (unwritable/malformed settings) stays a 500.
+        return fail(res, err?.status || 500, err?.message || 'contributor switch failed');
       }
     }
 
