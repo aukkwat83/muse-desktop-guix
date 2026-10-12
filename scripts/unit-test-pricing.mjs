@@ -134,6 +134,31 @@ test('malformed override falls back to built-in, never throws', () => {
   });
 });
 
+test('contributor flag bills a standard wire id at the contributor row', () => {
+  // Regression: the CLI moved contributor mode out of the model list, so a
+  // standard id on the wire priced the standard row — ~12-20x over the bill.
+  withEnv({ MUSE_DESKTOP_PRICE_JSON: null, MUSE_DESKTOP_THB_PER_USD: null }, () => {
+    const usage = { promptTokens: 1_000_000, outputTokens: 500_000 };
+    const table = priceTable();
+    const r = rateFor('muse-spark-1.3', table, { contributor: true });
+    assert.equal(r.matched, 'muse-spark-1.3-contributor');
+    assert.equal(r.estimated, false);
+    const c = sessionCost({ ...usage, model: 'muse-spark-1.3', contributor: true });
+    assert.ok(Math.abs(c.usd - (0.1 + 0.5 * 0.2)) < 1e-9, `contributor usd=${c.usd}`);
+    assert.equal(c.matched, 'muse-spark-1.3-contributor');
+    assert.equal(c.contributor, true);
+    // Without the flag nothing changes: standard id, standard row.
+    const s = sessionCost({ ...usage, model: 'muse-spark-1.3' });
+    assert.equal(s.matched, 'muse-spark-1.3');
+    assert.equal(s.contributor, false);
+    assert.ok(s.usd > c.usd * 10);
+    // Provider aliases ride along: meta/ prefix still finds the sibling.
+    assert.equal(rateFor('meta/muse-spark-1.3', table, { contributor: true }).matched, 'muse-spark-1.3-contributor');
+    // Unknown ids still fall back to default, never a contributor row.
+    assert.equal(rateFor('muse-spark-9.9', table, { contributor: true }).matched, 'default');
+  });
+});
+
 test('missing tokens cost zero, formatters never NaN', () => {
   withEnv({ MUSE_DESKTOP_PRICE_JSON: null }, () => {
     const c = sessionCost({});

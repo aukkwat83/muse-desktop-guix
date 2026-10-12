@@ -265,7 +265,7 @@ export class SessionStore {
     return this.data.chats.find((c) => c.id === id) || null;
   }
 
-  create({ title = 'New chat', cwd = process.cwd(), mode = 'always', model = null, effort = 'ultra', groupId = null } = {}) {
+  create({ title = 'New chat', cwd = process.cwd(), mode = 'always', model = null, effort = 'max', groupId = null } = {}) {
     const now = Date.now();
     const home = this.getGroup(groupId)?.id || this.data.activeGroupId || this.data.groups[0]?.id;
     const chat = normalizeChat({
@@ -467,7 +467,10 @@ function normalizeChat(raw) {
     cwd: String(raw.cwd || os.homedir()),
     mode: String(raw.mode || 'always'),
     model: raw.model ?? null,
-    effort: raw.effort ?? 'ultra',
+    // The desktop retired the `ultra` tier (it rides `max` reasoning while
+    // switching on token-hungry proactive guidance): stored `ultra` chats
+    // land on `max`, which is the same reasoning without the extra burn.
+    effort: raw.effort === 'ultra' ? 'max' : (raw.effort ?? 'max'),
     groupId: raw.groupId ? String(raw.groupId) : null,
     mspSessionId: raw.mspSessionId ?? null,
     createdAt: Number(raw.createdAt) || Date.now(),

@@ -13,6 +13,7 @@ const SUITES = [
   ['groups', 'unit-test-groups.mjs'],
   ['ap-title', 'unit-test-ap-title.mjs'],
   ['pricing', 'unit-test-pricing.mjs'],
+  ['contributor', 'unit-test-contributor.mjs'],
   ['notify', 'unit-test-notify.mjs'],
   ['goal-tasks', 'unit-test-goal-tasks.mjs'],
   ['subagents', 'unit-test-subagents.mjs'],

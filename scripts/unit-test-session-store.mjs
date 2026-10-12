@@ -27,15 +27,25 @@ test('create writes through immediately', () => {
   assert.equal(onDisk.chats[0].id, chat.id);
 });
 
-test('new chats default to yolo mode + ultra effort', () => {
+test('new chats default to yolo mode + max effort', () => {
   const file = tmpFile();
   const store = new SessionStore({ file, debounceMs: 10_000 });
   const chat = store.create({ title: 'x' });
   assert.equal(chat.mode, 'always');
-  assert.equal(chat.effort, 'ultra');
+  assert.equal(chat.effort, 'max');
   const explicit = store.create({ title: 'y', mode: 'normal', effort: 'low' });
   assert.equal(explicit.mode, 'normal');
   assert.equal(explicit.effort, 'low');
+});
+
+test('stored ultra effort migrates to max on load', () => {
+  const file = tmpFile();
+  const first = new SessionStore({ file, debounceMs: 10_000 });
+  const chat = first.create({ title: 'legacy' });
+  first.update(chat.id, { effort: 'ultra' });
+  first.flushNow();
+  const second = new SessionStore({ file, debounceMs: 10_000 });
+  assert.equal(second.get(chat.id).effort, 'max');
 });
 
 test('mspSessionId is flushed synchronously, not debounced', () => {

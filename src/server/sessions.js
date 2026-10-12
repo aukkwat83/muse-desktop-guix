@@ -457,7 +457,7 @@ export class SessionManager extends EventEmitter {
       mode: defaults.mode || 'always',
       cwd: defaults.cwd || process.cwd(),
       model: defaults.model || null,
-      effort: defaults.effort || 'ultra',
+      effort: defaults.effort || 'max',
       // Create-warm (grok-desktop's recipe): a fresh chat spawns its agent
       // in the background while the UI stays idle, so the ~20s of async MCP
       // connects after session/start usually finish while the user is still

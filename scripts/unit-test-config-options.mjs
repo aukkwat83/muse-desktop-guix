@@ -72,6 +72,17 @@ test('unknown thinking tier is a 400', async () => {
   });
 });
 
+test('retired ultra tier is a 400; max stays the top tier', async () => {
+  assert.ok(!REASONING_TIERS.includes('ultra'));
+  assert.equal(REASONING_TIERS.at(-1), 'max');
+  const { client } = liveClient();
+  await assert.rejects(() => client.setConfigOption('thinking', 'ultra'), (err) => {
+    assert.equal(err.status, 400);
+    assert.match(err.message, /not advertised/);
+    return true;
+  });
+});
+
 test('unknown configId and empty values are 400s', async () => {
   const { client } = liveClient();
   await assert.rejects(() => client.setConfigOption('nope', 'x'), (err) => {

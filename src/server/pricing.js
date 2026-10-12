@@ -75,15 +75,28 @@ export function thbPerUsd() {
  * lowercase form → lowercase suffix → `default`. The last step matters:
  * without it `Meta/Muse-Spark` matches nothing (suffix keeps its case,
  * lowercase keeps the prefix) and silently falls back to default.
+ * With `contributor: true` each candidate also tries its `-contributor`
+ * sibling — the CLI moved contributor mode out of the model list into
+ * settings.json, so a standard id on the wire still bills the contributor
+ * row when the mode is on. Explicit `-contributor` ids keep matching first.
  * The returned `matched` tells the UI whether the number is model-specific
  * or a fallback.
  */
-export function rateFor(modelId, table = priceTable()) {
+export function rateFor(modelId, table = priceTable(), opts = {}) {
   const models = table?.models || {};
   const raw = String(modelId || '').trim();
   const base = raw ? raw.split('/').filter(Boolean).pop() : '';
   const candidates = raw ? [raw, base, raw.toLowerCase(), (base || '').toLowerCase()] : [];
-  for (const c of candidates) {
+  const search = [];
+  if (opts?.contributor) {
+    // Contributor billing wins over the standard row: a standard id on the
+    // wire bills the contributor sibling when the mode is on.
+    for (const c of candidates) {
+      if (c && !c.toLowerCase().endsWith('-contributor')) search.push(`${c}-contributor`);
+    }
+  }
+  search.push(...candidates);
+  for (const c of search) {
     if (c && models[c]) return { rate: models[c], matched: c, estimated: false };
   }
   return { rate: models.default || BUILTIN.models.default, matched: 'default', estimated: true };
@@ -91,11 +104,11 @@ export function rateFor(modelId, table = priceTable()) {
 
 /**
  * Session-total cost from cumulative MSP tokens.
- * @returns {{ usd, thb, promptTokens, outputTokens, totalTokens, rate, matched, estimated, effective, source }}
+ * @returns {{ usd, thb, promptTokens, outputTokens, totalTokens, rate, matched, estimated, effective, source, contributor }}
  */
-export function sessionCost({ promptTokens, outputTokens, totalTokens, model } = {}) {
+export function sessionCost({ promptTokens, outputTokens, totalTokens, model, contributor = false } = {}) {
   const table = priceTable();
-  const { rate, matched, estimated } = rateFor(model, table);
+  const { rate, matched, estimated } = rateFor(model, table, { contributor });
   const p = Math.max(0, Math.round(Number(promptTokens) || 0));
   const o = Math.max(0, Math.round(Number(outputTokens) || 0));
   const t = Number.isFinite(Number(totalTokens)) && Number(totalTokens) >= 0
@@ -114,6 +127,7 @@ export function sessionCost({ promptTokens, outputTokens, totalTokens, model } =
     estimated: estimated || !table.override,
     effective: table.effective,
     source: table.source,
+    contributor: !!contributor,
   };
 }
 

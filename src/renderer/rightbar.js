@@ -416,12 +416,23 @@ async function copyText(text) {
   }
 }
 
-/** Client mirror of the server's rateFor(): exact → basename → lower → lower-basename → default. */
-function pickRate(modelId, pricing) {
+/** Client mirror of the server's rateFor(): exact → basename → lower → lower-basename → default.
+ * With contributor mode on each candidate also tries its `-contributor`
+ * sibling, mirroring the server — the CLI bills a standard id on the wire
+ * at the contributor row when the mode is on. */
+function pickRate(modelId, pricing, contributor = false) {
   const models = pricing?.models || {};
   const raw = String(modelId || '').trim();
   const base = raw ? raw.split('/').filter(Boolean).pop() : '';
-  for (const c of raw ? [raw, base, raw.toLowerCase(), (base || '').toLowerCase()] : []) {
+  const candidates = raw ? [raw, base, raw.toLowerCase(), (base || '').toLowerCase()] : [];
+  const search = [];
+  if (contributor) {
+    for (const c of candidates) {
+      if (c && !c.toLowerCase().endsWith('-contributor')) search.push(`${c}-contributor`);
+    }
+  }
+  search.push(...candidates);
+  for (const c of search) {
     if (c && models[c]) return { rate: models[c], matched: c, estimated: false };
   }
   return {
@@ -581,7 +592,13 @@ export function createRightbar({ api, aside, toggleBtn }) {
     if (pricing || pricingFailed) return;
     try {
       const res = await api('/api/pricing');
-      pricing = { table: res.pricing, thbPerUsd: Number(res.thbPerUsd) || 35 };
+      // Absent flag means a pre-contributor host — the deployment default
+      // is contributor on, so only an explicit false switches the badge off.
+      pricing = {
+        table: res.pricing,
+        thbPerUsd: Number(res.thbPerUsd) || 35,
+        contributor: res.contributor?.enabled !== false,
+      };
     } catch {
       pricingFailed = true;
     }
@@ -602,7 +619,8 @@ export function createRightbar({ api, aside, toggleBtn }) {
     const t = tokens.totalTokens != null ? Math.round(Number(tokens.totalTokens)) : p + o;
     const table = pricing?.table || BUILTIN_PRICING;
     const thbRate = pricing?.thbPerUsd || BUILTIN_THB_PER_USD;
-    const { rate, matched, estimated } = pickRate(model, table);
+    const contributor = pricing ? pricing.contributor !== false : true;
+    const { rate, matched, estimated } = pickRate(model, table, contributor);
     const usd = (p * (rate.input || 0) + o * (rate.output || 0)) / 1_000_000;
     const thb = usd * thbRate;
 
@@ -622,6 +640,16 @@ export function createRightbar({ api, aside, toggleBtn }) {
     row('output', `${fmtInt(o)} tokens`);
     row('รวม', `${fmtInt(t)} tokens`);
     row('โมเดล', model ? String(model).split('/').filter(Boolean).pop() : '—');
+    // Billing mode is a CLI setting now, not a model id — show which row
+    // actually prices this session so a standard id on contributor billing
+    // never reads as the standard price.
+    row(
+      'โหมด',
+      contributor ? 'contributor' : 'standard',
+      contributor
+        ? 'โหมด contributor: ใช้ข้อมูลปรับปรุงผลิตภัณฑ์ แลกเรทถูกกว่า'
+        : 'โหมด standard: ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์',
+    );
     // Which table row prices this session — a silent default fallback is
     // exactly how every model used to cost the same.
     row(
@@ -639,6 +667,29 @@ export function createRightbar({ api, aside, toggleBtn }) {
       `${estimated || !table.override ? 'ประมาณการ · ' : ''}เรท ${table.effective || '—'} · ${table.source || ''}`.trim(),
     );
     costBody.append(foot);
+
+    // Contributor on/off switch — the same mode the CLI keeps in its own
+    // settings.json. Enabling records the disclosure acknowledgment, so the
+    // label carries the data-use notice and the click is the informed
+    // consent. Pricing refetches after the switch, so the rail follows
+    // with no restart.
+    const toggle = el('button', 'btn ghost sm', contributor ? 'ปิด contributor' : 'เปิด contributor');
+    toggle.type = 'button';
+    toggle.title = contributor
+      ? 'ปิดโหมด contributor — กลับไปเรทมาตรฐาน ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์'
+      : 'เปิดโหมด contributor — ยอมให้ใช้ข้อมูลปรับปรุงผลิตภัณฑ์ แลกเรทถูกกว่า';
+    toggle.addEventListener('click', async () => {
+      toggle.disabled = true;
+      try {
+        await api('/api/contributor', { method: 'POST', body: { enabled: !contributor } });
+        pricing = null;
+        render();
+      } catch (err) {
+        toggle.disabled = false;
+        toggle.title = `สลับโหมดไม่สำเร็จ: ${err?.message || err}`;
+      }
+    });
+    costBody.append(toggle);
     summaryLine(costBody, fmtThb(thb));
   }
 

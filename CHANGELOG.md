@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.36 — 2026-10-12
+
+Contributor on/off switch in the cost rail (`POST /api/contributor`): flips
+the CLI's own `contributor_mode_enabled` (other keys preserved, `.bak`
+kept), records the disclosure acknowledgment on enable, 400s on non-boolean
+bodies — pricing and the โหมด badge follow with no restart. Covered by 2 new
+unit cases and 1 new E2E step (off→on round-trip, disclosure, key
+preservation, 400s). `?v=`=1.1.36.
+Full note: [docs/releases/v1.1.36-contributor-switch.md](docs/releases/v1.1.36-contributor-switch.md).
+
+## 1.1.35 — 2026-10-12
+
+Effort default is `max`, the `ultra` tier is retired, contributor billing is
+the default. New chats start at `max`; stored `ultra` migrates to `max` on
+load (same reasoning, without the proactive-guidance token burn) and `ultra`
+is a 400 on the config route. Contributor mode moved out of the model list
+into the CLI settings, so the host ensures `contributor_mode_enabled` (never
+rewriting an explicit opt-out, `.bak` kept, malformed files untouched),
+`/api/pricing` reports the live mode, and the cost rail bills a standard
+wire id at the contributor row with a โหมด badge. Covered by
+`unit-test-contributor` (10), new pricing/config-options/session-store cases
+and 5 new E2E steps (default without env, ultra-400, picker ceiling,
+pricing opt-out, migrate-across-restart): E2E 91/91. `?v=`=1.1.35.
+
 ## 1.1.34 — 2026-10-08
 
 Zombie-window recovery: `on_activate` verifies the existing window against

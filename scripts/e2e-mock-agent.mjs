@@ -24,7 +24,7 @@ function pickPort() {
   return 3900 + Math.floor(Math.random() * 400);
 }
 
-async function startHost({ authWall = false, museBin = MOCK, stateHome = null, configHome = null, extraEnv = null } = {}) {
+async function startHost({ authWall = false, museBin = MOCK, stateHome = null, configHome = null, extraEnv = null, dropEnv = null } = {}) {
   const port = pickPort();
   // stateHome/configHome reuse is the restart seam: the persistence step
   // boots a second host over the first host's dirs to prove the registry
@@ -42,9 +42,7 @@ async function startHost({ authWall = false, museBin = MOCK, stateHome = null, c
       mcpfix: { mode: 'optional', command: process.execPath, args: [path.join(ROOT, 'scripts/fixture-mcp-stdio.mjs')] },
     },
   }, null, 2));
-  const proc = spawn(process.execPath, [path.join(ROOT, 'src/server/index.js')], {
-    cwd: ROOT,
-    env: {
+  const env = {
       ...process.env,
       MUSE_DESKTOP_PORT: String(port),
       MUSE_DESKTOP_HOST: '127.0.0.1',
@@ -85,7 +83,13 @@ async function startHost({ authWall = false, museBin = MOCK, stateHome = null, c
       MOCK_MSP_ID_FILE: path.join(stateDir, 'mock-sid.counter'),
       ...(authWall ? { MOCK_MSP_MODE: 'authwall' } : {}),
       ...(extraEnv || {}),
-    },
+  };
+  // dropEnv proves a default: the key is absent, not overridden — a host
+  // that needs the env to behave must fail this harness, not read the dev's shell.
+  for (const k of dropEnv || []) delete env[k];
+  const proc = spawn(process.execPath, [path.join(ROOT, 'src/server/index.js')], {
+    cwd: ROOT,
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const logs = [];
@@ -210,7 +214,8 @@ await step('create a chat', async () => {
   assert.equal(r.status, 201);
   chatId = r.chat.id;
   assert.equal(r.chat.mode, 'always', 'new chats default to yolo');
-  // MUSE_DESKTOP_EFFORT=max on this host overrides the ultra default.
+  // MUSE_DESKTOP_EFFORT=max on this host; the no-env default is proven by
+  // the effort-default section near the end of this suite.
   assert.equal(r.chat.effort, 'max');
 });
 
@@ -266,6 +271,77 @@ await step('configured model + thinking effort reach the agent session', async (
     lines.some((l) => l === 'thinking=max'),
     `session/setReasoningEffort missing: ${JSON.stringify(lines)}`,
   );
+});
+
+await step('thinking change applies live; retired ultra is a 400', async () => {
+  const c = await req(host.base, 'POST', '/api/chats', { title: 'effort', cwd: os.tmpdir() });
+  assert.equal(c.status, 201);
+  const id = c.chat.id;
+  const ok = await req(host.base, 'POST', `/api/chats/${id}/config`, { configId: 'thinking', value: 'xhigh' });
+  assert.equal(ok.ok, true, `xhigh change must land: ${JSON.stringify(ok)}`);
+  const after = await req(host.base, 'GET', `/api/chats/${id}`);
+  assert.equal(after.chat.effort, 'xhigh');
+  assert.equal(after.chat.config?.effort, 'xhigh');
+  const ultra = await req(host.base, 'POST', `/api/chats/${id}/config`, { configId: 'thinking', value: 'ultra' });
+  assert.equal(ultra.status, 400, `retired ultra must 400, got ${ultra.status}`);
+  const kept = await req(host.base, 'GET', `/api/chats/${id}`);
+  assert.equal(kept.chat.effort, 'xhigh', 'a rejected tier must not move the stored effort');
+});
+
+await step('advertised thinking values top out at max, never ultra', async () => {
+  const c = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  const values = c.chat.config?.options?.thinking?.values || [];
+  assert.ok(values.includes('max'), `max missing from ${JSON.stringify(values)}`);
+  assert.ok(!values.includes('ultra'), `retired ultra still advertised: ${JSON.stringify(values)}`);
+});
+
+await step('pricing reports contributor default on and honors an explicit opt-out', async () => {
+  // The hermetic settings.json starts without the key, so boot writes the
+  // default in (keeping a .bak of the operator's file).
+  const before = JSON.parse(fs.readFileSync(host.settingsFile, 'utf8'));
+  assert.equal(before.contributor_mode_enabled, true, 'boot must default the key on');
+  assert.ok(
+    fs.existsSync(`${host.settingsFile}.bak`),
+    'boot must keep a .bak of the pre-default file',
+  );
+  const bak = JSON.parse(fs.readFileSync(`${host.settingsFile}.bak`, 'utf8'));
+  assert.ok(!('contributor_mode_enabled' in bak), '.bak must be the pre-change file');
+  const p = await req(host.base, 'GET', '/api/pricing');
+  assert.equal(p.contributor?.enabled, true);
+  // Per-request read: flipping the file flips the badge with no restart.
+  fs.writeFileSync(host.settingsFile, JSON.stringify({ ...before, contributor_mode_enabled: false }));
+  const off = await req(host.base, 'GET', '/api/pricing');
+  assert.equal(off.contributor?.enabled, false);
+  assert.equal(off.contributor?.source, 'settings');
+  fs.writeFileSync(host.settingsFile, JSON.stringify({ ...before, contributor_mode_enabled: true }));
+  const on = await req(host.base, 'GET', '/api/pricing');
+  assert.equal(on.contributor?.enabled, true);
+});
+
+await step('POST /api/contributor switches the mode end to end', async () => {
+  // Off: the CLI settings file flips and pricing follows with no restart.
+  const off = await req(host.base, 'POST', '/api/contributor', { enabled: false });
+  assert.equal(off.ok, true);
+  assert.equal(off.contributor?.enabled, false);
+  assert.equal(JSON.parse(fs.readFileSync(host.settingsFile, 'utf8')).contributor_mode_enabled, false);
+  const priced = await req(host.base, 'GET', '/api/pricing');
+  assert.equal(priced.contributor?.enabled, false);
+  // Back on: the mode flips and the disclosure acknowledgment is recorded —
+  // the toggle label carries the notice, so the click is the consent.
+  const back = await req(host.base, 'POST', '/api/contributor', { enabled: true });
+  assert.equal(back.ok, true);
+  assert.equal(back.contributor?.enabled, true);
+  const doc = JSON.parse(fs.readFileSync(host.settingsFile, 'utf8'));
+  assert.equal(doc.contributor_mode_enabled, true);
+  assert.equal(doc.contributor_mode_disclosure_acknowledged, true);
+  assert.ok(doc.mcpServers, 'the switch must preserve unrelated CLI settings');
+  // Anything but a boolean 400s and moves nothing.
+  for (const body of [{}, { enabled: 'yes' }, { enabled: 1 }, { enabled: null }]) {
+    const bad = await req(host.base, 'POST', '/api/contributor', body);
+    assert.equal(bad.status, 400, `non-boolean must 400, got ${bad.status} for ${JSON.stringify(body)}`);
+  }
+  const kept = await req(host.base, 'GET', '/api/pricing');
+  assert.equal(kept.contributor?.enabled, true, 'rejected switches must not move the mode');
 });
 
 await step('tool calls stream as rows and reach completed', async () => {
@@ -2079,6 +2155,45 @@ await step('an immediate prompt during a held subscribe waits, never NOT_SUBSCRI
     try { gated.proc.kill('SIGKILL'); } catch { /* already gone */ }
   }
 });
+
+// ------------------------------------------------- effort/contributor defaults
+// No MUSE_DESKTOP_EFFORT in the environment at all: the max default must
+// come from the code, and a stored ultra from the old default must land on
+// max after a restart — never rejected, never stuck.
+
+const plain = await startHost({ dropEnv: ['MUSE_DESKTOP_EFFORT'] });
+try {
+  await step('a host without MUSE_DESKTOP_EFFORT defaults new chats to max', async () => {
+    const r = await req(plain.base, 'POST', '/api/chats', { title: 'plain-default', cwd: os.tmpdir() });
+    assert.equal(r.status, 201);
+    assert.equal(r.chat.effort, 'max', `default effort must be max, got ${r.chat.effort}`);
+  });
+
+  await step('a stored ultra migrates to max across a restart', async () => {
+    const made = await req(plain.base, 'POST', '/api/chats', { title: 'legacy', cwd: os.tmpdir() });
+    const legacyId = made.chat.id;
+    await req(plain.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
+    await sleep(300);
+    try { plain.proc.kill('SIGKILL'); } catch { /* already gone */ }
+    const chatsFile = path.join(plain.stateHome, 'muse-desktop/chats.json');
+    const raw = JSON.parse(fs.readFileSync(chatsFile, 'utf8'));
+    raw.chats.find((c) => c.id === legacyId).effort = 'ultra';
+    fs.writeFileSync(chatsFile, JSON.stringify(raw, null, 2));
+    const plain2 = await startHost({ stateHome: plain.stateHome, configHome: plain.configHome, dropEnv: ['MUSE_DESKTOP_EFFORT'] });
+    try {
+      const got = await req(plain2.base, 'GET', `/api/chats/${legacyId}`);
+      assert.equal(got.chat.effort, 'max', `stored ultra must migrate to max, got ${got.chat.effort}`);
+    } finally {
+      await req(plain2.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
+      await sleep(300);
+      try { plain2.proc.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+} finally {
+  await req(plain.base, 'POST', '/api/host/shutdown', { killAgents: true }).catch(() => {});
+  await sleep(300);
+  try { plain.proc.kill('SIGKILL'); } catch { /* already gone */ }
+}
 
 const failed = results.filter(([ok]) => !ok).length;
 console.log(`e2e: ${results.length - failed}/${results.length} passed`);

@@ -179,8 +179,11 @@ export function uuidv7() {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
-/** The closed ReasoningEffort vocabulary, straight from the MSP schema. */
-export const REASONING_TIERS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+/** The ReasoningEffort tiers this desktop offers. The wire schema still
+ * knows `ultra`, but the desktop retired it: `ultra` rides `max` reasoning
+ * while also switching on proactive workflow guidance that burns tokens
+ * fast, so `max` is the top selectable tier here. */
+export const REASONING_TIERS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 function resolveMuseBin() {
   if (process.env.MUSE_BIN && fs.existsSync(process.env.MUSE_BIN)) {

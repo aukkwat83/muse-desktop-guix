@@ -29,6 +29,7 @@ import {
   noDialogMessage,
 } from './file-picker.js';
 import { priceTable, thbPerUsd } from './pricing.js';
+import { ensureContributorDefault, readContributorState, setContributorEnabled } from './contributor.js';
 import { buildNotifyPayload, notifyArgs, shouldDeliver } from './notify.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -71,11 +72,20 @@ const sessions = new SessionManager({
     mode: process.env.MUSE_DESKTOP_MODE || 'always',
     // Model alias / thinking effort applied to every new agent session.
     // Null model means the host default — the binary decides. Effort
-    // defaults to ultra; MUSE_DESKTOP_EFFORT overrides per deployment.
+    // defaults to max; MUSE_DESKTOP_EFFORT overrides per deployment.
     model: process.env.MUSE_DESKTOP_MODEL || null,
-    effort: process.env.MUSE_DESKTOP_EFFORT || 'ultra',
+    effort: process.env.MUSE_DESKTOP_EFFORT || 'max',
   },
 });
+
+// Contributor billing is the deployment default: the CLI moved the mode out
+// of the model list into its own settings.json, so the host ensures the key
+// exists (never rewriting an explicit opt-out) and the cost bar reads the
+// live state per request below.
+const contributorBoot = ensureContributorDefault();
+console.log(
+  `[contributor] enabled=${contributorBoot.enabled} source=${contributorBoot.source} path=${contributorBoot.path}`,
+);
 
 // --------------------------------------------------------------- helpers
 
@@ -721,7 +731,30 @@ const server = http.createServer(async (req, res) => {
     // Static model rate table for the right-bar calculator (USD per 1M
     // tokens + the THB rate). The renderer multiplies session tokens by it.
     if (pathname === '/api/pricing' && method === 'GET') {
-      return send(res, 200, { ok: true, pricing: priceTable(), thbPerUsd: thbPerUsd() });
+      return send(res, 200, {
+        ok: true,
+        pricing: priceTable(),
+        thbPerUsd: thbPerUsd(),
+        contributor: readContributorState(),
+      });
+    }
+
+    // Contributor on/off switch: writes the CLI's own settings.json (the
+    // same key the CLI honors), so the mode survives restarts on both sides.
+    // Pricing reads the file per request, so the cost rail follows with no
+    // restart. Anything but a boolean 400s; an unwritable file 500s.
+    if (pathname === '/api/contributor' && method === 'POST') {
+      const body = await readJson(req).catch(() => ({}));
+      if (typeof body?.enabled !== 'boolean') {
+        return fail(res, 400, 'enabled must be a boolean');
+      }
+      try {
+        const contributor = setContributorEnabled(body.enabled);
+        console.log(`[contributor] switched enabled=${contributor.enabled}`);
+        return send(res, 200, { ok: true, contributor });
+      } catch (err) {
+        return fail(res, 500, err?.message || 'contributor switch failed');
+      }
     }
 
     // ---- notifications ---------------------------------------------
