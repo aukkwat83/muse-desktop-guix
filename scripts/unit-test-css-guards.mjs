@@ -186,6 +186,22 @@ test('every renderer script/stylesheet carries the same non-empty ?v= token', ()
   assert.equal(tokens.size, 1, `mixed ?v= tokens: ${[...tokens].join(', ')}`);
 });
 
+// Per-module imports carry their own ?v= (app.js imports rightbar.js?v=…,
+// not index.html) — bumping only the shared token leaves a stale module
+// cached and the fix looks like it did nothing (1.1.36 contributor switch
+// shipped invisible for exactly this reason). Every relative import must
+// carry a non-empty token; the value is the module's own revision.
+test('every relative renderer import carries a non-empty ?v= token', () => {
+  const mods = fs.readdirSync(RENDERER).filter((f) => f.endsWith('.js'));
+  assert.ok(mods.length > 0, 'no renderer modules found');
+  for (const f of mods) {
+    const src = fs.readFileSync(path.join(RENDERER, f), 'utf8');
+    for (const m of src.matchAll(/from\s+['"]\.\/([^'"]+)\.js(['"])/g)) {
+      assert.fail(`${f} imports ./${m[1]}.js without a ?v= cache-bust token`);
+    }
+  }
+});
+
 // One number, one meaning (BUG-078): the badge paints pkg.version from
 // /api/version, WKWebView cache-busts on the shared ?v= token — 77 fixes
 // went out while the badge still read 0.4.0 because nothing tied the two.

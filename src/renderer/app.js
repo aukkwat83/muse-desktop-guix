@@ -20,7 +20,7 @@ import { initSidebarResize } from './sidebar-resize.js?v=1.0.0';
 import { initRightbarResize } from './rightbar-resize.js?v=1.0.0';
 import { closePopover, isPopoverOpen, miniConfirm, openMenu, openPanel } from './popover.js?v=0.5.1';
 import { createMcpPanel } from './mcp-panel.js?v=1.1.0';
-import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, unionSubagentCounts } from './rightbar.js?v=1.2.0';
+import { createRightbar, goalControlFor, goalStatusWord, overviewSubagentRows, unionSubagentCounts } from './rightbar.js?v=1.2.1';
 import { createChildActivity } from './child-activity.js?v=1.1.0';
 import { createOverviewPanel, resolvePlan } from './overview-panel.js?v=1.1.0';
 import { paintApTitle } from './ap-tags.js?v=1.0.0';
@@ -64,6 +64,7 @@ const el = {
   modeChip: $('#mode-chip'),
   modelChip: $('#model-chip'),
   effortChip: $('#effort-chip'),
+  contribChip: $('#contrib-chip'),
   composer: $('#composer'),
   grow: $('#grow'),
   prompt: $('#prompt'),
@@ -116,6 +117,9 @@ const state = {
   /** Active chat's { model, effort, options } config snapshot (BUG-074);
    *  options is null until the live agent advertises its selects. */
   chatConfig: null,
+  /** Global billing mode {enabled} from /api/pricing — a CLI setting, not
+   *  per-chat. Null until the first fetch lands; the pill hides till then. */
+  contributor: null,
   /** chatId → live turn record. Never a single global "current turn". */
   turnViews: new Map(),
   agent: null,
@@ -1611,6 +1615,42 @@ function updateConfigPills() {
   el.effortChip.hidden = opts ? !opts.thinking : !cfg?.effort;
   el.effortChip.textContent = opts?.thinking?.currentValue || cfg?.effort || '—';
   el.effortChip.disabled = false;
+  // Contributor pill: global billing mode, always visible once known —
+  // unlike effort it never depends on the chat or the advertised selects.
+  const contrib = state.contributor?.enabled;
+  el.contribChip.hidden = contrib == null;
+  el.contribChip.textContent = contrib ? 'contributor' : 'standard';
+  el.contribChip.title = contrib
+    ? 'โหมด contributor (เรทถูกกว่า ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อปิด'
+    : 'โหมด standard (ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อเปิด contributor';
+  el.contribChip.disabled = false;
+}
+
+/** Fetch the billing mode once (boot) and repaint the pill. */
+async function refreshContributor() {
+  try {
+    const res = await api('/api/pricing');
+    state.contributor = { enabled: res.contributor?.enabled !== false };
+  } catch {
+    state.contributor = { enabled: true }; // deployment default; pricing refines it
+  }
+  updateConfigPills();
+}
+
+/** Optimistic contributor flip + rollback — same contract as setChatConfig. */
+async function toggleContributor() {
+  const prev = state.contributor?.enabled !== false;
+  state.contributor = { enabled: !prev };
+  updateConfigPills();
+  try {
+    const res = await api('/api/contributor', { method: 'POST', body: { enabled: !prev } });
+    state.contributor = { enabled: res.contributor?.enabled !== false };
+    rightbar.refreshPricing();
+  } catch (err) {
+    state.contributor = { enabled: prev };
+    showError(`สลับโหมดไม่สำเร็จ: ${err?.message || err}`);
+  }
+  updateConfigPills();
 }
 
 function openConfigMenu(kind, anchor) {
@@ -4261,6 +4301,8 @@ function wireUi() {
 
   el.modelChip.addEventListener('click', () => openConfigMenu('model', el.modelChip));
   el.effortChip.addEventListener('click', () => openConfigMenu('thinking', el.effortChip));
+  el.contribChip.addEventListener('click', () => void toggleContributor());
+  void refreshContributor();
 
   el.mcpBtn?.addEventListener('click', () => mcpPanel.open(el.mcpBtn));
   // Goal/tasks/agents chips open the live overview popup at the active chat.

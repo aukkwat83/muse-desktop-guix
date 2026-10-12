@@ -668,28 +668,8 @@ export function createRightbar({ api, aside, toggleBtn }) {
     );
     costBody.append(foot);
 
-    // Contributor on/off switch — the same mode the CLI keeps in its own
-    // settings.json. Enabling records the disclosure acknowledgment, so the
-    // label carries the data-use notice and the click is the informed
-    // consent. Pricing refetches after the switch, so the rail follows
-    // with no restart.
-    const toggle = el('button', 'btn ghost sm', contributor ? 'ปิด contributor' : 'เปิด contributor');
-    toggle.type = 'button';
-    toggle.title = contributor
-      ? 'ปิดโหมด contributor — กลับไปเรทมาตรฐาน ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์'
-      : 'เปิดโหมด contributor — ยอมให้ใช้ข้อมูลปรับปรุงผลิตภัณฑ์ แลกเรทถูกกว่า';
-    toggle.addEventListener('click', async () => {
-      toggle.disabled = true;
-      try {
-        await api('/api/contributor', { method: 'POST', body: { enabled: !contributor } });
-        pricing = null;
-        render();
-      } catch (err) {
-        toggle.disabled = false;
-        toggle.title = `สลับโหมดไม่สำเร็จ: ${err?.message || err}`;
-      }
-    });
-    costBody.append(toggle);
+    // The on/off switch lives beside the effort pill in the header; the
+    // rail keeps its read-only mode row so the priced row stays labeled.
     summaryLine(costBody, fmtThb(thb));
   }
 
@@ -708,6 +688,13 @@ export function createRightbar({ api, aside, toggleBtn }) {
     setOpen,
     toggle: () => setOpen(!isOpen()),
     reveal,
+
+    /** Drop the cached pricing table so the next render refetches it —
+     *  the header contributor pill calls this after a mode switch. */
+    refreshPricing() {
+      pricing = null;
+      render();
+    },
 
     /** Chat switch: point every section at the new chat. */
     showChat(id) {

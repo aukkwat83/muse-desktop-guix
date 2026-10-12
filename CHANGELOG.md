@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.37 — 2026-10-12
+
+Contributor switch moved beside the effort pill (`contributor`/`standard`
+pill in the header, always visible once known) — the cost rail keeps only
+its read-only mode row. Fixes the invisible-switch incident: per-module
+`?v=` imports (e.g. `rightbar.js?v=`) were never bumped, so browsers kept
+the stale module; `rightbar.js?v=1.2.1`, shared `?v=`=1.1.37, plus a new
+css-guards pin that fails when any relative renderer import lacks `?v=`.
+Full note: [docs/releases/v1.1.37-contributor-pill.md](docs/releases/v1.1.37-contributor-pill.md).
+
 ## 1.1.36 — 2026-10-12
 
 Contributor on/off switch in the cost rail (`POST /api/contributor`): flips
