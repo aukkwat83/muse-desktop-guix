@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.39 — 2026-10-13
+
+Deep Research lands as a header pill beside contributor: a sticky
+per-chat toggle (sessionStorage-backed, like drafts) plus
+`/deep-research [on|off|<topic>]` in the composer — bare toggles the
+chat's pill, a topic runs one research turn. `POST /prompt` gains
+`deepResearch: true`; the server wraps the topic in the research
+harness (scope questions first, fan-out searches/Workflow,
+adversarial verification, cited report) on the wire only — the stored
+message stays the verbatim topic with `meta.deepResearch`, mirroring
+the session-recovery preamble. Queue/requeue and rotation retries
+keep the flag. New `deep-research` suite 5/5, slash-commands 6/6, one
+new e2e step. `?v=`=1.1.39.
+Full note: [docs/releases/v1.1.39-deep-research.md](docs/releases/v1.1.39-deep-research.md).
+
 ## 1.1.38 — 2026-10-13
 
 Contributor billing is locked on: boot forces `contributor_mode_enabled`

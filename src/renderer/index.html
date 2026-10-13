@@ -14,10 +14,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" href="/icon.png" />
     <!-- Blocking on purpose: sets data-theme before the first paint. -->
-    <script src="/theme-boot.js?v=1.1.38"></script>
-    <link rel="stylesheet" href="/style.css?v=1.1.38" />
-    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.38" />
-    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.38" />
+    <script src="/theme-boot.js?v=1.1.39"></script>
+    <link rel="stylesheet" href="/style.css?v=1.1.39" />
+    <link rel="stylesheet" href="/theme-claude-light.css?v=1.1.39" />
+    <link rel="stylesheet" href="/theme-claude-dark.css?v=1.1.39" />
   </head>
   <body>
     <div id="app">
@@ -79,6 +79,7 @@
             <button id="model-chip" class="pill mode" type="button" title="โมเดล — คลิกเพื่อเปลี่ยน" hidden>—</button>
             <button id="effort-chip" class="pill mode" type="button" title="Effort การคิด — คลิกเพื่อเปลี่ยน" hidden>—</button>
             <button id="contrib-chip" class="pill mode" type="button" title="โหมด contributor — คลิกเพื่อสลับ" hidden>—</button>
+            <button id="deep-chip" class="pill mode" type="button" aria-pressed="false" data-deep="off" title="Deep Research — คลิกเพื่อเปิดโหมดวิจัยเชิงลึกสำหรับแชทนี้ (หรือพิมพ์ /deep-research)">deep research</button>
             <button id="mode-chip" class="pill mode" type="button" title="Mode (Shift+Tab)">yolo</button>
            </div>
            <div class="head-actions">
@@ -229,7 +230,7 @@
     <!-- Standalone version paint: runs even when app.js fails to load, so a
          dead boot never leaves a silent shell (BUG-066). External file rather
          than an inline script because the CSP is script-src 'self'. -->
-    <script src="/version-boot.js?v=1.1.38"></script>
-    <script type="module" src="/app.js?v=1.1.38"></script>
+    <script src="/version-boot.js?v=1.1.39"></script>
+    <script type="module" src="/app.js?v=1.1.39"></script>
   </body>
 </html>

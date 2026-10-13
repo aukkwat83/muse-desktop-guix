@@ -39,6 +39,7 @@ import { applyApPrefixToTitle } from './ap-title.js';
 import { usageCacheFile, writeUsageCache } from './usage-cache.js';
 import { buildQuestionNotice, defaultQuestionNotifier } from './notify.js';
 import { contributorLocked, enforceContributorLock } from './contributor.js';
+import { applyDeepResearchWireText } from './deep-research.js';
 
 const DEFAULT_MAX_HOT = Number(process.env.MUSE_DESKTOP_MAX_HOT_AGENTS || 6);
 const DEFAULT_IDLE_DEMOTE_MS = Number(process.env.MUSE_DESKTOP_IDLE_DEMOTE_MS || 30 * 60 * 1000);
@@ -1257,12 +1258,18 @@ export class SessionManager extends EventEmitter {
     // A history-rotation retry re-sends the same text — the user message is
     // already in the transcript from the first attempt; storing it again
     // would paint the prompt twice.
+    // Deep Research meta rides the stored message (the harness itself is
+    // wire-only, below) so history can show which turns were research.
+    const userMeta = {
+      ...(resolved.meta.length ? { attachments: resolved.meta } : {}),
+      ...(opts.deepResearch === true && body ? { deepResearch: true } : {}),
+    };
     const userMsg = opts.skipUserMessage
       ? null
       : this.store.addMessage(chatId, {
         role: 'user',
         text: body,
-        ...(resolved.meta.length ? { meta: { attachments: resolved.meta } } : {}),
+        ...(Object.keys(userMeta).length ? { meta: userMeta } : {}),
       });
     if (!body && resolved.meta.length && (!chat.title || chat.title === 'New chat')) {
       this.store.update(chatId, { title: `ไฟล์แนบ ${resolved.meta.length} รายการ` });
@@ -1274,7 +1281,10 @@ export class SessionManager extends EventEmitter {
       const apTitle = applyApPrefixToTitle(this.store.get(chatId)?.title || 'New chat', body);
       if (apTitle.changed) this.store.update(chatId, { title: apTitle.title });
     }
-    const wireText = this._buildRecoveryWireText(chatId, body, userMsg?.id);
+    const recoveryWireText = this._buildRecoveryWireText(chatId, body, userMsg?.id);
+    const wireText = opts.deepResearch === true && body
+      ? applyDeepResearchWireText(recoveryWireText, body)
+      : recoveryWireText;
 
     live.turn = {
       turnId,
@@ -1349,6 +1359,7 @@ export class SessionManager extends EventEmitter {
             await this.prompt(chatId, body, {
               _historyRetried: true,
               skipUserMessage: true,
+              deepResearch: opts.deepResearch === true,
               attachments: userMsg?.meta?.attachments || rawAtts,
             });
           } catch (retryErr) {
@@ -1378,6 +1389,7 @@ export class SessionManager extends EventEmitter {
             await this.prompt(chatId, body, {
               _mcpAuditRetried: true,
               skipUserMessage: true,
+              deepResearch: opts.deepResearch === true,
               attachments: userMsg?.meta?.attachments || rawAtts,
             });
           } catch (retryErr) {

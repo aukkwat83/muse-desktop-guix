@@ -949,6 +949,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const { turnId, message } = await sessions.prompt(chatId, body.text, {
             attachments: body.attachments,
+            deepResearch: body.deepResearch === true,
           });
           return send(res, 202, { ok: true, turnId, message });
         } catch (err) {

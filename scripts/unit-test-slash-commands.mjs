@@ -54,6 +54,29 @@ test('/always-approve on|off map to always/normal; bare toggles', () => {
   assert.deepEqual(parseSlashCommand('/always-approve'), { type: 'toggle-always' });
 });
 
+test('/deep-research toggles bare, sets on|off, else carries the topic', () => {
+  assert.deepEqual(parseSlashCommand('/deep-research'), {
+    type: 'research-toggle',
+    enabled: null,
+  });
+  assert.deepEqual(parseSlashCommand('/deep-research on'), {
+    type: 'research-toggle',
+    enabled: true,
+  });
+  assert.deepEqual(parseSlashCommand('/DEEP-RESEARCH OFF'), {
+    type: 'research-toggle',
+    enabled: false,
+  });
+  assert.deepEqual(parseSlashCommand('/deep-research เทียบ LFP กับ NMC'), {
+    type: 'research',
+    rest: 'เทียบ LFP กับ NMC',
+  });
+  assert.deepEqual(parseSlashCommand('/deep-researchx'), {
+    type: 'unknown',
+    name: '/deep-researchx',
+  });
+});
+
 test('unknown leading slashes are reported with their name', () => {
   assert.deepEqual(parseSlashCommand('/compact'), { type: 'unknown', name: '/compact' });
   assert.deepEqual(parseSlashCommand('/planx do it'), { type: 'unknown', name: '/planx' });

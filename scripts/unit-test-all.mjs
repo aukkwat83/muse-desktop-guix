@@ -48,6 +48,7 @@ const SUITES = [
   ['prompt-queue', 'unit-test-prompt-queue.mjs'],
   ['history-window', 'unit-test-history-window.mjs'],
   ['slash-commands', 'unit-test-slash-commands.mjs'],
+  ['deep-research', 'unit-test-deep-research.mjs'],
   ['transcript-markdown', 'unit-test-transcript-markdown.mjs'],
   ['markdown', 'unit-test-markdown.mjs'],
   ['mcp', 'unit-test-mcp.mjs'],

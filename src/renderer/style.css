@@ -1880,6 +1880,13 @@ button.search-hit:hover {
   border-color: color-mix(in srgb, var(--ok) 50%, transparent);
 }
 
+/* Deep Research pill (v1.1.39): on-state reuses the audited busy pair. */
+.pill.mode[data-deep='on'] {
+  color: var(--accent-text);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
 /* ----------------------------------------------------------- auth gate */
 
 .auth-gate {

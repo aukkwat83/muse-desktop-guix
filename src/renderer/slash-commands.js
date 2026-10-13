@@ -12,6 +12,8 @@
  * @returns {{ type: 'none' }
  *   | { type: 'mode', mode: 'plan'|'normal'|'always', rest: string }
  *   | { type: 'toggle-always' }
+ *   | { type: 'research', rest: string }
+ *   | { type: 'research-toggle', enabled: boolean | null }
  *   | { type: 'unknown', name: string }}
  */
 export function parseSlashCommand(text) {
@@ -34,6 +36,18 @@ export function parseSlashCommand(text) {
 
   // /ask → back to normal mode.
   if (/^\/ask\s*$/i.test(t)) return { type: 'mode', mode: 'normal', rest: '' };
+
+  // /deep-research (v1.1.39): bare toggles this chat's Deep Research
+  // pill, on|off sets it, anything else is a one-shot research topic —
+  // the desktop harness rides on the wire, the topic stays verbatim.
+  m = t.match(/^\/deep-research(?:\s+([\s\S]+))?$/i);
+  if (m) {
+    const rest = (m[1] || '').trim();
+    if (!rest) return { type: 'research-toggle', enabled: null };
+    if (/^on$/i.test(rest)) return { type: 'research-toggle', enabled: true };
+    if (/^off$/i.test(rest)) return { type: 'research-toggle', enabled: false };
+    return { type: 'research', rest };
+  }
 
   // A leading slash that is none of the above: the caller must not eat the
   // text — it goes out as a normal prompt behind a Thai notice.

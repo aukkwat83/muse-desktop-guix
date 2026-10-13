@@ -12,7 +12,7 @@
 const OPEN_PHASES = new Set(['starting', 'running', 'waiting_input', 'settling']);
 
 /**
- * @typedef {{ id: string, text: string, attachments: Array, enqueuedAt: number }} QueueItem
+ * @typedef {{ id: string, text: string, attachments: Array, deepResearch: boolean, enqueuedAt: number }} QueueItem
  */
 
 export function createPromptQueue() {
@@ -31,7 +31,7 @@ export function createPromptQueue() {
     return q;
   }
 
-  function enqueue(chatId, text, attachments = []) {
+  function enqueue(chatId, text, attachments = [], opts = {}) {
     const id = String(chatId || '');
     const t = String(text || '').trim();
     const atts = Array.isArray(attachments) ? attachments : [];
@@ -40,6 +40,7 @@ export function createPromptQueue() {
       id: `q${++seq}`,
       text: t,
       attachments: atts,
+      deepResearch: opts?.deepResearch === true,
       enqueuedAt: Date.now(),
     };
     bucket(id).push(item);
@@ -82,12 +83,13 @@ export function createPromptQueue() {
         id: itemOrText.id || `q${++seq}`,
         text: String(itemOrText.text || '').trim(),
         attachments: Array.isArray(itemOrText.attachments) ? itemOrText.attachments : [],
+        deepResearch: itemOrText.deepResearch === true,
         enqueuedAt: itemOrText.enqueuedAt || Date.now(),
       };
     } else {
       const t = String(itemOrText || '').trim();
       if (!t) return null;
-      item = { id: `q${++seq}`, text: t, attachments: [], enqueuedAt: Date.now() };
+      item = { id: `q${++seq}`, text: t, attachments: [], deepResearch: false, enqueuedAt: Date.now() };
     }
     if (!item.text && !item.attachments.length) return null;
     const q = bucket(id);

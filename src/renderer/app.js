@@ -28,9 +28,10 @@ import { formatCtxMeter } from './ctx-meter.js?v=1.0.0';
 import { computePin } from './scroll-pin.js?v=0.4.0';
 import { createWireRevisions } from './wire-rev.js?v=1.0.2';
 import { createComposerDraftStore } from './composer-draft.js?v=0.4.0';
-import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.4.0';
+import { createPromptQueue, shouldDispatch } from './prompt-queue.js?v=0.5.0';
 import { adaptiveHistoryDefaults, computeHistoryStartIndex, expandHistoryStartIndex, sliceHistoryMessages } from './history-window.js?v=0.4.0';
-import { parseSlashCommand } from './slash-commands.js?v=0.4.0';
+import { parseSlashCommand } from './slash-commands.js?v=0.5.0';
+import { createDeepResearchStore } from './deep-research.js?v=1.0.0';
 import { chatToMarkdown } from './transcript-markdown.js?v=0.4.0';
 import { createTurnView, bindTurnId, interruptedMarkerText, stripMarkerGlyph, liveChildOrder, createLivePaintScheduler, seedTurnView, resolveStatusVerb, ixSubmitTransition, IX_SUBMIT_ERROR_TEXT, toolStatusLabel, ixPrimaryOptionId, ixKeyToOptionId, escStopAction, confirmedStopProceeds, outcomeLabel, applyIxSnapshot, reconcileIxSnapshot, ixSnapshotSurvives, ixHasUnresolved, messageChildOrder, shouldAutoExpandTool, toggleProgressOpen, progressSummary, progressTopic, toolTopic, configSelectsFromOptions, modelShortName, configMenuItems, agentToolMeta, agentSubtitle, toolDisplayState, agentCounts, agentToolRows, formatElapsed, turnHeaderLabel } from './turn-view.js?v=0.5.0';
 import { createQuestionDraftStore, draftToAnswers, orderInboxItems, buildInboxPanel, buildQuestionForm, buildApprovalMini, updateInboxList, updateInboxSubmit, routeReceiptVerdict, applyQuestionRoute } from './question-inbox.js?v=1.0.0';
@@ -65,6 +66,7 @@ const el = {
   modelChip: $('#model-chip'),
   effortChip: $('#effort-chip'),
   contribChip: $('#contrib-chip'),
+  deepChip: $('#deep-chip'),
   composer: $('#composer'),
   grow: $('#grow'),
   prompt: $('#prompt'),
@@ -137,6 +139,10 @@ const drafts = createComposerDraftStore();
 /** chatId → FIFO of prompts typed while a turn was running (BUG-051).
  *  In-memory only; dispatched strictly through POST /prompt after settle. */
 const promptQueue = createPromptQueue();
+
+/** chatId → Deep Research toggle (v1.1.39), sessionStorage-backed like
+ *  drafts. Sticky per chat until toggled off; never a global flag. */
+const deepResearch = createDeepResearchStore();
 /** Chats with a queue dispatch in flight — one POST per chat at a time. */
 const queueDispatching = new Set();
 
@@ -1627,6 +1633,7 @@ function updateConfigPills() {
       ? 'โหมด contributor (เรทถูกกว่า ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อปิด'
       : 'โหมด standard (ไม่ใช้ข้อมูลปรับปรุงผลิตภัณฑ์) — คลิกเพื่อเปิด contributor';
   el.contribChip.disabled = contribLocked;
+  updateDeepChip();
 }
 
 /** Fetch the billing mode once (boot) and repaint the pill. */
@@ -1663,6 +1670,32 @@ async function toggleContributor() {
     showError(`สลับโหมดไม่สำเร็จ: ${err?.message || err}`);
   }
   updateConfigPills();
+}
+
+/** Repaint the Deep Research pill from the active chat's toggle. */
+function updateDeepChip() {
+  if (!el.deepChip) return;
+  const on = deepResearch.get(state.activeId);
+  el.deepChip.dataset.deep = on ? 'on' : 'off';
+  el.deepChip.setAttribute('aria-pressed', on ? 'true' : 'false');
+  el.deepChip.textContent = 'deep research';
+  el.deepChip.title = on
+    ? 'Deep Research เปิดสำหรับแชทนี้ — ทุกข้อความจะถูกวิจัยเชิงลึกหลายแหล่งพร้อมอ้างอิง คลิกเพื่อปิด'
+    : 'Deep Research — คลิกเพื่อเปิดโหมดวิจัยเชิงลึกสำหรับแชทนี้ (หรือพิมพ์ /deep-research)';
+}
+
+/** Flip Deep Research for the active chat (contributor-pill contract,
+ *  but per-chat and renderer-owned: the harness rides POST /prompt). */
+function toggleDeepResearch() {
+  if (!state.activeId) {
+    showError('เปิดแชทก่อน จึงเปิด Deep Research ได้');
+    return;
+  }
+  const on = deepResearch.toggle(state.activeId);
+  updateDeepChip();
+  showError(on
+    ? 'Deep Research เปิดสำหรับแชทนี้ — ข้อความถัดไปจะถูกวิจัยเชิงลึก'
+    : 'Deep Research ปิดสำหรับแชทนี้');
 }
 
 function openConfigMenu(kind, anchor) {
@@ -3765,14 +3798,15 @@ async function submitPrompt() {
   // A turn is running → enqueue and free the composer (grok-desktop
   // app.js:7282-7289). The chip above the composer tracks the queue; the
   // settle of the in-flight turn dispatches the next one.
+  const deep = deepResearch.get(chatId);
   if (isRunning(chatId)) {
-    promptQueue.enqueue(chatId, text, atts);
+    promptQueue.enqueue(chatId, text, atts, { deepResearch: deep });
     clearAttachments(attachId);
     renderPromptQueue();
     return;
   }
   clearAttachments(attachId);
-  await sendPromptText(chatId, text, { attachments: atts });
+  await sendPromptText(chatId, text, { attachments: atts, deepResearch: deep });
 }
 
 /**
@@ -3791,13 +3825,38 @@ async function runSlashCommand(chatId, slash, rawText, atts = [], attachId = nul
   };
   if (slash.type === 'unknown') {
     showError(`ไม่รู้จักคำสั่ง ${slash.name} — ส่งเป็นข้อความตามปกติ`);
+    const deep = deepResearch.get(chatId);
     if (isRunning(chatId)) {
-      promptQueue.enqueue(chatId, rawText, atts);
+      promptQueue.enqueue(chatId, rawText, atts, { deepResearch: deep });
       consume();
       renderPromptQueue();
     } else {
       consume();
-      await sendPromptText(chatId, rawText, { attachments: atts });
+      await sendPromptText(chatId, rawText, { attachments: atts, deepResearch: deep });
+    }
+    return;
+  }
+  // Deep Research (v1.1.39): toggle forms flip this chat's pill and hold
+  // attachments for the next real send (like pure mode switches); a topic
+  // form is a one-shot research turn, toggle state untouched.
+  if (slash.type === 'research-toggle') {
+    const on = slash.enabled == null
+      ? deepResearch.toggle(chatId)
+      : deepResearch.set(chatId, slash.enabled);
+    updateDeepChip();
+    showError(on
+      ? 'Deep Research เปิดสำหรับแชทนี้ — ข้อความถัดไปจะถูกวิจัยเชิงลึก'
+      : 'Deep Research ปิดสำหรับแชทนี้');
+    return;
+  }
+  if (slash.type === 'research') {
+    if (isRunning(chatId)) {
+      promptQueue.enqueue(chatId, slash.rest, atts, { deepResearch: true });
+      consume();
+      renderPromptQueue();
+    } else {
+      consume();
+      await sendPromptText(chatId, slash.rest, { attachments: atts, deepResearch: true });
     }
     return;
   }
@@ -3815,13 +3874,14 @@ async function runSlashCommand(chatId, slash, rawText, atts = [], attachId = nul
     return;
   }
   if (slash.type === 'mode' && slash.rest) {
+    const deep = deepResearch.get(chatId);
     if (isRunning(chatId)) {
-      promptQueue.enqueue(chatId, slash.rest, atts);
+      promptQueue.enqueue(chatId, slash.rest, atts, { deepResearch: deep });
       consume();
       renderPromptQueue();
     } else {
       consume();
-      await sendPromptText(chatId, slash.rest, { attachments: atts });
+      await sendPromptText(chatId, slash.rest, { attachments: atts, deepResearch: deep });
     }
   }
 }
@@ -3833,16 +3893,21 @@ async function runSlashCommand(chatId, slash, rawText, atts = [], attachId = nul
  * text: the prompt goes back to the FRONT of the chat's queue and the next
  * settle retries it in order (grok-desktop prompt-queue.js:119-139).
  */
-async function sendPromptText(chatId, text, { queueItem = null, attachments = [] } = {}) {
+async function sendPromptText(chatId, text, { queueItem = null, attachments = [], deepResearch: deepOpt = false } = {}) {
   const atts = queueItem?.attachments?.length ? queueItem.attachments : attachments;
+  const deep = queueItem ? queueItem.deepResearch === true : deepOpt === true;
   try {
     await api(`/api/chats/${encodeURIComponent(chatId)}/prompt`, {
       method: 'POST',
-      body: { text, ...(atts?.length ? { attachments: toWireAttachments(atts) } : {}) },
+      body: {
+        text,
+        ...(atts?.length ? { attachments: toWireAttachments(atts) } : {}),
+        ...(deep ? { deepResearch: true } : {}),
+      },
     });
   } catch (err) {
     if (err.status === 409) {
-      promptQueue.requeueFront(chatId, queueItem || { text, attachments: atts });
+      promptQueue.requeueFront(chatId, queueItem || { text, attachments: atts, deepResearch: deep });
       if (chatId === state.activeId) renderPromptQueue();
       return;
     }
@@ -3896,6 +3961,9 @@ function renderPromptQueue() {
     preview.className = 'prompt-queue-preview';
     const t = item.text.replace(/\s+/g, ' ').trim();
     preview.replaceChildren();
+    if (item.deepResearch) {
+      preview.append(document.createTextNode('deep research · '));
+    }
     if (item.attachments?.length) {
       const att = document.createElement('span');
       att.className = 'prompt-queue-att';
@@ -4314,6 +4382,7 @@ function wireUi() {
   el.modelChip.addEventListener('click', () => openConfigMenu('model', el.modelChip));
   el.effortChip.addEventListener('click', () => openConfigMenu('thinking', el.effortChip));
   el.contribChip.addEventListener('click', () => void toggleContributor());
+  el.deepChip?.addEventListener('click', () => toggleDeepResearch());
   void refreshContributor();
 
   el.mcpBtn?.addEventListener('click', () => mcpPanel.open(el.mcpBtn));

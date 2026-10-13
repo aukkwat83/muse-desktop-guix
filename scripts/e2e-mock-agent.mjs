@@ -1021,6 +1021,41 @@ await step('a rotated session prepends a recovery recap to the retry wire text, 
   assert.equal(prompts().at(-1), 'hello again', 'the preamble must fire once only');
 });
 
+await step('deep research: harness rides the wire, stored message stays verbatim', async () => {
+  const prompts = () =>
+    fs
+      .readFileSync(path.join(host.stateHome, 'prompts.log'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l));
+  const topic = 'วิจัยเชิงลึกเรื่องแบตเตอรี่รถไฟฟ้า';
+  const donesBefore = stream.of('turn_done').length;
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, {
+    text: topic,
+    deepResearch: true,
+  });
+  assert.equal(r.status, 202);
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && stream.of('turn_done').length === donesBefore + 1,
+    { label: 'deep research turn_done' },
+  );
+  const wire = prompts().at(-1);
+  assert.ok(wire.startsWith('[DEEP RESEARCH'), 'agent must receive the harness first');
+  assert.ok(wire.endsWith(topic), 'topic must reach the agent verbatim');
+  const got = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  const stored = [...got.chat.messages].reverse().find((m) => m.role === 'user');
+  assert.equal(stored.text, topic, 'stored user message must stay the plain topic');
+  assert.equal(stored.meta?.deepResearch, true, 'stored message must carry the deep flag');
+  // A plain prompt right after must go out bare — the flag is per-turn.
+  const dones2 = stream.of('turn_done').length;
+  await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'hello plain' });
+  await stream.waitFor(
+    (e) => e.event === 'turn_done' && stream.of('turn_done').length === dones2 + 1,
+    { label: 'post-deep plain turn_done' },
+  );
+  assert.equal(prompts().at(-1), 'hello plain', 'a non-deep prompt must never inherit the harness');
+});
+
 await step('a second prompt while one is in flight is rejected with 409', async () => {
   await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'slow one' });
   const second = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'racer' });
