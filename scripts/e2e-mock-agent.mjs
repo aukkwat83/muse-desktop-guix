@@ -674,6 +674,30 @@ await step('a malformed prompt auto-cancels with a visible trace instead of stra
   assert.match(notice.text, /แสดงไม่ได้/, 'the notice must say the prompt cannot render');
 });
 
+await step('view/gap and an unroutable model land as persisted notices, not silence (1.4.7)', async () => {
+  // Both disclosures are additive on the wire ("clients that predate it
+  // skip the unknown method") — skipping them is legal but silent: the
+  // transcript would be missing a range, and the next turn would fail on
+  // an unroutable model, with nothing in the chat saying why.
+  const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'viewgap run' });
+  assert.equal(r.status, 202);
+  const done = await stream.waitFor(
+    (e) => e.event === 'turn_done' && e.data.turnId === r.turnId,
+    { label: 'viewgap turn_done' },
+  );
+  assert.match(done.data.content, /ช่องว่าง \(final\)/, 'the turn must still settle after the disclosures');
+  const chat = await req(host.base, 'GET', `/api/chats/${chatId}`);
+  const gapNotice = chat.chat.messages.find(
+    (m) => m.role === 'notice' && m.meta?.turnId === r.turnId && m.meta?.after === 'cursor-40',
+  );
+  assert.ok(gapNotice, 'the dropped range left no persisted notice');
+  assert.equal(gapNotice.meta.next, 'cursor-57');
+  const modelNotice = chat.chat.messages.find(
+    (m) => m.role === 'notice' && m.meta?.turnId === r.turnId && m.meta?.modelId === 'muse-spark-1.3',
+  );
+  assert.ok(modelNotice, 'the unroutable model left no persisted notice');
+});
+
 await step('a multi-question prompt mounts one form card, answered atomically', async () => {
   const r = await req(host.base, 'POST', `/api/chats/${chatId}/prompt`, { text: 'quizmulti run' });
   assert.equal(r.status, 202);

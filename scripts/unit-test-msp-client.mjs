@@ -144,7 +144,7 @@ test('recoverUserInput mounts single AND multi as cards, cancels malformed (BUG-
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(sent.map(([m]) => m), ['userInput/cancel']);
   assert.equal(sent[0][1].userInputId, 'u-3');
-  assert.ok(sent[0][1].reason?.length > 0, 'the cancel must carry a reason (binary 1.4.2 rejects reason-less cancels)');
+  assert.ok(sent[0][1].reason?.length > 0, 'the cancel must carry a reason (binaries 1.4.2+ reject reason-less cancels)');
 });
 
 test('recoverUserInput dedupes repeats and nulls id-less frames (BUG-084)', async () => {
@@ -473,6 +473,33 @@ test('tool_call events carry the topic title end to end (client level)', () => {
   const started = updates.find((u) => u.sessionUpdate === 'tool_call');
   assert.equal(started.title, 'ตรวจไฟล์ชั่วคราว');
   assert.ok(!started.title.includes('ls /tmp/mock'), 'the raw command must not leak into the title');
+});
+
+test('view/gap and modelRouteUnserved map onto named update kinds (1.4.7 disclosures)', () => {
+  const client = new MspClient({ cwd: os.tmpdir() });
+  const updates = [];
+  client.on('update', (u) => updates.push(u));
+  client._onNotification('view/gap', { sessionId: 's-1', after: 'c-40', next: 'c-57' });
+  const gap = updates.find((u) => u.sessionUpdate === 'msp:viewGap');
+  assert.ok(gap, 'view/gap must not fall through to the anonymous default');
+  assert.equal(gap.after, 'c-40');
+  assert.equal(gap.next, 'c-57');
+  client._onNotification('session/modelRouteUnserved', {
+    sessionId: 's-1', modelId: 'muse-spark-1.3', providerId: 'meta', installedProviderId: 'other',
+  });
+  const unserved = updates.find((u) => u.sessionUpdate === 'msp:modelRouteUnserved');
+  assert.ok(unserved, 'modelRouteUnserved must not fall through to the anonymous default');
+  assert.equal(unserved.modelId, 'muse-spark-1.3');
+  assert.equal(unserved.installedProviderId, 'other');
+});
+
+test('unknown notifications still forward under msp:<method>, never swallowed', () => {
+  const client = new MspClient({ cwd: os.tmpdir() });
+  const updates = [];
+  client.on('update', (u) => updates.push(u));
+  client._onNotification('future/channel', { anything: 1 });
+  assert.equal(updates[0]?.sessionUpdate, 'msp:future/channel');
+  assert.equal(updates[0]?.anything, 1);
 });
 
 let failed = 0;

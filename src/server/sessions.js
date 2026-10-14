@@ -110,7 +110,8 @@ const HISTORY_INCOMPATIBLE_NOTICE =
 const MCP_AUDIT_FAILED_NOTICE =
   'agent สตาร์ท MCP ไม่ผ่าน (MCP startup audit failed) — เปิด agent ใหม่แล้วลองส่งต่ออีกครั้ง เซสชันเดิมยังอยู่ครบ';
 /**
- * Interactive-settlement RPC codes (binary 1.4.3 error table, all
+ * Interactive-settlement RPC codes (binary error table, 1.4.3 provenance,
+ * re-verified against the 1.4.7 schema export, all
  * retryable:false AT THE HOST) — but the desktop's answer differs per
  * code: already-settled/not-found means the prompt is gone (resolve the
  * card as remotely settled); invalid/stale means OUR submission was wrong
@@ -2081,6 +2082,42 @@ export class SessionManager extends EventEmitter {
         // broadcast globally so every window's pill moves together.
         this.setUsageCache(update.usage);
         this.wire.emit(null, 'usage', { usage: update.usage });
+        return;
+      }
+      case 'msp:viewGap': {
+        // The agent-side push dropped a range of view events (wire
+        // view/gap): this chat's transcript may be missing a span of the
+        // turn. Persist the disclosure like the BUG-084 notice — an
+        // SSE-only trace vanishes on reload and the hole would read as
+        // the agent's own non sequitur.
+        this.store.addMessage(chatId, {
+          role: 'notice',
+          text: 'เหตุการณ์จาก agent บางส่วนหายไประหว่างทาง — คำตอบในเทิร์นนี้อาจขาดช่วง (agent ยังทำงานต่อตามปกติ)',
+          meta: {
+            ...(turnId ? { turnId } : {}),
+            after: update.after ?? null,
+            next: update.next ?? null,
+          },
+        });
+        this.wire.emit(chatId, 'agent_update_other', { kind: kind || 'unknown', update });
+        return;
+      }
+      case 'msp:modelRouteUnserved': {
+        // The standing model became unroutable after a credential swap
+        // (wire session/modelRouteUnserved). The wire leaves the
+        // selection in place, so without this notice the next turn just
+        // fails with no reason recorded anywhere in the chat.
+        const modelId = String(update.modelId || 'โมเดลปัจจุบัน');
+        this.store.addMessage(chatId, {
+          role: 'notice',
+          text: `โมเดล ${modelId} ใช้ต่อไม่ได้หลังข้อมูลล็อกอินเปลี่ยน — เลือกโมเดลอื่นจากตัวเลือกโมเดล แล้วส่งอีกครั้ง`,
+          meta: {
+            ...(turnId ? { turnId } : {}),
+            modelId: update.modelId ?? null,
+            installedProviderId: update.installedProviderId ?? null,
+          },
+        });
+        this.wire.emit(chatId, 'agent_update_other', { kind: kind || 'unknown', update });
         return;
       }
       case 'available_commands_update': {

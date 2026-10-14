@@ -475,7 +475,7 @@ async function handle(msg) {
     }
     case 'userInput/cancel': {
       if (DECIDE_LOG) fs.appendFileSync(DECIDE_LOG, `cancel ${JSON.stringify(params)}\n`);
-      // Binary-true: 1.4.2 rejects a reason-less cancel (`missing field
+      // Binary-true: 1.4.2+ rejects a reason-less cancel (`missing field
       // 'reason'`) even though the schema marks it optional — the actual
       // f381a7e1 wedge. The mock enforces it so the e2e fails if the
       // client ever drops the field again.
@@ -692,6 +692,25 @@ async function runTurn(turnId, text) {
       return;
     }
     if (await emitAgentText('m-audit', ['สวัสดีจาก mock agent '], 'สวัสดีจาก mock agent (audit-retry final)', turnId)) {
+      completeTurn(turnId);
+    }
+    return;
+  }
+
+  if (t.includes('viewgap')) {
+    // 1.4.7 disclosures: a dropped view range plus an unroutable standing
+    // model land mid-turn; the turn itself still completes normally.
+    notify('view/gap', { sessionId: SESSION_ID, after: 'cursor-40', next: 'cursor-57' });
+    notify('session/modelRouteUnserved', {
+      sessionId: SESSION_ID,
+      commandId: 'mock-swap-1',
+      modelId: 'muse-spark-1.3',
+      providerId: 'meta',
+      installedProviderId: 'other-provider',
+      sourceRange: null,
+      viewCursor: 'cursor-57',
+    });
+    if (await emitAgentText('m-gap', ['ตอบต่อหลังช่องว่าง '], 'ตอบต่อหลังช่องว่าง (final)', turnId)) {
       completeTurn(turnId);
     }
     return;

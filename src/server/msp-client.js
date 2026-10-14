@@ -604,8 +604,9 @@ export class MspClient extends EventEmitter {
 
   /**
    * ACK-safe explicit cancel of one question. A reason is always sent —
-   * the schema marks it optional but binary 1.4.2 rejects a reason-less
-   * cancel (`missing field 'reason'`), the f381a7e1 wedge (BUG-084).
+   * the schema marks it optional but binaries 1.4.2+ reject a reason-less
+   * cancel (`missing field 'reason'`), the f381a7e1 wedge (BUG-084); the
+   * 1.4.7 schema still does not require it, so do not "simplify" this.
    */
   async cancelUserInput(userInputId, reason, { commandId = null } = {}) {
     const id = String(userInputId || '');
@@ -1380,8 +1381,33 @@ export class MspClient extends EventEmitter {
         });
         return;
       }
+      case 'view/gap': {
+        // Push delivery dropped the (after, next) event range (schema
+        // SS4.8). The desktop keeps its own transcript and cannot page
+        // the hole away, so the loss is named and disclosed upstream —
+        // never silently absorbed into a transcript that looks complete.
+        this.emit('update', {
+          sessionUpdate: 'msp:viewGap',
+          after: params?.after ?? null,
+          next: params?.next ?? null,
+        });
+        return;
+      }
+      case 'session/modelRouteUnserved': {
+        // A credential swap installed a provider that cannot serve the
+        // standing model (schema #25603). Disclosure only — the wire
+        // leaves the selection unchanged; the repair (a routable
+        // session/setModel) belongs upstream, where the user can see it.
+        this.emit('update', {
+          sessionUpdate: 'msp:modelRouteUnserved',
+          modelId: params?.modelId ?? null,
+          providerId: params?.providerId ?? null,
+          installedProviderId: params?.installedProviderId ?? null,
+        });
+        return;
+      }
       default:
-        // session/*, usage/*, view/gap and future channels are forwarded,
+        // session/*, usage/* and future channels are forwarded,
         // not swallowed — a silently discarded channel is invisible until
         // someone notices a feature has never worked.
         this.emit('update', { sessionUpdate: `msp:${method}`, ...params });
@@ -1699,8 +1725,8 @@ export class MspClient extends EventEmitter {
         userInputId,
         sessionId: this.sessionId,
         commandId: uuidv7(),
-        // Load-bearing: the schema marks reason optional but binary 1.4.2
-        // rejects the cancel without it (`missing field 'reason'`) — the
+        // Load-bearing: the schema marks reason optional but binaries
+        // 1.4.2+ reject the cancel without it (`missing field 'reason'`) — the
         // actual f381a7e1 wedge. The model sees the cancelled result, so
         // say why and what to do.
         reason: 'desktop cannot render this prompt shape; proceeding without an answer',

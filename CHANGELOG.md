@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.40 — 2026-10-14
+
+CLI 1.4.7 wire pass (binary `1.4.7-R6101.1`): every load-bearing pin
+re-verified against the exported schema (fingerprint `sha256:6de32db…`,
+schemaVersion 1) and a live smoke (5/5 rows) — error codes
+-32050..-32057, the 500-char answer ceiling, and the still-undocumented
+`userInput/cancel` reason requirement are all unchanged; no breaking
+delta. Two additive 1.4.7 disclosures now land as persisted Thai notices
+instead of the anonymous `agent_update_other` default: `view/gap` (a
+dropped view range would otherwise leave a silent transcript hole) and
+`session/modelRouteUnserved` (a credential swap left the standing model
+unroutable; the next turn would fail with no reason recorded).
+ApprovalMode `onRequest` displays as ask by explicit mapping.
+Version-pin comments refreshed onto 1.4.7 (BUG-084 provenance kept).
+Covered by 2 new msp-client cases, 1 session-mode case and one new e2e
+step (95/95). `?v=`=1.1.40.
+Full note: [docs/releases/v1.1.40-cli-147-disclosures.md](docs/releases/v1.1.40-cli-147-disclosures.md).
+
 ## 1.1.39 — 2026-10-13
 
 Deep Research lands as a header pill beside contributor: a sticky

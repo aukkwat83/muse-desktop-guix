@@ -224,8 +224,8 @@ export function mspChoiceIsSticky(choice) {
 }
 
 /**
- * Schema ceiling for user-authored answer text (binary 1.4.3
- * UserInputAnswerParams: freeText <= 500, note <= 500). Both client and
+ * Schema ceiling for user-authored answer text (binary
+ * UserInputAnswerParams, 1.4.7: freeText <= 500, note <= 500). Both client and
  * server validation pin this constant — the binary answers anything past it
  * with -32057, so the form must refuse first.
  */

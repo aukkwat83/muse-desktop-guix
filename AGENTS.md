@@ -64,7 +64,7 @@ nothing — that was a real bug.
 `agent_update_other`. A silently discarded channel is invisible until someone notices a feature
 has never worked.
 
-## Facts about `muse serve` (verified against 1.3.0, not assumed)
+## Facts about `muse serve` (verified against 1.3.0; wire re-verified against 1.4.7-R6101.1 — schema fingerprint `sha256:6de32db0…`, smoke-msp 5/5)
 
 - Newline-delimited JSON-RPC 2.0 — same framing as the ACP dialect, different method set:
   `initialize` / `initialized` / `session/start|resume` / `turn/start|interrupt`, with view
@@ -86,8 +86,9 @@ has never worked.
 - Approvals arrive as **both** a server-initiated `approval/request` (answer `{}` receipt
   immediately; the decision travels separately as `approval/decide`) **and** an
   `approval/requested` notification. The client mounts exactly one card for the pair.
-- `userInput/cancel` MUST carry `reason`: binary 1.4.2 rejects a reason-less
-  cancel (`missing field 'reason'`) even though the exported schema marks it
+- `userInput/cancel` MUST carry `reason`: binaries 1.4.2+ reject a reason-less
+  cancel (`missing field 'reason'`) even though the exported schema (1.4.7
+  included) marks it
   optional — that silent rejection wedged chat f381a7e1 for 2h (BUG-084).
   The mock enforces it so the e2e fails if the field is ever dropped.
 - Belt and suspenders for the same wedge: the watchdog re-reads
@@ -95,6 +96,14 @@ has never worked.
   auto-cancels / escalates from the snapshot — the live frame is the fast
   path, the poll is the guarantee, and a cancel ignored past grace ends in
   a loud interrupt, never a silent hold.
+- Two wire disclosures (1.4.7) are additive — "clients that predate it skip the unknown
+  method" is legal but silent: `view/gap` (push dropped the `(after, next)` range; the
+  desktop cannot page the hole) and `session/modelRouteUnserved` (a credential swap left
+  the standing model unroutable; the wire keeps the selection, the repair is a routable
+  `session/setModel`). Both land as persisted `role: 'notice'` messages via
+  `msp:viewGap` / `msp:modelRouteUnserved` (1.1.40) — never let them fall back to the
+  anonymous `agent_update_other` default, or a transcript hole and a dead model both
+  read as unmotivated failures after reload.
 - `session/resume` returns history in the RESULT (no wire replay); `excludeItems: true` keeps
   it lean since we keep our own transcript.
 - Login state surfaces as turn/RPC failures matching `not logged in` — there is no dedicated
@@ -103,8 +112,10 @@ has never worked.
   vocabulary (`none|minimal|low|medium|high|xhigh|max|ultra`). Export the exact schema for
   this binary any time with `muse schema generate-json-schema`.
 - UI modes resolve onto the closed ApprovalMode vocabulary: `always→allowAll`,
-  `normal→promptUnmatched`, `plan→denyUnmatched`. Mode changes apply live via
-  `session/setApprovalMode` — no respawn exists on this path.
+  `normal→promptUnmatched`, `plan→denyUnmatched`. The 1.4.7 enum has a fourth value,
+  `onRequest`, with no UI chip — `mspApprovalModeToSessionMode` displays it as ask by
+  explicit decision. Mode changes apply live via `session/setApprovalMode` — no respawn
+  exists on this path.
 
 ## Machine-local runtime notes
 

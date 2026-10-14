@@ -47,6 +47,10 @@ export function mspApprovalModeToSessionMode(modeId) {
   const v = String(modeId ?? '').trim();
   if (v === 'allowAll') return 'always';
   if (v === 'denyUnmatched') return 'plan';
+  // promptUnmatched AND onRequest both display as ask: onRequest (the
+  // fourth ApprovalMode, schema 1.4.7) has no UI chip of its own, and a
+  // session the TUI left in it must not fall through by accident.
+  if (v === 'promptUnmatched' || v === 'onRequest') return 'normal';
   return 'normal';
 }
 

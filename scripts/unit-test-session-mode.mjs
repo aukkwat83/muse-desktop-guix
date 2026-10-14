@@ -49,6 +49,16 @@ test('round-trips through the MSP approval mode', () => {
   assert.equal(mspApprovalModeToSessionMode(sessionModeToMspApprovalMode('normal')), 'normal');
 });
 
+test('the full wire ApprovalMode enum resolves explicitly, onRequest included', () => {
+  // Schema 1.4.7 ApprovalMode: allowAll | promptUnmatched | onRequest |
+  // denyUnmatched. onRequest has no UI chip of its own — it displays as
+  // ask by decision, not by falling off the end of the mapping.
+  assert.equal(mspApprovalModeToSessionMode('allowAll'), 'always');
+  assert.equal(mspApprovalModeToSessionMode('promptUnmatched'), 'normal');
+  assert.equal(mspApprovalModeToSessionMode('onRequest'), 'normal');
+  assert.equal(mspApprovalModeToSessionMode('denyUnmatched'), 'plan');
+});
+
 test('no mode change forces a respawn on the MSP path', () => {
   // session/setApprovalMode applies live — the ACP respawn rule is gone.
   assert.equal(sessionModeNeedsProcessRestart('normal', 'plan'), false);
